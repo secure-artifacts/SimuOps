@@ -1,24 +1,52 @@
 # SimuOps Auto Manager Pro
 
-Windows desktop automation tool built with PyQt5.
+`SimuOps Auto Manager Pro` 是一个面向 Windows 的可视化桌面自动化工具，核心能力是通过模拟鼠标、键盘、窗口切换、文件拖拽和图片识别，自动执行原本需要人工一步步操作的软件流程。
 
-## Project Files
+它最大的特点不是依赖某个软件提供 API，而是直接模拟人的操作方式，对各种桌面软件、网页后台、上传界面、管理系统和重复性操作流程进行批量自动化处理。
 
-- `main.pyw`: main application entry
-- `requirements.txt`: Python dependencies
-- `setup.bat`: creates a virtual environment and installs dependencies
-- `start.bat`: launches the application
-- `config.default.json`: clean default configuration
+## 项目定位
 
-## Quick Start
+很多软件并没有开放接口，也不支持脚本调用，但人工操作路径其实是固定的，比如：
 
-1. Install Python 3.11 or newer on Windows.
-2. Open the project folder.
-3. Double-click `setup.bat`.
-4. After setup finishes, double-click `start.bat`.
+- 打开软件
+- 点击指定按钮
+- 输入文本
+- 上传图片或文件
+- 切换窗口
+- 根据界面变化继续下一步
+- 重复执行几十次、几百次
 
-## Notes
+这个项目就是把这类“人工点点点”的操作整理成可复用流程，再配合批量数据，实现一键批量执行。
 
-- This project is designed for Windows.
-- Runtime-generated files such as logs, screenshots, captures, and local config are ignored by Git.
-- If you want a clean reset, delete `app_config.json` and start the app again.
+## 特点
+
+- 模拟人工操作：通过鼠标点击、移动、键盘输入、滚轮、快捷键等方式直接驱动软件界面。
+- 适配范围广：不依赖目标程序提供接口，适合各种桌面软件、浏览器页面、后台系统和上传工具。
+- 批量执行能力强：同一套流程可以套用到多组数据，自动完成重复任务。
+- 可视化配置：通过界面编排步骤，不需要手写复杂脚本。
+- 支持条件判断：可结合图片识别、窗口检测等方式，根据界面状态决定下一步动作。
+- 支持文件操作：可处理文件上传、文件拖拽、截图保存等常见自动化场景。
+- 支持定时与排程：适合定时启动、周期执行和任务串行处理。
+- 支持人工接管：执行中可以暂停、恢复、跳步、重试、停止，适合半自动和全自动混合场景。
+
+## 适用场景
+
+- 批量操作各种 Windows 软件
+- 自动填写网页或桌面表单
+- 批量上传图片、附件、素材
+- 多账号重复登录与处理任务
+- 重复点击、切换、输入、提交类工作
+- 没有 API、只能人工操作的软件自动化
+- 需要按固定流程批量处理数据的业务场景
+
+## 主要功能
+
+- 流程编排：把点击、输入、等待、滚动、找图、上传、打开网址、运行程序等动作组合成自动化流程。
+- 鼠标键盘模拟：支持左键、右键、双击、移动、悬停点击、快捷键、单键输入等操作。
+- 图片识别判断：支持找图点击、找图判断，用于处理界面位置不固定或按钮状态变化的场景。
+- 窗口控制：支持窗口激活、窗口检测、程序启动，便于跨软件协同执行。
+- 批量数据驱动：支持按数据表逐行执行，让一套流程批量处理多组任务。
+- 智能填充：支持扫描文件夹并自动识别可用文本、图片、文件路径，填入批量任务中。
+- 文件拖拽与上传：适合处理上传窗口、附件提交、素材批量导入等操作。
+- 任务排程：支持定时执行、排程包、顺序运行多个任务。
+- 执行监控：支持日志输出、进度显示、暂停恢复、停止重试等控制能力。
