@@ -1,0 +1,20 @@
+{
+  "tasks": {},
+  "task_data": {},
+  "task_meta": {},
+  "extra_scan_dirs": [],
+  "folders": [],
+  "layout": {
+    "task_order": [],
+    "last_task": "",
+    "current_schedule_bundle": "Default Schedule Bundle"
+  },
+  "tasks_layout": {},
+  "schedule_bundles": {
+    "Default Schedule Bundle": {
+      "items": [],
+      "timer_config": null,
+      "timer_enabled": false
+    }
+  }
+}

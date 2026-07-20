@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+app_config.json
+app_config.broken_*.json
+progress_status.json
+
+logs/
+captures/
+screenshots/
