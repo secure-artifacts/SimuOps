@@ -528,6 +528,7 @@ SMART_FILL_FILE_EXTS = SMART_FILL_IMAGE_EXTS | SMART_FILL_TEXT_EXTS | {
 SMART_FILL_IMAGE_EXTS_TEXT = ",".join(sorted(SMART_FILL_IMAGE_EXTS))
 SMART_FILL_TEXT_EXTS_TEXT = ",".join(sorted(SMART_FILL_TEXT_EXTS))
 SMART_FILL_FILE_EXTS_TEXT = ",".join(sorted(SMART_FILL_FILE_EXTS))
+SMART_FILL_TXT_ONLY_EXTS_TEXT = ".txt"
 
 def get_default_smart_fill_rules():
     return {
@@ -583,6 +584,52 @@ def build_runtime_smart_fill_rules(raw_rules=None):
     rules["text_exts"] = _parse_exts_text(rules.get("text_exts_text"), SMART_FILL_TEXT_EXTS_TEXT)
     rules["file_exts"] = _parse_exts_text(rules.get("file_exts_text"), SMART_FILL_FILE_EXTS_TEXT)
     return rules
+
+def _get_smart_fill_ext_preset_texts(target_kind="file", act_type="", sub=None):
+    presets = []
+    if act_type in ["upload", "drag_file"]:
+        presets.extend([SMART_FILL_IMAGE_EXTS_TEXT, SMART_FILL_FILE_EXTS_TEXT])
+    elif act_type == "run_app":
+        presets.extend([SMART_FILL_FILE_EXTS_TEXT, SMART_FILL_IMAGE_EXTS_TEXT])
+    elif act_type == "clear_input_plus" and sub == "content":
+        presets.extend([SMART_FILL_TXT_ONLY_EXTS_TEXT, SMART_FILL_TEXT_EXTS_TEXT])
+    elif target_kind == "text":
+        presets.extend([SMART_FILL_TEXT_EXTS_TEXT, SMART_FILL_TXT_ONLY_EXTS_TEXT])
+    else:
+        presets.extend([SMART_FILL_FILE_EXTS_TEXT, SMART_FILL_IMAGE_EXTS_TEXT])
+    unique = []
+    seen = set()
+    for item in presets:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            unique.append(text)
+    return unique
+
+def _create_exts_combo(current_text="", target_kind="file", act_type="", sub=None, placeholder=""):
+    combo = QComboBox()
+    combo.setEditable(True)
+    combo.setInsertPolicy(QComboBox.NoInsert)
+    for text in _get_smart_fill_ext_preset_texts(target_kind=target_kind, act_type=act_type, sub=sub):
+        combo.addItem(text)
+    if combo.lineEdit():
+        combo.lineEdit().setPlaceholderText(placeholder)
+    current_text = str(current_text or "").strip()
+    if current_text:
+        idx = combo.findText(current_text, Qt.MatchFixedString)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setEditText(current_text)
+    return combo
+
+def _get_combo_text(combo):
+    if not combo:
+        return ""
+    text = combo.currentText()
+    if not text and combo.lineEdit():
+        text = combo.lineEdit().text()
+    return str(text or "").strip()
 
 def natural_sort_key(text):
     text = "" if text is None else str(text)
@@ -1202,6 +1249,87 @@ def activate_window_from_point(x, y):
         raise RuntimeError(f"无法根据坐标定位窗口: ({x}, {y})")
     force_activate_window(hwnd)
     return hwnd
+
+def get_window_text(hwnd):
+    """安全读取窗口标题。"""
+    if not hwnd or sys.platform != 'win32':
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(512)
+        ctypes.windll.user32.GetWindowTextW(int(hwnd), buf, len(buf))
+        return buf.value or ""
+    except Exception:
+        return ""
+
+def _safe_guard_name(text):
+    text = str(text or "").strip()
+    text = re.sub(r'[\\/:*?"<>|\s]+', '_', text)
+    text = text.strip("._")
+    return text[:80] or "item"
+
+def _capture_virtual_screen_region(left, top, width, height):
+    """抓取虚拟桌面区域，兼容多屏与负坐标。"""
+    if width <= 0 or height <= 0:
+        raise ValueError("截图区域尺寸无效")
+    try:
+        from PIL import ImageGrab
+        if sys.platform == 'win32':
+            user32 = ctypes.windll.user32
+            vx = int(user32.GetSystemMetrics(76))   # SM_XVIRTUALSCREEN
+            vy = int(user32.GetSystemMetrics(77))   # SM_YVIRTUALSCREEN
+            full_img = ImageGrab.grab(all_screens=True)
+            crop_left = max(0, int(left) - vx)
+            crop_top = max(0, int(top) - vy)
+            crop_right = min(full_img.size[0], crop_left + int(width))
+            crop_bottom = min(full_img.size[1], crop_top + int(height))
+            if crop_right <= crop_left or crop_bottom <= crop_top:
+                raise RuntimeError("目标区域超出虚拟桌面范围")
+            return full_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+        return ImageGrab.grab(bbox=(int(left), int(top), int(left) + int(width), int(top) + int(height)))
+    except Exception as e:
+        raise RuntimeError(f"抓取界面守卫截图失败: {e}")
+
+def create_action_guard_snapshot(task_name, step_name, x, y, width=160, height=96):
+    """录制坐标时自动保存一张周边界面快照，供执行前校验。"""
+    guard_dir = os.path.join(BASE_DIR, "step_guards")
+    os.makedirs(guard_dir, exist_ok=True)
+    left = int(round(x - width / 2))
+    top = int(round(y - height / 2))
+    img = _capture_virtual_screen_region(left, top, width, height)
+    file_name = f"{_safe_guard_name(task_name)}__{_safe_guard_name(step_name)}__{int(x)}_{int(y)}.png"
+    guard_path = os.path.join(guard_dir, file_name)
+    img.save(guard_path)
+    hwnd = get_root_window_from_point(x, y)
+    return {
+        "guard_image": guard_path,
+        "guard_region": [left, top, img.size[0], img.size[1]],
+        "guard_window_title": get_window_text(hwnd),
+        "guard_window_class": get_window_class_name(hwnd),
+        "guard_threshold": 0.72,
+    }
+
+def evaluate_guard_snapshot_similarity(guard_image_path, region):
+    """比较当前界面与录制快照的相似度，返回 0~1。"""
+    if not guard_image_path or not os.path.exists(guard_image_path):
+        raise FileNotFoundError(f"守卫快照不存在: {guard_image_path}")
+    if not isinstance(region, (list, tuple)) or len(region) < 4:
+        raise ValueError("守卫区域参数无效")
+    try:
+        from PIL import Image, ImageChops, ImageStat
+        left, top, width, height = [int(float(v)) for v in region[:4]]
+        current = _capture_virtual_screen_region(left, top, width, height).convert("L")
+        recorded = Image.open(guard_image_path).convert("L")
+        if current.size != recorded.size:
+            current = current.resize(recorded.size)
+        diff = ImageChops.difference(recorded, current)
+        rms = ImageStat.Stat(diff).rms[0]
+        return max(0.0, min(1.0, 1.0 - (float(rms) / 255.0)))
+    except Exception as e:
+        raise RuntimeError(f"界面快照比对失败: {e}")
+
+class StepGuardMismatchError(RuntimeError):
+    """界面守卫未通过时抛出，调用方应跳过当前行而不是终止整个任务。"""
+    pass
 
 def is_same_path(p1, p2):
     """[深度归一化版] 智能路径比对。
@@ -2494,6 +2622,57 @@ class MultiLineTextDelegate(QStyledItemDelegate):
     def updateEditorGeometry(self, editor, option, index):
         rect = option.rect.adjusted(0, 0, 0, 40)
         editor.setGeometry(rect)
+
+class PrefixPresetEditorDialog(QDialog):
+    """用于完整查看和编辑前缀内容的弹窗。"""
+    def __init__(self, parent=None, name="", prefix="", title="✏️ 编辑前缀"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(760, 560)
+
+        layout = QVBoxLayout(self)
+        tip = QLabel("这里会完整显示当前前缀内容，可直接编辑多行文本。")
+        tip.setStyleSheet("color: #666; padding: 2px 0 4px 2px;")
+        layout.addWidget(tip)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit(str(name))
+        self.name_edit.setPlaceholderText("输入前缀名称...")
+        form.addRow("名称：", self.name_edit)
+        layout.addLayout(form)
+
+        layout.addWidget(QLabel("前缀内容："))
+        self.prefix_edit = QTextEdit()
+        self.prefix_edit.setAcceptRichText(False)
+        self.prefix_edit.setWordWrapMode(QTextOption.WrapAnywhere)
+        self.prefix_edit.setPlainText(str(prefix))
+        self.prefix_edit.setPlaceholderText("输入完整前缀内容...")
+        self.prefix_edit.setMinimumHeight(360)
+        layout.addWidget(self.prefix_edit, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_ok = QPushButton("✅ 保存")
+        btn_ok.setStyleSheet("background-color: #e8f5e9; font-weight: bold; min-width: 96px;")
+        btn_cancel = QPushButton("❌ 取消")
+        btn_cancel.setMinimumWidth(96)
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        if str(prefix).strip():
+            self.prefix_edit.setFocus()
+        else:
+            self.name_edit.selectAll()
+            self.name_edit.setFocus()
+
+    def get_data(self):
+        return {
+            "name": self.name_edit.text().strip(),
+            "prefix": self.prefix_edit.toPlainText()
+        }
 
 def parse_spreadsheet_clipboard_text(raw_text):
     """解析来自 Excel / Google 表格 的制表符文本，保留被引号包裹单元格内的换行。"""
@@ -3965,6 +4144,7 @@ ROW_STATUS_OK    = "✅"
 ROW_STATUS_FAIL  = "❌"
 ROW_STATUS_SKIP  = "⏭️"
 ROW_STATUS_DEFER = "⏸️"
+ROW_STATUS_MANUAL = "⚠️"
 
 class AutoEngine(QThread):
     log_sig        = pyqtSignal(str, str)
@@ -4056,6 +4236,58 @@ class AutoEngine(QThread):
                     return
                 end += time.time() - pause_started
             time.sleep(min(0.05, end - time.time()))
+
+    def _validate_step_guard(self, act, act_type):
+        """执行前界面守卫：优先比对录制快照，退化到窗口标题/类名校验。"""
+        guarded_types = {
+            "click", "double_click", "right_click", "move", "hover_click",
+            "scroll", "input", "clear_input", "clear_input_plus", "upload", "drag_file"
+        }
+        if self.dry_run or act_type not in guarded_types:
+            return
+        if not bool(act.get("guard_enabled", True)):
+            return
+        x, y = act.get('x'), act.get('y')
+        if x is None or y is None:
+            return
+        x, y = int(x), int(y)
+        if x == 0 and y == 0:
+            return
+
+        guard_image = str(act.get("guard_image", "") or "").strip()
+        guard_region = act.get("guard_region")
+        guard_threshold = float(act.get("guard_threshold", 0.72) or 0.72)
+        if guard_image and os.path.exists(guard_image) and isinstance(guard_region, (list, tuple)) and len(guard_region) >= 4:
+            score = evaluate_guard_snapshot_similarity(guard_image, guard_region)
+            if score < guard_threshold:
+                raise StepGuardMismatchError(
+                    f"界面守卫未通过：当前画面与录制时差异较大（相似度 {score:.0%} < {guard_threshold:.0%}）"
+                )
+            self.log_sig.emit(f"🧭 界面守卫通过：相似度 {score:.0%}", "gray")
+            return
+
+        guard_class = str(act.get("guard_window_class", "") or "").strip()
+        guard_title = str(act.get("guard_window_title", "") or "").strip()
+        if not guard_class and not guard_title:
+            return
+
+        actual_hwnd = get_root_window_from_point(x, y)
+        if not actual_hwnd:
+            raise StepGuardMismatchError(f"界面守卫未通过：无法定位坐标 ({x}, {y}) 所在窗口")
+        actual_class = str(get_window_class_name(actual_hwnd) or "").strip()
+        actual_title = str(get_window_text(actual_hwnd) or "").strip()
+
+        if guard_class and actual_class != guard_class:
+            raise StepGuardMismatchError(f"界面守卫未通过：窗口类名不匹配（当前={actual_class or '空'}，录制={guard_class}）")
+        if guard_title:
+            title_ok = (
+                actual_title == guard_title or
+                (guard_title and guard_title in actual_title) or
+                (actual_title and actual_title in guard_title)
+            )
+            if not title_ok:
+                raise StepGuardMismatchError(f"界面守卫未通过：窗口标题不匹配（当前={actual_title or '空'}，录制={guard_title}）")
+        self.log_sig.emit(f"🧭 窗口守卫通过：{actual_title or actual_class or '已匹配'}", "gray")
 
     def _write_progress_status(self, percent, cur_loop, cur_group, total_groups, cur_step, total_steps, step_name="", task_name="", status="running"):
         """将当前执行进度实时写入 progress_status.json，供无界面监控工具读取。"""
@@ -4369,6 +4601,7 @@ class AutoEngine(QThread):
 
         row_ok = True
         row_state = "done"
+        manual_reason = ""
         s_idx = s_start
         while s_idx < len(self.actions):
             if self._stop:
@@ -4379,11 +4612,16 @@ class AutoEngine(QThread):
                 self._next_row = False
                 self.log_sig.emit(f"⏩ [手动] 放弃第 {t_idx+1} 行剩余步骤，跳到下一行", "orange")
                 row_ok = True
+                row_state = "manual"
+                manual_reason = "人工切下一行"
                 break
 
             if self._skip_step:
                 self._skip_step = False
                 self.log_sig.emit(f"⏭ [手动] 跳过步骤: [{self.actions[s_idx].get('name', f'步骤{s_idx+1}')}]", "orange")
+                if row_state == "done":
+                    row_state = "manual"
+                    manual_reason = "人工跳步"
                 s_idx += 1
                 continue
 
@@ -4461,6 +4699,7 @@ class AutoEngine(QThread):
             attempts = 0
             max_attempts = max(1, self.retry_count + 1)
             jump_target = None
+            guard_skip_row = False
 
             while attempts < max_attempts:
                 if self._stop:
@@ -4473,6 +4712,15 @@ class AutoEngine(QThread):
                         self._enqueue_deferred_row(l_idx, t_idx, s_idx, result[1])
                         row_state = "deferred"
                     step_ok = True
+                    break
+                except StepGuardMismatchError as e:
+                    error_detail = str(e) if str(e) else "界面守卫未通过"
+                    self._last_error = error_detail
+                    self.log_sig.emit(f"⚠️ {error_detail}，已跳过当前行并继续下一行", "orange")
+                    row_ok = True
+                    row_state = "manual"
+                    manual_reason = "界面守卫不匹配，已跳过当前行"
+                    guard_skip_row = True
                     break
                 except Exception as e:
                     error_detail = str(e) if str(e) else f"未知错误类型: {type(e).__name__}"
@@ -4494,6 +4742,8 @@ class AutoEngine(QThread):
                             row_ok = False
 
             if row_state == "deferred":
+                break
+            if guard_skip_row:
                 break
 
             if jump_target:
@@ -4517,11 +4767,24 @@ class AutoEngine(QThread):
                 self._next_row = False
                 self.log_sig.emit(f"⏩ [手动] 放弃第 {t_idx+1} 行剩余步骤，跳到下一行", "orange")
                 row_ok = True
+                row_state = "manual"
+                manual_reason = "人工切下一行"
                 break
             if self._skip_step:
                 self._skip_step = False
                 self.log_sig.emit(f"⏭ [手动] 跳过当前步骤延时，直接进入下一步", "orange")
+                if row_state == "done":
+                    row_state = "manual"
+                    manual_reason = "人工跳步"
                 s_idx += 1
+                continue
+
+            if self._retry_step:
+                self._retry_step = False
+                self.log_sig.emit(f"🔁 [手动] 立即重执行当前步骤: [{name}]", "blue")
+                if row_state == "done":
+                    row_state = "manual"
+                    manual_reason = "人工重试"
                 continue
 
             s_delay = float(row_delay) if (row_delay and str(row_delay).replace('.','',1).isdigit()) else float(act.get('delay', 1))
@@ -4534,10 +4797,15 @@ class AutoEngine(QThread):
                 self._next_row = False
                 self.log_sig.emit(f"⏩ [手动] 延时中触发，跳到下一行", "orange")
                 row_ok = True
+                row_state = "manual"
+                manual_reason = "人工切下一行"
                 break
             if self._skip_step:
                 self._skip_step = False
                 self.log_sig.emit(f"⏭ [手动] 延时中触发，跳入下一步", "orange")
+                if row_state == "done":
+                    row_state = "manual"
+                    manual_reason = "人工跳步"
                 s_idx += 1
                 continue
 
@@ -4559,9 +4827,15 @@ class AutoEngine(QThread):
         if row_state == "deferred":
             self.row_status_sig.emit(t_idx, ROW_STATUS_DEFER)
             row_result_text = "⏸️ 挂起"
+        elif not row_ok:
+            self.row_status_sig.emit(t_idx, ROW_STATUS_FAIL)
+            row_result_text = "❌ 失败"
+        elif row_state == "manual":
+            self.row_status_sig.emit(t_idx, ROW_STATUS_MANUAL)
+            row_result_text = f"⚠️ {manual_reason or '人工介入'}"
         else:
-            self.row_status_sig.emit(t_idx, ROW_STATUS_OK if row_ok else ROW_STATUS_FAIL)
-            row_result_text = "✅ 成功" if row_ok else "❌ 失败"
+            self.row_status_sig.emit(t_idx, ROW_STATUS_OK)
+            row_result_text = "✅ 成功"
 
         self.log_sig.emit(
             f"═══ 组 {t_idx+1}/{total} 完成 | 结果: {row_result_text} | "
@@ -4658,6 +4932,7 @@ class AutoEngine(QThread):
         # [新增] 如果开启了标准化，且当前是打开网页或激活窗口动作，则在操作后执行标准化
         # 我们在这里记录是否需要标准化，等动作执行完后再操作
         should_std = self.standardize_window and act_type in ["open_url", "win_active"]
+        self._validate_step_guard(act, act_type)
         if act_type == "image_click":
             # 解析跳转参数：图片路径|成功跳转步骤|失败跳转步骤
             # 增强：过滤掉可能存在的换行符和干扰字符
@@ -5597,9 +5872,9 @@ class ClearInputPrefixPresetDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setColumnWidth(0, 150)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.AnyKeyPressed)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setWordWrap(True)
         self.table.verticalHeader().setDefaultSectionSize(34)
@@ -5609,7 +5884,7 @@ class ClearInputPrefixPresetDialog(QDialog):
         layout.addWidget(self.lbl_selection_count)
         bind_table_selection_label(self.table, self.lbl_selection_count)
         self._table_updating = False
-        tip = QLabel("提示：双击单元格可直接编辑；“前缀内容”支持多行。")
+        tip = QLabel("提示：双击行或点“编辑前缀”可弹出完整编辑窗口；支持“上移/下移”调整顺序。")
         tip.setStyleSheet("color: #666; padding: 2px 0 4px 2px;")
         layout.addWidget(tip)
 
@@ -5625,6 +5900,7 @@ class ClearInputPrefixPresetDialog(QDialog):
                 log_internal_issue(f"加载增强输入前缀库失败: {self.config_path}", e)
         self._refresh_table()
         self.table.itemChanged.connect(self._on_table_item_changed)
+        self.table.itemDoubleClicked.connect(lambda *_: self._edit_preset())
 
         btn_layout = QHBoxLayout()
         btn_use = QPushButton("✅ 使用选中前缀")
@@ -5634,15 +5910,27 @@ class ClearInputPrefixPresetDialog(QDialog):
         btn_add.clicked.connect(self._add_preset)
         btn_edit = QPushButton("✏️ 编辑前缀")
         btn_edit.clicked.connect(self._edit_preset)
+        btn_up = QPushButton("⬆️ 上移")
+        btn_up.clicked.connect(lambda: self._move_preset(-1))
+        btn_down = QPushButton("⬇️ 下移")
+        btn_down.clicked.connect(lambda: self._move_preset(1))
+        btn_import = QPushButton("📥 导入")
+        btn_import.clicked.connect(self._import_presets)
+        btn_export = QPushButton("📤 导出")
+        btn_export.clicked.connect(self._export_presets)
         btn_del = QPushButton("❌ 删除前缀")
         btn_del.clicked.connect(self._del_preset)
         btn_layout.addWidget(btn_use)
         btn_layout.addWidget(btn_add)
         btn_layout.addWidget(btn_edit)
+        btn_layout.addWidget(btn_up)
+        btn_layout.addWidget(btn_down)
+        btn_layout.addWidget(btn_import)
+        btn_layout.addWidget(btn_export)
         btn_layout.addWidget(btn_del)
         layout.addLayout(btn_layout)
 
-    def _refresh_table(self):
+    def _refresh_table(self, selected_row=None):
         self._table_updating = True
         self.table.setRowCount(0)
         for p in self.presets:
@@ -5658,6 +5946,12 @@ class ClearInputPrefixPresetDialog(QDialog):
         for row in range(self.table.rowCount()):
             self.table.resizeRowToContents(row)
             self.table.setRowHeight(row, min(max(self.table.rowHeight(row), 34), 120))
+        self._filter_table(self.search_edit.text())
+        if selected_row is None:
+            selected_row = self.table.currentRow()
+        if 0 <= selected_row < self.table.rowCount():
+            self.table.setCurrentCell(selected_row, 0)
+            self.table.selectRow(selected_row)
 
     def _on_table_item_changed(self, item):
         if self._table_updating or not item:
@@ -5699,41 +5993,367 @@ class ClearInputPrefixPresetDialog(QDialog):
             log_internal_issue(f"保存增强输入前缀库失败: {self.config_path}", e)
             QMessageBox.warning(self, "保存失败", f"前缀库保存失败：\n{e}")
 
+    def _parse_import_text(self, raw_text):
+        text = str(raw_text or "").lstrip("\ufeff").strip()
+        if not text:
+            return []
+
+        imported = []
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                for idx, p in enumerate(obj):
+                    if not isinstance(p, dict):
+                        continue
+                    name = str(p.get("name", "")).strip() or f"导入{idx + 1}"
+                    prefix = str(p.get("prefix", ""))
+                    imported.append({"name": name, "prefix": prefix})
+                if imported:
+                    return imported
+        except Exception:
+            pass
+
+        for line in text.splitlines():
+            raw_line = line.rstrip("\r\n")
+            s = raw_line.strip()
+            if not s or s.startswith("#"):
+                continue
+
+            compact = s.lower().replace(" ", "")
+            if compact in {
+                "name|prefix", "名称|前缀", "名称|前缀内容",
+                "name,prefix", "名称,前缀", "名称,前缀内容",
+                "name\tprefix", "名称\t前缀", "名称\t前缀内容"
+            }:
+                continue
+
+            if "\t" in raw_line:
+                name, prefix = raw_line.split("\t", 1)
+            elif "|" in raw_line:
+                name, prefix = raw_line.split("|", 1)
+            elif "," in raw_line:
+                name, prefix = raw_line.split(",", 1)
+            else:
+                name, prefix = "", raw_line
+
+            name = str(name).strip() or f"导入{len(imported) + 1}"
+            prefix = str(prefix)
+            if name or prefix.strip():
+                imported.append({"name": name, "prefix": prefix})
+        return imported
+
+    def _import_presets(self):
+        path, selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "选择前缀数据文件",
+            "",
+            "Data Files (*.json *.csv *.txt);;All Files (*.*)"
+        )
+        if not path:
+            return
+
+        try:
+            items = []
+            lower_path = path.lower()
+            if lower_path.endswith(".csv") or "CSV" in selected_filter:
+                with open(path, "r", encoding="utf-8-sig", errors="ignore", newline="") as f:
+                    reader = csv.reader(f)
+                    for idx, row in enumerate(reader):
+                        if not row:
+                            continue
+                        header0 = str(row[0]).strip().lower() if len(row) > 0 else ""
+                        header1 = str(row[1]).strip().lower() if len(row) > 1 else ""
+                        if idx == 0 and header0 in {"name", "名称"} and header1 in {"prefix", "前缀", "前缀内容"}:
+                            continue
+                        name = str(row[0]).strip() if len(row) > 0 else ""
+                        prefix = str(row[1]) if len(row) > 1 else ""
+                        if name or prefix.strip():
+                            items.append({"name": name or f"导入{len(items) + 1}", "prefix": prefix})
+            else:
+                with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+                    items = self._parse_import_text(f.read())
+
+            if not items:
+                QMessageBox.warning(self, "导入失败", "没有解析到可用的前缀数据。")
+                return
+
+            mode, ok = QInputDialog.getItem(
+                self,
+                "导入模式",
+                "请选择导入方式：",
+                ["同名覆盖", "仅追加", "先清空再导入"],
+                0,
+                False
+            )
+            if not ok:
+                return
+
+            if mode == "先清空再导入":
+                self.presets = []
+
+            name_to_idx = {str(p.get("name", "")): i for i, p in enumerate(self.presets)}
+            added = 0
+            updated = 0
+            for p in items:
+                name = str(p.get("name", "")).strip() or f"导入{len(self.presets) + 1}"
+                prefix = str(p.get("prefix", ""))
+                if mode == "仅追加":
+                    base_name = name
+                    suffix = 2
+                    while name in name_to_idx:
+                        name = f"{base_name}_{suffix}"
+                        suffix += 1
+                    name_to_idx[name] = len(self.presets)
+                    self.presets.append({"name": name, "prefix": prefix})
+                    added += 1
+                elif name in name_to_idx:
+                    self.presets[name_to_idx[name]] = {"name": name, "prefix": prefix}
+                    updated += 1
+                else:
+                    name_to_idx[name] = len(self.presets)
+                    self.presets.append({"name": name, "prefix": prefix})
+                    added += 1
+
+            self._refresh_table()
+            self._save_user_presets()
+            QMessageBox.information(self, "导入完成", f"已导入完成：新增 {added} 条，更新 {updated} 条。")
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", f"读取或导入前缀数据失败：\n{e}")
+
+    def _export_presets(self):
+        sel_model = self.table.selectionModel()
+        sel_rows_model = sel_model.selectedRows() if sel_model else []
+        export_items = []
+        for m in sel_rows_model:
+            row = m.row()
+            if 0 <= row < len(self.presets):
+                export_items.append({
+                    "name": str(self.presets[row].get("name", "")),
+                    "prefix": str(self.presets[row].get("prefix", ""))
+                })
+        if not export_items:
+            export_items = [
+                {"name": str(p.get("name", "")), "prefix": str(p.get("prefix", ""))}
+                for p in self.presets
+            ]
+        if not export_items:
+            QMessageBox.warning(self, "提示", "前缀库为空，暂无可导出的内容。")
+            return
+
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出前缀库",
+            "prefix_presets.json",
+            "JSON Files (*.json);;CSV Files (*.csv);;Text Files (*.txt)"
+        )
+        if not path:
+            return
+
+        try:
+            if path.lower().endswith(".csv") or "CSV" in selected_filter:
+                if not path.lower().endswith(".csv"):
+                    path += ".csv"
+                with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["name", "prefix"])
+                    for p in export_items:
+                        writer.writerow([p["name"], p["prefix"]])
+            elif path.lower().endswith(".txt") or "Text" in selected_filter:
+                if not path.lower().endswith(".txt"):
+                    path += ".txt"
+                with open(path, "w", encoding="utf-8") as f:
+                    for p in export_items:
+                        f.write(f"{p['name']}|{p['prefix']}\n")
+            else:
+                if not path.lower().endswith(".json"):
+                    path += ".json"
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(export_items, f, ensure_ascii=False, indent=4)
+            QMessageBox.information(self, "导出完成", f"已导出 {len(export_items)} 条前缀。")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", f"导出前缀库失败：\n{e}")
+
+    def _get_current_row(self):
+        row = self.table.currentRow()
+        return row if 0 <= row < len(self.presets) else -1
+
     def _add_preset(self):
-        new_name = f"前缀{len(self.presets) + 1}"
-        self.presets.append({"name": new_name, "prefix": ""})
-        self._refresh_table()
-        self._save_user_presets()
+        default_name = f"前缀{len(self.presets) + 1}"
+        dlg = PrefixPresetEditorDialog(self, name=default_name, prefix="", title="➕ 添加前缀")
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        data = dlg.get_data()
+        self.presets.append({
+            "name": data["name"] or default_name,
+            "prefix": data["prefix"]
+        })
         row = len(self.presets) - 1
-        self.table.setCurrentCell(row, 0)
-        item = self.table.item(row, 0)
-        if item:
-            self.table.editItem(item)
+        self._refresh_table(selected_row=row)
+        self._save_user_presets()
 
     def _edit_preset(self):
-        item = self.table.currentItem()
-        row = item.row() if item else self.table.currentRow()
+        row = self._get_current_row()
         if row < 0:
             return
-        if not item:
-            item = self.table.item(row, 1) or self.table.item(row, 0)
-        if item:
-            self.table.setCurrentItem(item)
-            self.table.editItem(item)
+        current = self.presets[row]
+        dlg = PrefixPresetEditorDialog(
+            self,
+            name=current.get("name", ""),
+            prefix=current.get("prefix", ""),
+            title=f"✏️ 编辑前缀 - {current.get('name', '') or f'前缀{row + 1}'}"
+        )
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        data = dlg.get_data()
+        self.presets[row] = {
+            "name": data["name"] or f"前缀{row + 1}",
+            "prefix": data["prefix"]
+        }
+        self._refresh_table(selected_row=row)
+        self._save_user_presets()
+
+    def _move_preset(self, direction):
+        row = self._get_current_row()
+        if row < 0:
+            return
+        target_row = row + direction
+        if target_row < 0 or target_row >= len(self.presets):
+            return
+        self.presets[row], self.presets[target_row] = self.presets[target_row], self.presets[row]
+        self._refresh_table(selected_row=target_row)
+        self._save_user_presets()
 
     def _del_preset(self):
-        item = self.table.currentItem()
-        row = item.row() if item else self.table.currentRow()
+        row = self._get_current_row()
         if row < 0:
             return
         self.presets.pop(row)
-        self._refresh_table()
+        self._refresh_table(selected_row=min(row, len(self.presets) - 1))
         self._save_user_presets()
 
     def get_prefix(self):
-        item = self.table.currentItem()
-        row = item.row() if item else self.table.currentRow()
+        row = self._get_current_row()
         return self.table.item(row, 1).text() if row >= 0 and self.table.item(row, 1) else None
+
+class StepPostCheckDialog(QDialog):
+    """步骤执行后校验配置。"""
+
+    TYPE_OPTIONS = [
+        ("不校验", "none"),
+        ("图片出现", "image_exists"),
+        ("图片消失", "image_not_exists"),
+        ("窗口出现", "window_exists"),
+        ("窗口消失", "window_not_exists"),
+    ]
+
+    def __init__(self, current_config=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🧪 执行后结果判断")
+        self.resize(560, 260)
+
+        cfg = current_config if isinstance(current_config, dict) else {}
+        layout = QVBoxLayout(self)
+
+        tip = QLabel("动作执行完成后，会按这里的条件做验收。验收失败时，会自动进入当前步骤的重试次数和出错策略。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #555;")
+        layout.addWidget(tip)
+
+        form = QFormLayout()
+        self.type_combo = QComboBox()
+        for label, value in self.TYPE_OPTIONS:
+            self.type_combo.addItem(label, value)
+        current_type = str(cfg.get("type", "none") or "none")
+        idx = max(0, self.type_combo.findData(current_type))
+        self.type_combo.setCurrentIndex(idx)
+        form.addRow("校验方式:", self.type_combo)
+
+        target_row = QHBoxLayout()
+        self.target_edit = QLineEdit(str(cfg.get("target", "") or ""))
+        self.target_edit.setPlaceholderText("图片路径，或窗口标题 / 选择结果...")
+        self.btn_pick_target = QPushButton("选择")
+        self.btn_pick_target.setFixedWidth(64)
+        self.btn_pick_target.clicked.connect(self._pick_target)
+        target_row.addWidget(self.target_edit, 1)
+        target_row.addWidget(self.btn_pick_target)
+        form.addRow("校验目标:", target_row)
+
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(0, 60)
+        self.timeout_spin.setSuffix(" 秒")
+        self.timeout_spin.setValue(int(cfg.get("timeout", 3) or 3))
+        form.addRow("最长等待:", self.timeout_spin)
+
+        self.confidence_spin = QSpinBox()
+        self.confidence_spin.setRange(50, 99)
+        self.confidence_spin.setSuffix(" %")
+        self.confidence_spin.setValue(int(round(float(cfg.get("confidence", 0.8) or 0.8) * 100)))
+        form.addRow("找图相似度:", self.confidence_spin)
+
+        layout.addLayout(form)
+
+        self.lbl_hint = QLabel("")
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setStyleSheet("color: #666;")
+        layout.addWidget(self.lbl_hint)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_ok = QPushButton("✅ 保存")
+        btn_cancel = QPushButton("❌ 取消")
+        btn_ok.clicked.connect(self._save_and_accept)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        self.type_combo.currentIndexChanged.connect(self._refresh_ui)
+        self._refresh_ui()
+
+    def _current_type(self):
+        return self.type_combo.currentData() or "none"
+
+    def _refresh_ui(self):
+        mode = self._current_type()
+        is_image = mode in ("image_exists", "image_not_exists")
+        needs_target = mode != "none"
+        self.target_edit.setEnabled(needs_target)
+        self.btn_pick_target.setEnabled(needs_target)
+        self.confidence_spin.setEnabled(is_image)
+        self.btn_pick_target.setText("选图" if is_image else ("选窗" if needs_target else "选择"))
+        if mode == "none":
+            self.lbl_hint.setText("关闭后，该步骤只按“有没有报错”判断。")
+        elif is_image:
+            self.lbl_hint.setText("适合按钮出现、成功弹窗出现、上传完成标记出现等场景。")
+        else:
+            self.lbl_hint.setText("适合页面切换、弹窗出现、指定窗口关闭等场景。")
+
+    def _pick_target(self):
+        mode = self._current_type()
+        if mode in ("image_exists", "image_not_exists"):
+            file_path, _ = QFileDialog.getOpenFileName(self, "选择校验图片", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp)")
+            if file_path:
+                self.target_edit.setText(os.path.normpath(file_path))
+        elif mode in ("window_exists", "window_not_exists"):
+            selection = WindowSelector(self).get_selection()
+            if selection:
+                self.target_edit.setText(selection)
+
+    def _save_and_accept(self):
+        mode = self._current_type()
+        target = self.target_edit.text().strip()
+        if mode != "none" and not target:
+            QMessageBox.warning(self, "提示", "已开启执行后校验，请先填写校验目标。")
+            return
+        self.accept()
+
+    def get_config(self):
+        return {
+            "type": self._current_type(),
+            "target": self.target_edit.text().strip(),
+            "timeout": int(self.timeout_spin.value()),
+            "confidence": round(self.confidence_spin.value() / 100.0, 2),
+        }
 
 class AutoManager(QMainWindow):
     def __init__(self):
@@ -5923,7 +6543,9 @@ class AutoManager(QMainWindow):
         btn_rename_task = QPushButton("✏️ 改名"); btn_rename_task.clicked.connect(self._rename_task)
         btn_del_task = QPushButton("🗑️ 删除"); btn_del_task.clicked.connect(self._delete_task)
         btn_clone_task = QPushButton("📋 克隆"); btn_clone_task.clicked.connect(self._clone_task)
-        for btn in (btn_open_task, btn_add_task, btn_add_folder, btn_move_task, btn_rename_task, btn_del_task, btn_clone_task):
+        btn_import_task = QPushButton("📥 导入任务"); btn_import_task.clicked.connect(self._import_task_templates)
+        btn_export_task = QPushButton("📤 导出任务"); btn_export_task.clicked.connect(self._export_task_templates)
+        for btn in (btn_open_task, btn_add_task, btn_add_folder, btn_move_task, btn_rename_task, btn_del_task, btn_clone_task, btn_import_task, btn_export_task):
             btn.setMinimumWidth(0)
             btn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         
@@ -5931,6 +6553,7 @@ class AutoManager(QMainWindow):
         task_btn_grid.addWidget(btn_add_task, 1, 0); task_btn_grid.addWidget(btn_add_folder, 1, 1)
         task_btn_grid.addWidget(btn_move_task, 2, 0); task_btn_grid.addWidget(btn_rename_task, 2, 1)
         task_btn_grid.addWidget(btn_del_task, 3, 0); task_btn_grid.addWidget(btn_clone_task, 3, 1)
+        task_btn_grid.addWidget(btn_import_task, 4, 0); task_btn_grid.addWidget(btn_export_task, 4, 1)
         side_ly.addLayout(task_btn_grid)
         
         self.main_splitter.addWidget(side_panel)
@@ -6123,13 +6746,9 @@ class AutoManager(QMainWindow):
         btn_reset.clicked.connect(self._reset_data_to_presets); data_ctrl.addWidget(btn_reset)
         btn_add_data = QPushButton("➕ 添加数据"); btn_add_data.clicked.connect(self._add_data_row); data_ctrl.addWidget(btn_add_data)
         btn_del_data = QPushButton("❌ 删除数据"); btn_del_data.clicked.connect(self._del_data_row); data_ctrl.addWidget(btn_del_data)
+        btn_del_done_data = QPushButton("🧹 删除已完成"); btn_del_done_data.setToolTip("只删除当前任务里“已勾选”且状态为“完成”的数据行。"); btn_del_done_data.clicked.connect(self._del_completed_data_rows); data_ctrl.addWidget(btn_del_done_data)
         btn_batch_fill = QPushButton("🛠️ 批量填充"); btn_batch_fill.setStyleSheet("background-color: #f3e5f5; font-weight: bold;"); btn_batch_fill.setToolTip("批量填充账户、文件路径、输入文本等，支持文件夹扫描"); btn_batch_fill.clicked.connect(self._batch_assign_profiles); data_ctrl.addWidget(btn_batch_fill)
-
-        self.btn_manual_save = QPushButton("💾 保存数据"); 
-        self.btn_manual_save.setStyleSheet("background-color: #e8f5e9; border: 1px solid #4CAF50; font-weight: bold; color: #2e7d32;")
-        self.btn_manual_save.setToolTip("强制同步并保存当前表格中的所有手动改动")
-        self.btn_manual_save.clicked.connect(self._manual_save_data)
-        data_ctrl.addWidget(self.btn_manual_save)
+        btn_prefix_library = QPushButton("📚 前缀库"); btn_prefix_library.setStyleSheet("background-color: #fff8e1; border: 1px solid #ffd54f; font-weight: bold;"); btn_prefix_library.setToolTip("直接在主界面打开常用前缀库，无需先进入批量填充中心。"); btn_prefix_library.clicked.connect(self._open_prefix_library); data_ctrl.addWidget(btn_prefix_library)
 
         self.btn_select_all = QPushButton("☑️ 全选"); self.btn_select_all.clicked.connect(lambda: self._set_all_row_check_state(True)); data_ctrl.addWidget(self.btn_select_all)
         self.btn_deselect_all = QPushButton("☐ 取消全选"); self.btn_deselect_all.clicked.connect(lambda: self._set_all_row_check_state(False)); data_ctrl.addWidget(self.btn_deselect_all)
@@ -7001,6 +7620,79 @@ class AutoManager(QMainWindow):
             paths = [self.current_task]
         return paths
 
+    def _make_unique_task_name(self, base_name, folder="", exclude_task_id=None):
+        base_name = (base_name or "").strip() or "导入任务"
+        folder = (folder or "").strip().replace("\\", "/").strip("/")
+        existing_names = set()
+        for task_id in self.config.get("tasks", {}).keys():
+            if exclude_task_id and task_id == exclude_task_id:
+                continue
+            if self._get_task_folder(task_id) == folder:
+                existing_names.add(self._get_task_name_only(task_id))
+        if base_name not in existing_names:
+            return base_name
+        index = 2
+        while True:
+            candidate = f"{base_name}_{index}"
+            if candidate not in existing_names:
+                return candidate
+            index += 1
+
+    def _clear_exported_step_coordinates(self, step):
+        step = dict(step if isinstance(step, dict) else {})
+        step.pop("x", None)
+        step.pop("y", None)
+        step.pop("guard_image", None)
+        step.pop("guard_region", None)
+        step.pop("guard_window_title", None)
+        step.pop("guard_window_class", None)
+        step.pop("guard_threshold", None)
+        return step
+
+    def _build_task_template_payload(self, task_ids):
+        import copy
+        exported_tasks = []
+        for task_id in task_ids:
+            if task_id not in self.config.get("tasks", {}):
+                continue
+            raw_actions = self.config.get("tasks", {}).get(task_id, [])
+            actions = []
+            coord_step_names = []
+            for idx, step in enumerate(raw_actions):
+                cleaned_step = self._clear_exported_step_coordinates(step)
+                actions.append(cleaned_step)
+                if isinstance(step, dict) and (step.get("x") is not None or step.get("y") is not None):
+                    coord_step_names.append(step.get("name", f"步骤{idx + 1}"))
+            meta = copy.deepcopy(self._get_task_meta(task_id, create_missing=True))
+            meta.pop("created_at", None)
+            exported_tasks.append({
+                "name": self._get_task_name_only(task_id),
+                "folder": self._get_task_folder(task_id),
+                "meta": meta,
+                "actions": actions,
+                "task_data": copy.deepcopy(self.config.get("task_data", {}).get(task_id, [])),
+                "tasks_layout": copy.deepcopy(self.config.get("tasks_layout", {}).get(task_id, [])),
+                "coordinate_step_names": coord_step_names,
+            })
+        return {
+            "format": "task_template_bundle",
+            "version": 1,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "coordinates_removed": True,
+            "note": "导出的任务模板默认不包含坐标和界面守卫，导入后请重新录制相关步骤坐标。",
+            "tasks": exported_tasks,
+        }
+
+    def _normalize_imported_task_templates(self, payload):
+        if isinstance(payload, dict) and payload.get("format") == "task_template_bundle":
+            tasks = payload.get("tasks", [])
+            return tasks if isinstance(tasks, list) else []
+        if isinstance(payload, dict) and ("actions" in payload or "task_data" in payload):
+            return [payload]
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        return []
+
     def _prompt_target_folder(self, initial_folder=""):
         folders = ["(根目录)"] + self._get_all_folder_paths()
         current_text = initial_folder if initial_folder else "(根目录)"
@@ -7561,6 +8253,8 @@ class AutoManager(QMainWindow):
             menu = QMenu(self)
             menu.addAction("➕ 新建任务").triggered.connect(self._add_task)
             menu.addAction("📁 新建文件夹").triggered.connect(self._add_folder)
+            menu.addSeparator()
+            menu.addAction("📥 导入任务模板").triggered.connect(self._import_task_templates)
             menu.exec_(self.task_tree.viewport().mapToGlobal(pos))
             return
 
@@ -7577,6 +8271,7 @@ class AutoManager(QMainWindow):
             folder_name = self._tree_item_path(item)
             menu.addAction("➕ 在此文件夹新建任务").triggered.connect(lambda: self._add_task(folder=folder_name))
             menu.addAction("📁 在此文件夹新建子文件夹").triggered.connect(lambda: self._add_folder(parent_folder=folder_name))
+            menu.addAction("📥 导入任务模板").triggered.connect(self._import_task_templates)
             menu.addSeparator()
             menu.addAction("📂 展开/收起").triggered.connect(lambda: item.setExpanded(not item.isExpanded()))
             menu.addAction("✏️ 重命名文件夹").triggered.connect(lambda: self._rename_folder(item))
@@ -7585,6 +8280,7 @@ class AutoManager(QMainWindow):
             menu.addAction("📖 打开任务").triggered.connect(lambda checked=False, p=task_path: self._open_task_in_editor(p))
             menu.addAction("📂 移动到文件夹...").triggered.connect(self._move_selected_tasks_to_folder)
             menu.addAction("📋 克隆此任务").triggered.connect(self._clone_task)
+            menu.addAction("📤 导出任务模板").triggered.connect(self._export_task_templates)
             menu.addAction("✏️ 重命名任务").triggered.connect(self._rename_task)
             menu.addAction("🗑️ 删除任务").triggered.connect(self._delete_task)
             
@@ -7700,6 +8396,124 @@ class AutoManager(QMainWindow):
         self._reload_task_combo_after_config_change(self.current_task)
         self._log(f"⬇️ 任务 [{self._get_task_display_text(self.current_task, with_folder=True)}] 已下移", "blue")
 
+    def _import_task_templates(self):
+        p, _ = QFileDialog.getOpenFileName(self, "导入任务模板", "", "JSON Files (*.json)")
+        if not p:
+            return
+        try:
+            import copy
+            with open(p, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            items = self._normalize_imported_task_templates(payload)
+            if not items:
+                QMessageBox.warning(self, "导入失败", "没有解析到可导入的任务模板。")
+                return
+
+            added_task_ids = []
+            total_coord_steps = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip() or "导入任务"
+                folder = str(item.get("folder", "")).strip().replace("\\", "/").strip("/")
+                actions = item.get("actions", [])
+                actions = actions if isinstance(actions, list) else []
+                task_data = item.get("task_data", [])
+                task_data = copy.deepcopy(task_data if isinstance(task_data, list) else [])
+                task_layout = item.get("tasks_layout", [])
+                task_layout = copy.deepcopy(task_layout if isinstance(task_layout, list) else [])
+                coord_step_names = item.get("coordinate_step_names", [])
+                if not isinstance(coord_step_names, list):
+                    coord_step_names = []
+
+                cleaned_actions = []
+                for idx, step in enumerate(actions):
+                    cleaned_actions.append(self._clear_exported_step_coordinates(step))
+                    if idx < len(coord_step_names):
+                        total_coord_steps += 1
+                    elif isinstance(step, dict) and (step.get("x") is not None or step.get("y") is not None):
+                        total_coord_steps += 1
+
+                unique_name = self._make_unique_task_name(name, folder=folder)
+                self._ensure_folder_path_exists(folder)
+                task_id = _new_task_id(set(self.config.get("tasks", {}).keys()))
+                self.config['tasks'][task_id] = cleaned_actions
+                self.config['task_data'][task_id] = task_data
+                self.config.setdefault('tasks_layout', {})[task_id] = task_layout
+                self._set_task_location(task_id, folder=folder, name=unique_name)
+
+                raw_meta = item.get("meta", {})
+                if isinstance(raw_meta, dict):
+                    meta = self._get_task_meta(task_id, create_missing=True)
+                    for key, value in raw_meta.items():
+                        if key in ("name", "folder", "created_at"):
+                            continue
+                        meta[key] = copy.deepcopy(value)
+                    self.config["task_meta"][task_id] = _normalize_task_meta(task_id, meta)
+
+                added_task_ids.append(task_id)
+
+            if not added_task_ids:
+                QMessageBox.warning(self, "导入失败", "文件里没有有效任务。")
+                return
+
+            self.config['folders'] = sorted(set(self.config.get('folders', [])), key=lambda p: (p.count('/'), p.lower()))
+            save_config(self.config)
+            preferred_task = added_task_ids[0]
+            self._reload_task_combo_after_config_change(preferred_task)
+            self._refresh_schedule_task_options()
+            self._log(f"📥 已导入 {len(added_task_ids)} 个任务模板", "green")
+            import_hint = "\n请重新录制相关点击步骤坐标后再执行。" if total_coord_steps else ""
+            QMessageBox.information(
+                self,
+                "导入完成",
+                f"已导入 {len(added_task_ids)} 个任务。\n\n"
+                f"这些模板会保留步骤和批量数据，但坐标/界面守卫已清空。"
+                f"{import_hint}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导入任务模板失败: {str(e)}")
+
+    def _export_task_templates(self):
+        task_ids = self._get_selected_task_paths()
+        if not task_ids:
+            QMessageBox.warning(self, "提示", "请先选择要导出的任务。")
+            return
+
+        try:
+            if self.current_task and self.current_task in task_ids:
+                self._force_sync_action_widgets()
+                self._save_data_table()
+
+            payload = self._build_task_template_payload(task_ids)
+            if not payload.get("tasks"):
+                QMessageBox.warning(self, "提示", "没有可导出的任务内容。")
+                return
+
+            if len(task_ids) == 1:
+                default_name = f"{self._get_task_name_only(task_ids[0])}_模板.json"
+            else:
+                default_name = f"任务模板包_{datetime.now().strftime('%Y%m%d')}.json"
+            p, _ = QFileDialog.getSaveFileName(self, "导出任务模板", default_name, "JSON Files (*.json)")
+            if not p:
+                return
+
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=4, ensure_ascii=False)
+
+            coord_count = sum(len(task.get("coordinate_step_names", [])) for task in payload.get("tasks", []))
+            self._log(f"📤 已导出 {len(payload.get('tasks', []))} 个任务模板", "blue")
+            export_hint = "\n对方导入后需重新录制相关步骤坐标。" if coord_count else ""
+            QMessageBox.information(
+                self,
+                "导出完成",
+                f"已导出 {len(payload.get('tasks', []))} 个任务模板。\n\n"
+                "导出文件默认已去掉坐标和界面守卫，适合发给别人复用。"
+                f"{export_hint}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出任务模板失败: {str(e)}")
+
     def _import_full_config(self):
         p, _ = QFileDialog.getOpenFileName(self, "导入完整配置", "", "JSON Files (*.json)")
         if p:
@@ -7800,9 +8614,20 @@ class AutoManager(QMainWindow):
                 btn = QPushButton("- 无需坐标 -"); btn.setEnabled(False)
                 self.action_table.setCellWidget(i, 2, btn)
             else:
+                w_pos = QWidget()
+                l_pos = QHBoxLayout(w_pos)
+                l_pos.setContentsMargins(0, 0, 0, 0)
+                l_pos.setSpacing(6)
+                chk_guard = QCheckBox("匹配")
+                chk_guard.setChecked(bool(a.get('guard_enabled', True)))
+                chk_guard.setToolTip("开启时，执行前会校验当前界面是否与录制时一致；关闭后将直接按坐标执行，不做界面卫士匹配。")
+                chk_guard.stateChanged.connect(lambda state, idx=i: self._update_config(idx, 'guard_enabled', state == Qt.Checked))
                 btn = QPushButton(f"{a.get('x',0)}, {a.get('y',0)}")
+                btn.setToolTip("点击重新录制坐标")
                 btn.clicked.connect(lambda chk, idx=i: self._start_record(idx))
-                self.action_table.setCellWidget(i, 2, btn)
+                l_pos.addWidget(chk_guard)
+                l_pos.addWidget(btn, 1)
+                self.action_table.setCellWidget(i, 2, w_pos)
             if a.get('action') == "上传文件":
                 w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0)
                 le = QLineEdit(str(a.get('value', ''))); le.editingFinished.connect(lambda idx=i, target=None: self._update_config(idx, 'value', self.action_table.cellWidget(idx, 3).findChild(QLineEdit).text()))
@@ -8303,6 +9128,10 @@ class AutoManager(QMainWindow):
                     content_text = edits[1].text() if len(edits) > 1 else ""
                     self._update_config(row, 'value', f"{prefix_text}|{content_text}")
 
+    def _open_prefix_library(self):
+        dlg = ClearInputPrefixPresetDialog(self)
+        dlg.exec_()
+
     def _update_config(self, idx, key, val):
         if not self.current_task: return
         if key == 'row_value_update':
@@ -8532,6 +9361,8 @@ class AutoManager(QMainWindow):
         has_any = False
         all_checked = True
         for r in range(self.data_table.rowCount()):
+            if not self._is_data_row_selectable(r):
+                continue
             item = self.data_table.item(r, 0)
             if not item:
                 continue
@@ -8547,6 +9378,8 @@ class AutoManager(QMainWindow):
         has_any = False
         all_checked = True
         for r in range(self.data_table.rowCount()):
+            if not self._is_data_row_selectable(r):
+                continue
             item = self.data_table.item(r, 0)
             if not item:
                 continue
@@ -8562,7 +9395,8 @@ class AutoManager(QMainWindow):
         for r in range(self.data_table.rowCount()):
             item = self.data_table.item(r, 0)
             if item:
-                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                can_check = self._is_data_row_selectable(r)
+                item.setCheckState(Qt.Checked if checked and can_check else Qt.Unchecked)
         self.data_table.blockSignals(False)
         self._update_data_select_header()
         self._save_data_table()
@@ -8572,7 +9406,10 @@ class AutoManager(QMainWindow):
         for r in range(self.data_table.rowCount()):
             item = self.data_table.item(r, 0)
             if item:
-                item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+                if not self._is_data_row_selectable(r):
+                    item.setCheckState(Qt.Unchecked)
+                else:
+                    item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
         self.data_table.blockSignals(False)
         self._update_data_select_header()
         self._save_data_table()
@@ -8594,7 +9431,7 @@ class AutoManager(QMainWindow):
             for r in range(start, end + 1):
                 item = self.data_table.item(r, 0)
                 if item:
-                    item.setCheckState(state)
+                    item.setCheckState(state if checked and self._is_data_row_selectable(r) else Qt.Unchecked)
         finally:
             self.data_table.blockSignals(False)
         self._update_data_select_header()
@@ -8719,10 +9556,13 @@ class AutoManager(QMainWindow):
             row_dict = old_data[r] if r < len(old_data) else {}
             s_item = QTableWidgetItem(statuses.get(r, ""))
             s_item.setFlags(s_item.flags() & ~Qt.ItemIsEditable); s_item.setTextAlignment(Qt.AlignCenter)
+            self._apply_row_status_style(s_item, statuses.get(r, ""))
             self.data_table.setItem(r, 1, s_item)
             chk_item = QTableWidgetItem()
             chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            chk_item.setCheckState(Qt.Checked if row_dict.get("_选中", True) else Qt.Unchecked)
+            row_has_data = self._row_has_meaningful_data(row_dict, acts)
+            is_checked = bool(row_dict.get("_选中", True)) if row_has_data else False
+            chk_item.setCheckState(Qt.Checked if is_checked else Qt.Unchecked)
             self.data_table.setItem(r, 0, chk_item)
 
             col_idx = 2
@@ -8925,6 +9765,115 @@ class AutoManager(QMainWindow):
         else:
             self._schedule_config_flush()
 
+    def _row_has_meaningful_data(self, row_dict, actions):
+        if not isinstance(row_dict, dict):
+            return False
+        for action in actions:
+            act_type = CMD_MAP.get(action.get('action'), "click")
+            if act_type in ["click", "double_click", "right_click", "move", "hover_click", "scroll", "wait", "screenshot"]:
+                continue
+            step_name = action.get('name', '')
+            raw_val = row_dict.get(step_name, "")
+            s = str(raw_val or "").strip()
+            default_raw = action.get('value', '')
+            default_s = str(default_raw or "").strip()
+
+            delay_key = f"{step_name}_延时"
+            if str(row_dict.get(delay_key, "") or "").strip():
+                return True
+
+            skip_key = f"{step_name}_跳过"
+            if bool(row_dict.get(skip_key, False)):
+                return True
+
+            if act_type == "clear_input_plus":
+                if s == "[SKIP_ROW]":
+                    return True
+                parts = s.split("|", 1)
+                prefix = parts[0].strip() if len(parts) > 0 else ""
+                content = parts[1].strip() if len(parts) > 1 else ""
+                def_parts = default_s.split("|", 1)
+                def_prefix = def_parts[0].strip() if len(def_parts) > 0 else ""
+                def_content = def_parts[1].strip() if len(def_parts) > 1 else ""
+                if (prefix or content) and (prefix != def_prefix or content != def_content):
+                    return True
+            elif act_type == "open_url":
+                if s == "[SKIP_ROW]":
+                    return True
+                parts = s.split("|", 1)
+                url_part = parts[0].strip() if len(parts) > 0 else ""
+                profile_part = parts[1].strip() if len(parts) > 1 else ""
+                def_parts = default_s.split("|", 1)
+                def_url_part = def_parts[0].strip() if len(def_parts) > 0 else ""
+                def_profile_part = def_parts[1].strip() if len(def_parts) > 1 else ""
+                if (url_part or profile_part) and (url_part != def_url_part or profile_part != def_profile_part):
+                    return True
+            else:
+                if s and s != default_s:
+                    return True
+        return False
+
+    def _is_data_row_selectable(self, row_index, actions=None, data_rows=None):
+        if not self.current_task:
+            return False
+        if actions is None:
+            actions = self.config.get('tasks', {}).get(self.current_task, [])
+        if data_rows is None:
+            data_rows = self.config.get('task_data', {}).get(self.current_task, [])
+        if row_index < 0 or row_index >= len(data_rows):
+            return False
+        row_dict = data_rows[row_index] if isinstance(data_rows[row_index], dict) else {}
+        return self._row_has_meaningful_data(row_dict, actions)
+
+    def _auto_check_blank_rows(self, rows=None):
+        if not self.current_task:
+            return
+        actions = self.config.get('tasks', {}).get(self.current_task, [])
+        data_rows = self.config.get('task_data', {}).get(self.current_task, [])
+        if not data_rows:
+            return
+
+        if rows is None:
+            target_rows = range(len(data_rows))
+        else:
+            target_rows = []
+            for row in rows:
+                try:
+                    row = int(row)
+                except Exception:
+                    continue
+                if 0 <= row < len(data_rows):
+                    target_rows.append(row)
+
+        changed = False
+        self.data_table.blockSignals(True)
+        try:
+            for row in target_rows:
+                row_dict = data_rows[row] if row < len(data_rows) else {}
+                should_check = self._row_has_meaningful_data(row_dict, actions)
+                old_checked = bool(row_dict.get("_选中", False))
+                row_dict["_选中"] = should_check
+                if row < self.data_table.rowCount():
+                    chk_item = self.data_table.item(row, 0)
+                    target_state = Qt.Checked if should_check else Qt.Unchecked
+                    if chk_item and chk_item.checkState() != target_state:
+                        chk_item.setCheckState(target_state)
+                        changed = True
+                    elif chk_item is None:
+                        chk_item = QTableWidgetItem()
+                        chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                        chk_item.setCheckState(target_state)
+                        self.data_table.setItem(row, 0, chk_item)
+                        changed = True
+                if old_checked != should_check:
+                    changed = True
+        finally:
+            self.data_table.blockSignals(False)
+
+        if changed:
+            self._update_data_select_header()
+            self._save_data_table(flush=True)
+
     def _on_cell_widget_changed(self, row, col, val):
         item = self.data_table.item(row, col)
         if item:
@@ -9020,6 +9969,10 @@ class AutoManager(QMainWindow):
         lbl_info.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         left_header_row1.addWidget(lbl_info)
         left_header_row1.addStretch()
+        btn_batch_fill_menu = QPushButton("☰ 小菜单")
+        btn_batch_fill_menu.setFixedHeight(28)
+        btn_batch_fill_menu.setToolTip("打开批量填充中心的小菜单。")
+        left_header_row1.addWidget(btn_batch_fill_menu)
         left_header_v.addLayout(left_header_row1)
 
         # 工具按钮行：放进横向滚动容器，避免按钮过多导致左侧最小宽度过大，从而“拖不动分隔条”
@@ -9090,6 +10043,7 @@ class AutoManager(QMainWindow):
                 if curr_real_row not in selected_rows:
                     selected_rows.append(curr_real_row)
             _reload_preview_from_main(f"已实装新增 {num} 行", preserved_state=preview_state)
+            self._auto_check_blank_rows(selected_rows)
             
         btn_add_row_dlg.clicked.connect(_add_row_in_dlg)
         tools_h.addWidget(btn_add_row_dlg)
@@ -9148,6 +10102,7 @@ class AutoManager(QMainWindow):
 
         def _apply_toolbar_collapsed(collapsed):
             tools_scroll.setVisible(not collapsed)
+            btn_batch_fill_menu.setVisible(bool(collapsed))
             _toolbar_auto_state["collapsed"] = bool(collapsed)
 
         def _update_toolbar_auto_visibility(force=False):
@@ -9218,22 +10173,22 @@ class AutoManager(QMainWindow):
                     event.acceptProposedAction()
 
         # --- 核心改进：预览表列拆分逻辑 ---
-        preview_cols = [] # [(real_col_idx, step_name, act_type, sub_type)] sub_type: "prefix" or "content" or "url" or "profile" or None
+        preview_cols = [] # [(real_col_idx, step_idx, step_name, act_type, sub_type)] sub_type: "prefix" or "content" or "url" or "profile" or None
         for col_idx, s_idx, name, act_type in targets:
             if act_type == "clear_input_plus":
-                preview_cols.append((col_idx, name, act_type, "prefix"))
-                preview_cols.append((col_idx, name, act_type, "content"))
+                preview_cols.append((col_idx, s_idx, name, act_type, "prefix"))
+                preview_cols.append((col_idx, s_idx, name, act_type, "content"))
             elif act_type == "open_url":
-                preview_cols.append((col_idx, name, act_type, "url"))
-                preview_cols.append((col_idx, name, act_type, "profile"))
+                preview_cols.append((col_idx, s_idx, name, act_type, "url"))
+                preview_cols.append((col_idx, s_idx, name, act_type, "profile"))
             else:
-                preview_cols.append((col_idx, name, act_type, None))
+                preview_cols.append((col_idx, s_idx, name, act_type, None))
 
         # 核心数据预览表：显示选中的行和选中的步骤列
         preview_table = DragDropTable(len(selected_rows), len(preview_cols), dlg)
         
         headers = []
-        for _, name, act_type, sub in preview_cols:
+        for _, _, name, act_type, sub in preview_cols:
             if sub == "prefix": headers.append(f"{name}\n(前缀)")
             elif sub == "content": headers.append(f"{name}\n(内容)")
             elif sub == "url": headers.append(f"{name}\n(网址)")
@@ -9248,7 +10203,7 @@ class AutoManager(QMainWindow):
         preview_table.verticalHeader().setMinimumSectionSize(28)
         preview_table.verticalHeader().setMaximumSectionSize(160)
         preview_table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        for pc_idx, (_, _, act_type, sub) in enumerate(preview_cols):
+        for pc_idx, (_, _, _, act_type, sub) in enumerate(preview_cols):
             if (act_type in ["input", "clear_input"] and sub is None) or (act_type == "clear_input_plus" and sub == "content"):
                 preview_table.setItemDelegateForColumn(pc_idx, MultiLineTextDelegate(preview_table))
 
@@ -9296,12 +10251,38 @@ class AutoManager(QMainWindow):
                 lbl_info.setText(f"待处理行（共 {len(selected_rows)} 行）: [💡 支持直接拖入外部文件或右侧工具项]")
                 dlg.setWindowTitle(base_dialog_title)
 
+        def _show_batch_fill_mini_menu():
+            def _pick_preview_row_height():
+                value, ok = QInputDialog.getInt(
+                    dlg,
+                    "设置行高",
+                    "请输入预览区统一行高：",
+                    preview_row_height_spin.value(),
+                    28,
+                    160,
+                    1
+                )
+                if ok:
+                    preview_row_height_spin.setValue(value)
+
+            menu = QMenu(dlg)
+            menu.addAction("➕ 临时增加行", _add_row_in_dlg)
+            menu.addAction("📋 直贴表格", lambda: btn_paste_clipboard_dlg.click())
+            menu.addAction("🔄 同步表头", lambda: btn_sync_headers_dlg.click())
+            menu.addAction("🧹 重置预设", lambda: btn_reset_presets_dlg.click())
+            menu.addAction("🗑️ 删除选中行", lambda: btn_del_row_dlg.click())
+            menu.addSeparator()
+            menu.addAction(f"📏 设置行高（当前 {preview_row_height_spin.value()} px）", _pick_preview_row_height)
+            menu.exec_(btn_batch_fill_menu.mapToGlobal(btn_batch_fill_menu.rect().bottomLeft()))
+
+        btn_batch_fill_menu.clicked.connect(_show_batch_fill_mini_menu)
+
         def _reload_preview_from_main(extra_text="", preserved_state=None):
             preview_table.blockSignals(True)
             preview_table.setRowCount(len(selected_rows))
             preview_table.setVerticalHeaderLabels([f"第{r+1}行" for r in selected_rows])
             for r_idx, real_row in enumerate(selected_rows):
-                for pc_idx, (real_col, name, act_type, sub) in enumerate(preview_cols):
+                for pc_idx, (real_col, _step_idx, name, act_type, sub) in enumerate(preview_cols):
                     val = ""
                     item_backing = self.data_table.item(real_row, real_col)
                     if item_backing:
@@ -9750,9 +10731,9 @@ class AutoManager(QMainWindow):
         prefix_table = QTableWidget()
         prefix_table.setColumnCount(2)
         prefix_table.setHorizontalHeaderLabels(["名称", "前缀内容"])
-        prefix_table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        prefix_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         prefix_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        prefix_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.AnyKeyPressed)
+        prefix_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         prefix_table.setAlternatingRowColors(True)
         prefix_table.setWordWrap(True)
         prefix_table.verticalHeader().setDefaultSectionSize(34)
@@ -9765,14 +10746,15 @@ class AutoManager(QMainWindow):
         prefix_ly.addWidget(prefix_selection_count)
         bind_table_selection_label(prefix_table, prefix_selection_count)
         prefix_table_updating = [False]
-        prefix_tip = QLabel("提示：双击单元格可直接编辑；“前缀内容”支持多行。")
+        prefix_tip = QLabel("提示：双击行或点“编辑”可弹出完整编辑窗口；支持“上移/下移”调整顺序。")
         prefix_tip.setStyleSheet("color: #666; padding: 2px 0 0 2px;")
         prefix_ly.addWidget(prefix_tip)
 
-        def _refresh_prefix_table():
+        def _refresh_prefix_table(selected_idx=None):
             prefix_table_updating[0] = True
             prefix_table.setRowCount(0)
             keyword = prefix_search.text().strip().lower()
+            target_row = -1
             for idx, p in enumerate(prefix_presets):
                 name = str(p.get("name", ""))
                 prefix = str(p.get("prefix", ""))
@@ -9786,10 +10768,15 @@ class AutoManager(QMainWindow):
                 it_prefix.setData(Qt.UserRole, idx)
                 prefix_table.setItem(row, 0, it_name)
                 prefix_table.setItem(row, 1, it_prefix)
+                if idx == selected_idx:
+                    target_row = row
             prefix_table_updating[0] = False
             for row in range(prefix_table.rowCount()):
                 prefix_table.resizeRowToContents(row)
                 prefix_table.setRowHeight(row, min(max(prefix_table.rowHeight(row), 34), 120))
+            if 0 <= target_row < prefix_table.rowCount():
+                prefix_table.setCurrentCell(target_row, 0)
+                prefix_table.selectRow(target_row)
 
         def _on_prefix_item_changed(item):
             if prefix_table_updating[0] or not item:
@@ -9830,6 +10817,17 @@ class AutoManager(QMainWindow):
                 return -1
             idx = item.data(Qt.UserRole)
             return int(idx) if idx is not None else -1
+
+        def _select_prefix_idx(target_idx):
+            if target_idx < 0:
+                return
+            for row in range(prefix_table.rowCount()):
+                item = prefix_table.item(row, 0)
+                idx = int(item.data(Qt.UserRole)) if item and item.data(Qt.UserRole) is not None else -1
+                if idx == target_idx:
+                    prefix_table.setCurrentCell(row, 0)
+                    prefix_table.selectRow(row)
+                    return
 
         def _import_prefix_presets():
             imp = QDialog(dlg)
@@ -10079,28 +11077,50 @@ class AutoManager(QMainWindow):
                 QMessageBox.warning(dlg, "导出失败", f"导出前缀库失败：\n{e}")
 
         def _add_prefix_preset():
-            prefix_presets.append({"name": f"前缀{len(prefix_presets) + 1}", "prefix": ""})
+            default_name = f"前缀{len(prefix_presets) + 1}"
+            edit_dlg = PrefixPresetEditorDialog(dlg, name=default_name, prefix="", title="➕ 添加前缀")
+            if edit_dlg.exec_() != QDialog.Accepted:
+                return
+            data = edit_dlg.get_data()
+            prefix_presets.append({
+                "name": data["name"] or default_name,
+                "prefix": data["prefix"]
+            })
             _save_prefix_presets()
-            _refresh_prefix_table()
-            row = prefix_table.rowCount() - 1
-            if row >= 0:
-                prefix_table.setCurrentCell(row, 0)
-                item = prefix_table.item(row, 0)
-                if item:
-                    prefix_table.editItem(item)
+            _refresh_prefix_table(selected_idx=len(prefix_presets) - 1)
 
         def _edit_prefix_preset():
             idx = _get_current_prefix_idx()
             if idx < 0 or idx >= len(prefix_presets):
                 return
-            item = prefix_table.currentItem()
-            if not item:
-                row = prefix_table.currentRow()
-                if row >= 0:
-                    item = prefix_table.item(row, 1) or prefix_table.item(row, 0)
-            if item:
-                prefix_table.setCurrentItem(item)
-                prefix_table.editItem(item)
+            current = prefix_presets[idx]
+            edit_dlg = PrefixPresetEditorDialog(
+                dlg,
+                name=current.get("name", ""),
+                prefix=current.get("prefix", ""),
+                title=f"✏️ 编辑前缀 - {current.get('name', '') or f'前缀{idx + 1}'}"
+            )
+            if edit_dlg.exec_() != QDialog.Accepted:
+                return
+            data = edit_dlg.get_data()
+            prefix_presets[idx] = {
+                "name": data["name"] or f"前缀{idx + 1}",
+                "prefix": data["prefix"]
+            }
+            _save_prefix_presets()
+            _refresh_prefix_table(selected_idx=idx)
+
+        def _move_prefix_preset(direction):
+            idx = _get_current_prefix_idx()
+            if idx < 0 or idx >= len(prefix_presets):
+                return
+            target_idx = idx + direction
+            if target_idx < 0 or target_idx >= len(prefix_presets):
+                return
+            prefix_presets[idx], prefix_presets[target_idx] = prefix_presets[target_idx], prefix_presets[idx]
+            _save_prefix_presets()
+            _refresh_prefix_table(selected_idx=target_idx)
+            _select_prefix_idx(target_idx)
 
         def _del_prefix_preset():
             idx = _get_current_prefix_idx()
@@ -10111,7 +11131,7 @@ class AutoManager(QMainWindow):
                 return
             prefix_presets.pop(idx)
             _save_prefix_presets()
-            _refresh_prefix_table()
+            _refresh_prefix_table(selected_idx=min(idx, len(prefix_presets) - 1))
 
         def _apply_prefix_presets_to_preview():
             sel_model = prefix_table.selectionModel()
@@ -10138,7 +11158,7 @@ class AutoManager(QMainWindow):
 
             valid_targets = []
             for it in target_items:
-                _, step_name, act_type, sub = preview_cols[it.column()]
+                _, _, step_name, act_type, sub = preview_cols[it.column()]
                 if act_type == "clear_input_plus" and sub == "prefix":
                     valid_targets.append(it)
             if not valid_targets:
@@ -10153,6 +11173,8 @@ class AutoManager(QMainWindow):
         prefix_btns = QHBoxLayout()
         btn_prefix_add = QPushButton("➕ 添加")
         btn_prefix_edit = QPushButton("✏️ 编辑")
+        btn_prefix_up = QPushButton("⬆️ 上移")
+        btn_prefix_down = QPushButton("⬇️ 下移")
         btn_prefix_del = QPushButton("❌ 删除")
         btn_prefix_import = QPushButton("📥 导入")
         btn_prefix_export = QPushButton("📤 导出")
@@ -10160,6 +11182,8 @@ class AutoManager(QMainWindow):
         btn_prefix_apply.setStyleSheet("background: #e8f5e9; font-weight: bold;")
         prefix_btns.addWidget(btn_prefix_add)
         prefix_btns.addWidget(btn_prefix_edit)
+        prefix_btns.addWidget(btn_prefix_up)
+        prefix_btns.addWidget(btn_prefix_down)
         prefix_btns.addWidget(btn_prefix_del)
         prefix_btns.addWidget(btn_prefix_import)
         prefix_btns.addWidget(btn_prefix_export)
@@ -10172,8 +11196,11 @@ class AutoManager(QMainWindow):
         prefix_search.textChanged.connect(_refresh_prefix_table)
         btn_prefix_refresh.clicked.connect(lambda: [prefix_presets.clear(), prefix_presets.extend(_load_prefix_presets()), _refresh_prefix_table()])
         prefix_table.itemChanged.connect(_on_prefix_item_changed)
+        prefix_table.itemDoubleClicked.connect(lambda *_: _edit_prefix_preset())
         btn_prefix_add.clicked.connect(_add_prefix_preset)
         btn_prefix_edit.clicked.connect(_edit_prefix_preset)
+        btn_prefix_up.clicked.connect(lambda: _move_prefix_preset(-1))
+        btn_prefix_down.clicked.connect(lambda: _move_prefix_preset(1))
         btn_prefix_del.clicked.connect(_del_prefix_preset)
         btn_prefix_import.clicked.connect(_import_prefix_presets)
         btn_prefix_export.clicked.connect(_export_prefix_presets)
@@ -10560,14 +11587,18 @@ class AutoManager(QMainWindow):
                 for i in range(file_tree.topLevelItemCount()): _toggle(file_tree.topLevelItem(i))
             search_file.textChanged.connect(_filter_files)
 
-            def _make_smart_fill_step_key(real_col, act_type, sub=None):
+            def _make_smart_fill_step_key(step_idx, act_type, sub=None):
+                sub_key = sub if sub else "main"
+                return f"{int(step_idx)}|{act_type}|{sub_key}"
+
+            def _make_smart_fill_legacy_step_key(real_col, act_type, sub=None):
                 sub_key = sub if sub else "main"
                 return f"{int(real_col)}|{act_type}|{sub_key}"
 
             def _get_smart_fill_target_columns():
                 target_columns = []
                 seen = set()
-                for pc_idx, (real_col, step_name, act_type, sub) in enumerate(preview_cols):
+                for pc_idx, (real_col, step_idx, step_name, act_type, sub) in enumerate(preview_cols):
                     is_target = (
                         (act_type in ["upload", "drag_file", "run_app"] and sub is None) or
                         (act_type in ["input", "clear_input"] and sub is None) or
@@ -10575,19 +11606,19 @@ class AutoManager(QMainWindow):
                     )
                     if not is_target:
                         continue
-                    step_key = _make_smart_fill_step_key(real_col, act_type, sub)
+                    step_key = _make_smart_fill_step_key(step_idx, act_type, sub)
                     if step_key in seen:
                         continue
                     seen.add(step_key)
-                    target_columns.append((pc_idx, real_col, step_name, act_type, sub, step_key))
+                    target_columns.append((pc_idx, real_col, step_idx, step_name, act_type, sub, step_key))
                 return target_columns
 
             def _build_default_step_rule(step_name, act_type, sub, smart_rules):
                 if act_type in ["upload", "drag_file", "run_app"]:
-                    default_exts = smart_rules.get(
-                        "image_exts_text" if act_type == "upload" else "file_exts_text",
-                        SMART_FILL_IMAGE_EXTS_TEXT if act_type == "upload" else SMART_FILL_FILE_EXTS_TEXT
-                    )
+                    if act_type in ["upload", "drag_file"]:
+                        default_exts = smart_rules.get("image_exts_text", SMART_FILL_IMAGE_EXTS_TEXT)
+                    else:
+                        default_exts = smart_rules.get("file_exts_text", SMART_FILL_FILE_EXTS_TEXT)
                     return {
                         "step_name": step_name,
                         "target_kind": "file",
@@ -10596,20 +11627,27 @@ class AutoManager(QMainWindow):
                         "text_fill_mode": "content",
                         "shortage_action": "blank",
                     }
+                text_default_exts = (
+                    SMART_FILL_TXT_ONLY_EXTS_TEXT
+                    if act_type == "clear_input_plus" and sub == "content"
+                    else smart_rules.get("text_exts_text", SMART_FILL_TEXT_EXTS_TEXT)
+                )
                 return {
                     "step_name": step_name,
                     "target_kind": "text",
-                    "exts_text": str(smart_rules.get("text_exts_text", SMART_FILL_TEXT_EXTS_TEXT)),
+                    "exts_text": str(text_default_exts),
                     "consume_mode": "sequential",
                     "text_fill_mode": str(smart_rules.get("text_fill_mode", "content")),
                     "shortage_action": str(smart_rules.get("text_shortage_action", "skip_row")),
                 }
 
-            def _get_effective_step_rule(step_key, step_name, act_type, sub, smart_rules):
+            def _get_effective_step_rule(step_key, step_name, act_type, sub, smart_rules, legacy_step_key=None):
                 base = _build_default_step_rule(step_name, act_type, sub, smart_rules)
                 raw_map = smart_rules.get("step_rules", {})
                 if isinstance(raw_map, dict):
                     raw = raw_map.get(step_key)
+                    if not isinstance(raw, dict) and legacy_step_key:
+                        raw = raw_map.get(legacy_step_key)
                     if isinstance(raw, dict):
                         for k in ["exts_text", "consume_mode", "text_fill_mode", "shortage_action"]:
                             if k in raw:
@@ -10648,21 +11686,27 @@ class AutoManager(QMainWindow):
                 step_ly.addWidget(rule_table, 1)
 
                 row_widgets = []
-                for row_idx, (_, real_col, step_name, act_type, sub, step_key) in enumerate(target_columns):
-                    rule = _get_effective_step_rule(step_key, step_name, act_type, sub, smart_rules)
+                for row_idx, (_, real_col, step_idx, step_name, act_type, sub, step_key) in enumerate(target_columns):
+                    legacy_step_key = _make_smart_fill_legacy_step_key(real_col, act_type, sub)
+                    rule = _get_effective_step_rule(step_key, step_name, act_type, sub, smart_rules, legacy_step_key=legacy_step_key)
                     type_text = "文件上传/拖拽" if rule["target_kind"] == "file" else "文本填充"
                     if act_type == "clear_input_plus":
                         type_text = "增强文本内容"
 
                     it_name = QTableWidgetItem(step_name)
-                    it_name.setToolTip(f"列索引: {real_col} | 动作类型: {act_type}")
+                    it_name.setToolTip(f"步骤序号: {step_idx + 1} | 列索引: {real_col} | 动作类型: {act_type}")
                     it_type = QTableWidgetItem(type_text)
                     rule_table.setItem(row_idx, 0, it_name)
                     rule_table.setItem(row_idx, 1, it_type)
 
-                    le_exts = QLineEdit(str(rule.get("exts_text", "")))
-                    le_exts.setPlaceholderText(".png 或 .txt,.md")
-                    rule_table.setCellWidget(row_idx, 2, le_exts)
+                    cb_exts = _create_exts_combo(
+                        current_text=str(rule.get("exts_text", "")),
+                        target_kind=rule.get("target_kind", "file"),
+                        act_type=act_type,
+                        sub=sub,
+                        placeholder=".png 或 .txt,.md"
+                    )
+                    rule_table.setCellWidget(row_idx, 2, cb_exts)
 
                     cb_consume = QComboBox()
                     cb_consume.addItem("顺序消耗", "sequential")
@@ -10695,7 +11739,7 @@ class AutoManager(QMainWindow):
                         "act_type": act_type,
                         "sub": sub,
                         "target_kind": rule["target_kind"],
-                        "le_exts": le_exts,
+                        "cb_exts": cb_exts,
                         "cb_consume": cb_consume,
                         "cb_text_mode": cb_text_mode,
                         "cb_shortage": cb_shortage,
@@ -10732,7 +11776,7 @@ class AutoManager(QMainWindow):
                             row_data["sub"],
                             get_default_smart_fill_rules()
                         )
-                        row_data["le_exts"].setText(str(default_rule.get("exts_text", "")))
+                        row_data["cb_exts"].setEditText(str(default_rule.get("exts_text", "")))
                         idx = row_data["cb_consume"].findData(default_rule.get("consume_mode", "sequential"))
                         if idx >= 0:
                             row_data["cb_consume"].setCurrentIndex(idx)
@@ -10746,7 +11790,7 @@ class AutoManager(QMainWindow):
                 def _confirm_step_rules():
                     new_step_rules = {}
                     for row_data in row_widgets:
-                        exts_text = row_data["le_exts"].text().strip()
+                        exts_text = _get_combo_text(row_data["cb_exts"])
                         if not exts_text:
                             QMessageBox.warning(dlg_step, "提示", f"步骤「{row_data['step_name']}」请至少填写一个扩展名。")
                             return
@@ -10845,17 +11889,29 @@ class AutoManager(QMainWindow):
                     cb_text_shortage.setCurrentIndex(idx)
                 form.addRow("文本不足时:", cb_text_shortage)
 
-                le_image_exts = QLineEdit(str(rules.get("image_exts_text", SMART_FILL_IMAGE_EXTS_TEXT)))
-                le_image_exts.setPlaceholderText(".png,.jpg,.jpeg")
-                form.addRow("图片扩展名:", le_image_exts)
+                cb_image_exts = _create_exts_combo(
+                    current_text=str(rules.get("image_exts_text", SMART_FILL_IMAGE_EXTS_TEXT)),
+                    target_kind="file",
+                    act_type="upload",
+                    placeholder=".png,.jpg,.jpeg"
+                )
+                form.addRow("图片扩展名:", cb_image_exts)
 
-                le_text_exts = QLineEdit(str(rules.get("text_exts_text", SMART_FILL_TEXT_EXTS_TEXT)))
-                le_text_exts.setPlaceholderText(".txt,.md,.csv")
-                form.addRow("文本扩展名:", le_text_exts)
+                cb_text_exts = _create_exts_combo(
+                    current_text=str(rules.get("text_exts_text", SMART_FILL_TEXT_EXTS_TEXT)),
+                    target_kind="text",
+                    act_type="input",
+                    placeholder=".txt,.md,.csv"
+                )
+                form.addRow("文本扩展名:", cb_text_exts)
 
-                le_file_exts = QLineEdit(str(rules.get("file_exts_text", SMART_FILL_FILE_EXTS_TEXT)))
-                le_file_exts.setPlaceholderText(".png,.jpg,.txt,.zip,.mp4")
-                form.addRow("通用文件扩展名:", le_file_exts)
+                cb_file_exts = _create_exts_combo(
+                    current_text=str(rules.get("file_exts_text", SMART_FILL_FILE_EXTS_TEXT)),
+                    target_kind="file",
+                    act_type="run_app",
+                    placeholder=".png,.jpg,.txt,.zip,.mp4"
+                )
+                form.addRow("通用文件扩展名:", cb_file_exts)
 
                 rule_ly.addLayout(form)
 
@@ -10898,9 +11954,9 @@ class AutoManager(QMainWindow):
                     if idx >= 0: cb_text_fill_mode.setCurrentIndex(idx)
                     idx = cb_text_shortage.findData(rule_dict.get("text_shortage_action", "skip_row"))
                     if idx >= 0: cb_text_shortage.setCurrentIndex(idx)
-                    le_image_exts.setText(str(rule_dict.get("image_exts_text", SMART_FILL_IMAGE_EXTS_TEXT)))
-                    le_text_exts.setText(str(rule_dict.get("text_exts_text", SMART_FILL_TEXT_EXTS_TEXT)))
-                    le_file_exts.setText(str(rule_dict.get("file_exts_text", SMART_FILL_FILE_EXTS_TEXT)))
+                    cb_image_exts.setEditText(str(rule_dict.get("image_exts_text", SMART_FILL_IMAGE_EXTS_TEXT)))
+                    cb_text_exts.setEditText(str(rule_dict.get("text_exts_text", SMART_FILL_TEXT_EXTS_TEXT)))
+                    cb_file_exts.setEditText(str(rule_dict.get("file_exts_text", SMART_FILL_FILE_EXTS_TEXT)))
 
                 def _collect_rule_form():
                     return {
@@ -10912,9 +11968,9 @@ class AutoManager(QMainWindow):
                         "file_source": cb_file_source.currentData(),
                         "text_fill_mode": cb_text_fill_mode.currentData(),
                         "text_shortage_action": cb_text_shortage.currentData(),
-                        "image_exts_text": le_image_exts.text().strip(),
-                        "text_exts_text": le_text_exts.text().strip(),
-                        "file_exts_text": le_file_exts.text().strip(),
+                        "image_exts_text": _get_combo_text(cb_image_exts),
+                        "text_exts_text": _get_combo_text(cb_text_exts),
+                        "file_exts_text": _get_combo_text(cb_file_exts),
                         "step_rules": dict(rules.get("step_rules", {})) if isinstance(rules.get("step_rules", {}), dict) else {},
                     }
 
@@ -10945,7 +12001,7 @@ class AutoManager(QMainWindow):
             def _is_smart_fill_target_cell(item):
                 if not item:
                     return False
-                _, _, cell_act_type, cell_sub = preview_cols[item.column()]
+                _, _, _, cell_act_type, cell_sub = preview_cols[item.column()]
                 return (
                     (cell_act_type in ["upload", "drag_file", "run_app"] and cell_sub is None) or
                     (cell_act_type in ["input", "clear_input"] and cell_sub is None) or
@@ -11048,11 +12104,14 @@ class AutoManager(QMainWindow):
                     "pending_texts": pending_texts if pending_texts is not None else [],
                 }
                 for it in target_items:
-                    real_col, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
-                    step_key = _make_smart_fill_step_key(real_col, cell_act_type, cell_sub)
+                    real_col, step_idx, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
+                    step_key = _make_smart_fill_step_key(step_idx, cell_act_type, cell_sub)
                     if step_key in runtime["step_rules"]:
                         continue
-                    rule = _get_effective_step_rule(step_key, step_name, cell_act_type, cell_sub, smart_rules)
+                    legacy_step_key = _make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
+                    rule = _get_effective_step_rule(
+                        step_key, step_name, cell_act_type, cell_sub, smart_rules, legacy_step_key=legacy_step_key
+                    )
                     runtime["step_rules"][step_key] = rule
                     runtime["step_items"][step_key] = _build_bundle_step_items(bundle, rule, pending_texts=pending_texts)
                     runtime["step_cursors"][step_key] = [0]
@@ -11160,12 +12219,12 @@ class AutoManager(QMainWindow):
             def _bundle_has_more_rows(bundle_runtime, target_items, pending_text_only=False):
                 text_step_keys = []
                 for it in target_items:
-                    real_col, _, cell_act_type, cell_sub = preview_cols[it.column()]
+                    real_col, step_idx, _, cell_act_type, cell_sub = preview_cols[it.column()]
                     if (
                         (cell_act_type in ["input", "clear_input"] and cell_sub is None) or
                         (cell_act_type == "clear_input_plus" and cell_sub == "content")
                     ):
-                        step_key = _make_smart_fill_step_key(real_col, cell_act_type, cell_sub)
+                        step_key = _make_smart_fill_step_key(step_idx, cell_act_type, cell_sub)
                         if step_key not in text_step_keys:
                             text_step_keys.append(step_key)
                 if pending_text_only and text_step_keys:
@@ -11178,10 +12237,15 @@ class AutoManager(QMainWindow):
                         return False
                 has_sequential = False
                 for it in target_items:
-                    real_col, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
-                    step_key = _make_smart_fill_step_key(real_col, cell_act_type, cell_sub)
+                    real_col, step_idx, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
+                    step_key = _make_smart_fill_step_key(step_idx, cell_act_type, cell_sub)
                     rule = bundle_runtime["step_rules"].get(step_key) or _get_effective_step_rule(
-                        step_key, step_name, cell_act_type, cell_sub, smart_rules
+                        step_key,
+                        step_name,
+                        cell_act_type,
+                        cell_sub,
+                        smart_rules,
+                        legacy_step_key=_make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
                     )
                     items = bundle_runtime["step_items"].get(step_key, [])
                     cursor_holder = bundle_runtime["step_cursors"].setdefault(step_key, [0])
@@ -11192,8 +12256,8 @@ class AutoManager(QMainWindow):
                 if has_sequential:
                     return False
                 for it in target_items:
-                    real_col, _, cell_act_type, cell_sub = preview_cols[it.column()]
-                    step_key = _make_smart_fill_step_key(real_col, cell_act_type, cell_sub)
+                    real_col, step_idx, _, cell_act_type, cell_sub = preview_cols[it.column()]
+                    step_key = _make_smart_fill_step_key(step_idx, cell_act_type, cell_sub)
                     if bundle_runtime["step_items"].get(step_key):
                         return True
                 return False
@@ -11213,8 +12277,8 @@ class AutoManager(QMainWindow):
                     text_targets = []
                     file_targets = []
                     for it in target_items:
-                        real_col, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
-                        step_key = _make_smart_fill_step_key(real_col, cell_act_type, cell_sub)
+                        real_col, step_idx, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
+                        step_key = _make_smart_fill_step_key(step_idx, cell_act_type, cell_sub)
                         if (
                             (cell_act_type in ["input", "clear_input"] and cell_sub is None) or
                             (cell_act_type == "clear_input_plus" and cell_sub == "content")
@@ -11226,7 +12290,12 @@ class AutoManager(QMainWindow):
                     if text_targets:
                         first_it, step_key, step_name, cell_act_type, cell_sub = text_targets[0]
                         step_rule = bundle_runtime["step_rules"].get(step_key) or _get_effective_step_rule(
-                            step_key, step_name, cell_act_type, cell_sub, smart_rules
+                            step_key,
+                            step_name,
+                            cell_act_type,
+                            cell_sub,
+                            smart_rules,
+                            legacy_step_key=_make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
                         )
                         consume_mode = str(step_rule.get("consume_mode", "sequential"))
                         repeat_single = (consume_mode == "repeat_first")
@@ -11240,7 +12309,12 @@ class AutoManager(QMainWindow):
 
                     for _it, step_key, step_name, cell_act_type, cell_sub in file_targets:
                         step_rule = bundle_runtime["step_rules"].get(step_key) or _get_effective_step_rule(
-                            step_key, step_name, cell_act_type, cell_sub, smart_rules
+                            step_key,
+                            step_name,
+                            cell_act_type,
+                            cell_sub,
+                            smart_rules,
+                            legacy_step_key=_make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
                         )
                         consume_mode = str(step_rule.get("consume_mode", "sequential"))
                         repeat_single = (consume_mode == "repeat_first")
@@ -11253,7 +12327,12 @@ class AutoManager(QMainWindow):
                     if text_targets:
                         _it, step_key, step_name, cell_act_type, cell_sub = text_targets[0]
                         step_rule = bundle_runtime["step_rules"].get(step_key) or _get_effective_step_rule(
-                            step_key, step_name, cell_act_type, cell_sub, smart_rules
+                            step_key,
+                            step_name,
+                            cell_act_type,
+                            cell_sub,
+                            smart_rules,
+                            legacy_step_key=_make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
                         )
                         consume_mode = str(step_rule.get("consume_mode", "sequential"))
                         repeat_single = (consume_mode == "repeat_first")
@@ -11267,7 +12346,12 @@ class AutoManager(QMainWindow):
 
                     for _it, step_key, step_name, cell_act_type, cell_sub in file_targets:
                         step_rule = bundle_runtime["step_rules"].get(step_key) or _get_effective_step_rule(
-                            step_key, step_name, cell_act_type, cell_sub, smart_rules
+                            step_key,
+                            step_name,
+                            cell_act_type,
+                            cell_sub,
+                            smart_rules,
+                            legacy_step_key=_make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
                         )
                         consume_mode = str(step_rule.get("consume_mode", "sequential"))
                         repeat_single = (consume_mode == "repeat_first")
@@ -11282,10 +12366,15 @@ class AutoManager(QMainWindow):
                         return changed, skip_count, used_text_files, used_file_sources, used_real_source
 
                 for it in target_items:
-                    real_col, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
-                    step_key = _make_smart_fill_step_key(real_col, cell_act_type, cell_sub)
+                    real_col, step_idx, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
+                    step_key = _make_smart_fill_step_key(step_idx, cell_act_type, cell_sub)
                     step_rule = bundle_runtime["step_rules"].get(step_key) or _get_effective_step_rule(
-                        step_key, step_name, cell_act_type, cell_sub, smart_rules
+                        step_key,
+                        step_name,
+                        cell_act_type,
+                        cell_sub,
+                        smart_rules,
+                        legacy_step_key=_make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
                     )
                     consume_mode = str(step_rule.get("consume_mode", "sequential"))
                     repeat_single = (consume_mode == "repeat_first")
@@ -11791,7 +12880,7 @@ class AutoManager(QMainWindow):
                 # 核心批量填充逻辑：将选中的源数据按当前选区顺序填入目标格
                 for i, it in enumerate(target_items):
                     val = source_vals[i % len(source_vals)]
-                    _, _, cell_act_type, _ = preview_cols[it.column()]
+                    _, _, _, cell_act_type, _ = preview_cols[it.column()]
                     # [修复] 账号类型：val 是 (显示名, profile_id) 元组，需拆分处理
                     if isinstance(val, tuple):
                         disp_name, pid = val
@@ -11861,7 +12950,7 @@ class AutoManager(QMainWindow):
         _apply_toolbox_mode(saved_mode == "dual", save_mode=False)
 
         def _on_cell_clicked(row, col):
-            real_col, name, act_type, sub = preview_cols[col]
+            real_col, _step_idx, name, act_type, sub = preview_cols[col]
             display_type = f"{act_type}-{sub}" if sub else act_type
             cur_target_label.setText(f"🎯 当前填充目标: {name} ({display_type})")
             cur_target_label.setStyleSheet("""
@@ -11952,7 +13041,7 @@ class AutoManager(QMainWindow):
             for (real_row, real_col), data in row_col_data.items():
                 # 寻找该列对应的动作类型
                 act_type = ""
-                for rc, _, at, _ in preview_cols:
+                for rc, _, _, at, _ in preview_cols:
                     if rc == real_col:
                         act_type = at
                         break
@@ -12053,10 +13142,12 @@ class AutoManager(QMainWindow):
             # [关键修复] 强制触发一次界面重绘
             self.data_table.viewport().update()
             self._save_data_table()
+            self._auto_check_blank_rows(selected_rows)
             QMessageBox.information(self, "成功", "所有更改已应用。")
             
         btn_apply.clicked.connect(_apply_to_main)
         dlg.exec_()
+        self._auto_check_blank_rows(selected_rows)
 
     def _add_data_row(self):
         """添加数据行，支持批量添加。"""
@@ -12248,6 +13339,7 @@ class AutoManager(QMainWindow):
         menu.addSeparator()
         menu.addAction("➕ 批量添加空行").triggered.connect(self._add_data_row)
         menu.addAction("❌ 删除选中行").triggered.connect(self._del_data_row)
+        menu.addAction("🧹 删除已完成行").triggered.connect(self._del_completed_data_rows)
         menu.exec_(self.data_table.viewport().mapToGlobal(pos))
 
     def _toggle_step_skip(self, row, step_name, should_skip):
@@ -12286,7 +13378,61 @@ class AutoManager(QMainWindow):
         rows = sorted(list(set([i.row() for i in self.data_table.selectedItems()])), reverse=True)
         if not rows: return
         for r in rows: self.config['task_data'][self.current_task].pop(r)
+        if hasattr(self, '_row_statuses') and self.current_task in self._row_statuses:
+            old_statuses = self._row_statuses.get(self.current_task, {})
+            removed = set(rows)
+            new_statuses = {}
+            shift = 0
+            for idx in range(len(self.config['task_data'][self.current_task]) + len(rows)):
+                if idx in removed:
+                    shift += 1
+                    continue
+                if idx in old_statuses:
+                    new_statuses[idx - shift] = old_statuses[idx]
+            self._row_statuses[self.current_task] = new_statuses
         save_config(self.config); self._refresh_data_table()
+
+    def _del_completed_data_rows(self):
+        if not self.current_task:
+            return
+        self._save_data_table(flush=True)
+        data_rows = self.config.get('task_data', {}).get(self.current_task, [])
+        statuses = self._row_statuses.get(self.current_task, {})
+        rows = []
+        for idx in range(len(data_rows)):
+            if statuses.get(idx) != ROW_STATUS_OK:
+                continue
+            row_dict = data_rows[idx] if isinstance(data_rows[idx], dict) else {}
+            if not bool(row_dict.get("_选中", False)):
+                continue
+            rows.append(idx)
+        if not rows:
+            QMessageBox.information(self, "提示", "当前没有“已勾选”且“已完成”的行可删除。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "删除已完成行",
+            f"确定删除当前任务里 {len(rows)} 行“已勾选”且“已完成”的数据吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        removed = set(rows)
+        for r in sorted(rows, reverse=True):
+            self.config['task_data'][self.current_task].pop(r)
+        new_statuses = {}
+        shift = 0
+        for idx in range(len(data_rows)):
+            if idx in removed:
+                shift += 1
+                continue
+            if idx in statuses:
+                new_statuses[idx - shift] = statuses[idx]
+        self._row_statuses[self.current_task] = new_statuses
+        save_config(self.config)
+        self._refresh_data_table()
+        self._log(f"🧹 已删除 {len(rows)} 行已完成数据", "green")
     def _refresh_win_combos(self):
         """刷新数据表中所有「激活窗口」列的窗口下拉列表。"""
         titles = sorted(list(set([t for t in gw.getAllTitles() if t.strip()])))
@@ -12525,13 +13671,21 @@ class AutoManager(QMainWindow):
             try:
                 # 1. 更新内存数据
                 acts[self.recording_idx].update({'x': x, 'y': y})
+                step_name = acts[self.recording_idx].get('name', f'步骤{self.recording_idx+1}')
+                try:
+                    guard_info = create_action_guard_snapshot(self.current_task, step_name, x, y)
+                    acts[self.recording_idx].update(guard_info)
+                    if guard_info.get("guard_image"):
+                        self._log(f"🧭 已同步保存界面守卫快照: {os.path.basename(guard_info['guard_image'])}", "gray")
+                except Exception as guard_err:
+                    log_internal_issue(f"录制界面守卫失败: {self.current_task} / {self.recording_idx}", guard_err)
+                    self._log(f"⚠️ 坐标已保存，但界面守卫快照保存失败: {guard_err}", "orange")
                 self._log(f"💾 内存数据已更新: {acts[self.recording_idx]}", "gray")
                 
                 # 2. 物理保存到文件
                 save_config(self.config)
                 self._log(f"💾 配置文件已物理保存到硬盘", "gray")
                 
-                step_name = acts[self.recording_idx].get('name', f'步骤{self.recording_idx+1}')
                 self._log(f"✅ 坐标已录制: [{step_name}] -> ({x}, {y})", "green")
                 
                 # 3. 同步更新 UI：流程编排表
@@ -12591,6 +13745,24 @@ class AutoManager(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "导入失败", str(e))
 
+    def _apply_row_status_style(self, item, status):
+        if not item:
+            return
+        item.setText(status)
+        item.setTextAlignment(Qt.AlignCenter)
+        if status == ROW_STATUS_OK:
+            item.setBackground(QColor("#c8e6c9"))
+        elif status == ROW_STATUS_FAIL:
+            item.setBackground(QColor("#ffcdd2"))
+        elif status == ROW_STATUS_SKIP:
+            item.setBackground(QColor("#fff9c4"))
+        elif status == ROW_STATUS_DEFER:
+            item.setBackground(QColor("#dbeafe"))
+        elif status == ROW_STATUS_MANUAL:
+            item.setBackground(QColor("#ffe0b2"))
+        else:
+            item.setBackground(QColor("#ffffff"))
+
     def _on_row_status(self, row_idx, status):
         """Called from engine thread via signal — update status cell and cache."""
         if self.current_task not in self._row_statuses:
@@ -12601,12 +13773,7 @@ class AutoManager(QMainWindow):
             if not item:
                 item = QTableWidgetItem(); item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 self.data_table.setItem(row_idx, 1, item)
-            item.setText(status)
-            item.setTextAlignment(Qt.AlignCenter)
-            if status == ROW_STATUS_OK:   item.setBackground(QColor("#c8e6c9"))
-            elif status == ROW_STATUS_FAIL: item.setBackground(QColor("#ffcdd2"))
-            elif status == ROW_STATUS_SKIP: item.setBackground(QColor("#fff9c4"))
-            elif status == ROW_STATUS_DEFER: item.setBackground(QColor("#dbeafe"))
+            self._apply_row_status_style(item, status)
 
     def _on_highlight(self, row_idx, step_idx):
         """Highlight the currently-executing data row; clear when row_idx==-1."""
@@ -12635,6 +13802,7 @@ class AutoManager(QMainWindow):
                         elif st == ROW_STATUS_FAIL: item.setBackground(QColor("#ffcdd2"))
                         elif st == ROW_STATUS_SKIP: item.setBackground(QColor("#fff9c4"))
                         elif st == ROW_STATUS_DEFER: item.setBackground(QColor("#dbeafe"))
+                        elif st == ROW_STATUS_MANUAL: item.setBackground(QColor("#ffe0b2"))
                         else: item.setBackground(QColor(base_color))
         if row_idx >= 0:
             self.data_table.scrollToItem(self.data_table.item(row_idx, 2) or self.data_table.item(row_idx, 1))
@@ -13422,12 +14590,19 @@ class AutoManager(QMainWindow):
 
     # ── Feature 8: Global Hotkeys ─────────────────────────────────────────────
     def _default_hotkeys(self):
-        return {"pause": "F9", "stop": "F10", "capture": "F8"}
+        return {
+            "pause": "F9",
+            "stop": "F10",
+            "capture": "F8",
+            "skip_step": "F6",
+            "next_row": "F7",
+            "retry_step": "F5"
+        }
 
     def _register_hotkeys(self):
         """[增强] 注册全局控制热键：F9启动/暂停，F10停止。"""
         if not HAS_KEYBOARD:
-            self.lbl_hotkey.setText("⚠️ 未安装 keyboard 库，F9/F10 全局热键不可用")
+            self.lbl_hotkey.setText("⚠️ 未安装 keyboard 库，执行控制全局热键不可用")
             return
         
         try:
@@ -13439,14 +14614,28 @@ class AutoManager(QMainWindow):
             pause_key = hk.get("pause", "F9")
             stop_key  = hk.get("stop",  "F10")
             cap_key   = hk.get("capture", "F8")
+            skip_key  = hk.get("skip_step", "F6")
+            next_key  = hk.get("next_row", "F7")
+            retry_key = hk.get("retry_step", "F5")
 
             # 注册新热键
             h1 = keyboard.add_hotkey(pause_key, self._hotkey_pause_toggle)
             h2 = keyboard.add_hotkey(stop_key,  self._hotkey_stop)
             h3 = keyboard.add_hotkey(cap_key,   self._hotkey_capture)
-            self._hotkey_hooks = [h1, h2, h3]
+            h4 = keyboard.add_hotkey(skip_key, self._hotkey_skip_step)
+            h5 = keyboard.add_hotkey(next_key, self._hotkey_next_row)
+            h6 = keyboard.add_hotkey(retry_key, self._hotkey_retry_step)
+            self._hotkey_hooks = [h1, h2, h3, h4, h5, h6]
             
-            self.lbl_hotkey.setText(f"⌨️ 全局热键: [{pause_key}] 暂停/继续  [{stop_key}] 停止")
+            self.lbl_hotkey.setText(
+                f"⌨️ 全局热键: [{pause_key}] 暂停/继续  [{skip_key}] 跳步  "
+                f"[{next_key}] 下一行  [{retry_key}] 重试  [{stop_key}] 停止"
+            )
+            if hasattr(self, 'osd'):
+                self.osd.btn_skip_step.setToolTip(f"跳过当前步骤，直接执行下一步\n快捷键: {skip_key}")
+                self.osd.btn_next_row.setToolTip(f"放弃当前行剩余步骤，跳到下一行开始执行\n快捷键: {next_key}")
+                self.osd.btn_retry.setToolTip(f"重新执行当前步骤（不跳过，重来一次）\n快捷键: {retry_key}")
+                self.osd.btn_stop.setToolTip(f"终止整个任务\n快捷键: {stop_key}")
         except Exception as e:
             self.lbl_hotkey.setText(f"⚠️ 热键注册失败: {e}")
 
@@ -13477,6 +14666,15 @@ class AutoManager(QMainWindow):
     def _hotkey_capture(self):
         QTimer.singleShot(0, self._start_region_capture)
 
+    def _hotkey_skip_step(self):
+        QTimer.singleShot(0, self._osd_skip_step)
+
+    def _hotkey_next_row(self):
+        QTimer.singleShot(0, self._osd_next_row)
+
+    def _hotkey_retry_step(self):
+        QTimer.singleShot(0, self._osd_retry_step)
+
     def _on_hotkey_paused(self, l, t, s):
         self.resume_point = (l, t, s)
         self.btn_resume.setEnabled(True)
@@ -13484,15 +14682,22 @@ class AutoManager(QMainWindow):
 
     def _show_hotkey_settings(self):
         hk = self.config.get("hotkeys", self._default_hotkeys())
-        dlg = QDialog(self); dlg.setWindowTitle("⌨️ 全局热键设置"); dlg.resize(400, 300)
+        dlg = QDialog(self); dlg.setWindowTitle("⌨️ 全局热键设置"); dlg.resize(420, 380)
         ly = QVBoxLayout(dlg)
         ly.addWidget(QLabel("修改后点击保存，重启程序或手动触发注册生效："))
-        form_rows = [("暂停/继续 热键:", "pause"), ("停止 热键:", "stop"), ("框选截图 热键:", "capture")]
+        form_rows = [
+            ("暂停/继续 热键:", "pause"),
+            ("停止 热键:", "stop"),
+            ("框选截图 热键:", "capture"),
+            ("跳过当前步骤 热键:", "skip_step"),
+            ("切到下一行 热键:", "next_row"),
+            ("重试当前步骤 热键:", "retry_step")
+        ]
         edits = {}
         for label, key in form_rows:
             row = QHBoxLayout(); row.addWidget(QLabel(label))
             ed = QLineEdit(hk.get(key, "")); row.addWidget(ed); edits[key] = ed; ly.addLayout(row)
-        ly.addWidget(QLabel("示例: F8  F9  ctrl+shift+p  alt+s"))
+        ly.addWidget(QLabel("示例: F5  F6  F7  F8  F9  F10  ctrl+shift+p  alt+s"))
         btns = QHBoxLayout()
         btn_ok = QPushButton("💾 保存并应用"); btn_cancel = QPushButton("取消")
         btn_ok.clicked.connect(dlg.accept); btn_cancel.clicked.connect(dlg.reject)
