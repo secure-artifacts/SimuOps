@@ -47,7 +47,7 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItemIterator, QStackedWidget, QGridLayout, QStyle, QFrame, QSizePolicy,
     QStyledItemDelegate, QSlider, QScrollArea
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint, QSize, QDate, QTime, QDateTime, QRect, QItemSelectionModel
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint, QSize, QDate, QTime, QDateTime, QRect, QItemSelectionModel, QEvent
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap, QCursor, QIcon, QFont, QBrush, QDrag, QTextOption
 from PyQt5.QtWidgets import QRubberBand
 
@@ -4561,9 +4561,13 @@ class FloatingProgressWindow(QWidget):
         super().__init__(parent)
         self._pinned = True   # 是否始终置顶
         self._collapsed = False  # 是否折叠日志区
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.X11BypassWindowManagerHint)
+        flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        if sys.platform.startswith('linux'):
+            flags |= Qt.X11BypassWindowManagerHint
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        # Windows 下如果“显示但不激活”，悬浮窗容易出现能看见但按钮不响应点击的问题。
+        self.setAttribute(Qt.WA_ShowWithoutActivating, not sys.platform.startswith('win'))
 
         self.resize(520, 210)  # 增大宽度以容纳更多按钮
 
@@ -4704,6 +4708,14 @@ class FloatingProgressWindow(QWidget):
 
         layout.addWidget(self.container)
 
+        self._interactive_widgets = (
+            self.btn_pause, self.btn_skip_step, self.btn_next_row,
+            self.btn_retry, self.btn_stop, self.btn_copy_log,
+            self.btn_pin, self.btn_collapse, self.log_area
+        )
+        for widget in self._interactive_widgets:
+            widget.installEventFilter(self)
+
         self._dragging = False
         self._drag_pos = QPoint()
 
@@ -4724,6 +4736,15 @@ class FloatingProgressWindow(QWidget):
         y = screen_geo.y() + max(0, int(top_margin))
         self.move(x, y)
 
+    def _bring_to_front(self):
+        """保持悬浮窗在最前，但不强抢输入焦点。"""
+        try:
+            self.raise_()
+        except Exception:
+            pass
+        if sys.platform == 'win32':
+            self._force_topmost(-1)
+
     def update_progress(self, task_name, loop, group, total_groups, step, total_steps, step_name, percent):
         info = f"<b>{task_name}</b> | 组 {group}/{total_groups} | 步 {step}/{total_steps}: <font color='#82b1ff'>{step_name}</font>"
         self.lbl_info.setText(info)
@@ -4737,7 +4758,23 @@ class FloatingProgressWindow(QWidget):
             if sys.platform == 'win32':
                 self._force_topmost(-1)
 
+    def _ensure_interaction_ready(self):
+        """确保悬浮窗在鼠标操作前进入可交互状态。"""
+        try:
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):
+        if obj in getattr(self, "_interactive_widgets", ()) and event.type() in (
+            QEvent.MouseButtonPress, QEvent.MouseButtonDblClick, QEvent.FocusIn
+        ):
+            self._ensure_interaction_ready()
+        return super().eventFilter(obj, event)
+
     def mousePressEvent(self, event):
+        self._ensure_interaction_ready()
         child = self.childAt(event.pos())
         if isinstance(child, (QPushButton, QTextEdit)):
             event.ignore()
@@ -10529,6 +10566,17 @@ class AutoManager(QMainWindow):
         try:
             if not self.current_task:
                 return
+            existing = getattr(self, "_subtask_progress_dialog", None)
+            try:
+                if existing and existing.isVisible():
+                    existing.showNormal()
+                    existing.raise_()
+                    existing.activateWindow()
+                    return
+            except RuntimeError:
+                self._subtask_progress_dialog = None
+            except Exception:
+                pass
             rows = self._get_checked_data_rows()
             if not rows:
                 QMessageBox.information(self, "提示", "请先在“批量数据”里勾选至少一行。")
@@ -10546,11 +10594,24 @@ class AutoManager(QMainWindow):
             except Exception:
                 pass
             self._subtask_progress_dialog = dlg
-            try:
-                dlg.exec_()
-            finally:
+            dlg.setModal(False)
+            dlg.setWindowModality(Qt.NonModal)
+            dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+
+            def _clear_subtask_dialog_ref(*_args):
                 if getattr(self, "_subtask_progress_dialog", None) is dlg:
                     self._subtask_progress_dialog = None
+
+            try:
+                dlg.finished.connect(_clear_subtask_dialog_ref)
+                dlg.destroyed.connect(_clear_subtask_dialog_ref)
+            except Exception:
+                pass
+
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            self._keep_osd_front_and_clear(recenter=True)
         except Exception as e:
             # 记录详细调用栈到日志区；弹窗只给出精简信息，避免噪音
             tb = traceback.format_exc()
@@ -10959,9 +11020,7 @@ class AutoManager(QMainWindow):
         self.osd.lbl_pct.setText("0%")
         self.osd.lbl_detail.setText("准备就绪")
         self.osd.show()
-        self.osd.raise_()
-        if sys.platform == 'win32':
-            self.osd._force_topmost(-1)
+        self._keep_osd_front_and_clear(recenter=True)
 
     def _update_osd_subtask(self, percent):
         if getattr(self, "_ui_stop_reset_pending", False):
@@ -10989,6 +11048,17 @@ class AutoManager(QMainWindow):
                 cur_act.get('name', 'Step'),
                 percent
             )
+            self._keep_osd_front_and_clear()
+
+    def _keep_osd_front_and_clear(self, recenter=False):
+        if not hasattr(self, "osd") or not self.osd.isVisible():
+            return
+        try:
+            if recenter:
+                self.osd._move_to_top_center()
+            self.osd._bring_to_front()
+        except Exception:
+            self.osd._bring_to_front()
 
     def _schedule_config_flush(self, delay_ms=260):
         """合并短时间内的频繁保存请求，减少输入时卡顿。"""
