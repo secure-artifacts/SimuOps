@@ -6273,6 +6273,10 @@ class AutoEngine(QThread):
                         pyautogui.typewrite(url, interval=0.01)
                     self._cooperative_sleep(0.05)
                     pyautogui.press('enter')
+                    if should_std:
+                        # 这里原先会提前 return，导致“打开网址”分支跳过统一的标准化逻辑
+                        self._cooperative_sleep(1)
+                        self._standardize_browser_window()
                     return None
                 except Exception as e:
                     raise RuntimeError(f"使用已打开窗口打开网址失败: {e}")
@@ -6449,7 +6453,6 @@ class AutoEngine(QThread):
                     threading.Thread(target=_async_force_standardize, daemon=True).start()
                 else:
                     import webbrowser; webbrowser.open(url)
-                return None
             else:
                 import webbrowser; webbrowser.open(url)
         elif act_type == "run_app":  os.startfile(val) if sys.platform == 'win32' else os.system(val)
