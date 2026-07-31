@@ -1331,6 +1331,10 @@ class StepGuardMismatchError(RuntimeError):
     """界面守卫未通过时抛出，调用方应跳过当前行而不是终止整个任务。"""
     pass
 
+class ExecutionInterrupted(RuntimeError):
+    """步骤在执行中被人工控制打断（停止/跳步/下一行/重试）时抛出。"""
+    pass
+
 def is_same_path(p1, p2):
     """[深度归一化版] 智能路径比对。
     核心逻辑：只要物理位置相同，或者规范化后的路径（处理了 Default 后缀差异）相同，即视为同一账号。"""
@@ -1422,6 +1426,14 @@ def get_profile_display_name(profile_id):
       3) 最终兜底返回 '自定义路径账号 (parent/basename)' 而非纯 basename。
     """
     if not profile_id: return "未设置账户"
+    # [增强] 允许在 open_url 的“账号/目标”位置填入窗口句柄（用于直接激活已打开的浏览器窗口）
+    # 形如：xxx::hwnd=123456 或 ::hwnd=123456
+    try:
+        if isinstance(profile_id, str) and "::hwnd=" in profile_id:
+            left = profile_id.split("::hwnd=", 1)[0].strip()
+            return left if left else "已打开窗口"
+    except Exception:
+        pass
     # 如果是路径，尝试从路径中提取
     if "\\" in profile_id or "/" in profile_id:
         norm_id = os.path.normpath(profile_id)
@@ -1707,6 +1719,64 @@ def build_window_display_text(raw_title, hwnd=None, prefix="", profile_meta=None
         extras.append(f"#{str(int(hwnd))[-4:]}")
     suffix = f" 〔{' | '.join(extras)}〕" if extras else ""
     return f"{prefix}{title}{suffix}"
+
+def find_browser_window_hwnd_by_hint(target_hint):
+    """按窗口标题/账号标识/展示文案匹配已打开浏览器窗口，返回 hwnd。"""
+    if sys.platform != "win32" or not target_hint:
+        return None
+    hint = str(target_hint or "").strip()
+    if not hint:
+        return None
+    hint_lower = hint.lower()
+    seen_hwnds = set()
+    try:
+        from pywinauto import Desktop
+        desktop = Desktop(backend="uia")
+        for b_class in ["Chrome_WidgetWin_1", "MozillaWindowClass"]:
+            for win in desktop.windows(class_name=b_class):
+                try:
+                    hwnd = int(getattr(win, "handle", 0) or 0)
+                except Exception:
+                    hwnd = 0
+                if not hwnd or hwnd in seen_hwnds:
+                    continue
+                seen_hwnds.add(hwnd)
+
+                title = str(get_window_text(hwnd) or "").strip()
+                marker = str(get_window_account_marker(hwnd) or "").strip()
+                display_text = str(build_window_display_text(title, hwnd) or "").strip()
+                info = get_window_profile_descriptor(hwnd) or {}
+                profile_path = str(info.get("path", "") or "").strip()
+                profile_id = str(info.get("id", "") or "").strip()
+                profile_name = str(info.get("name") or info.get("email") or "").strip()
+                profile_display = get_profile_display_name(profile_path or profile_id) if (profile_path or profile_id) else ""
+
+                candidates = [
+                    title,
+                    marker,
+                    display_text,
+                    profile_name,
+                    profile_id,
+                    profile_path,
+                    profile_display,
+                ]
+                matched = any(
+                    c and (hint_lower in c.lower() or c.lower() in hint_lower)
+                    for c in candidates
+                )
+                if matched:
+                    return hwnd
+
+                try:
+                    for tab in win.descendants(control_type="TabItem"):
+                        tab_title = str(tab.window_text() or "").strip()
+                        if tab_title and hint_lower in tab_title.lower():
+                            return hwnd
+                except Exception:
+                    pass
+    except Exception as e:
+        log_internal_issue(f"按提示词匹配浏览器窗口失败: {hint}", e)
+    return None
 
 # --- Shutdown Countdown Dialog ---
 class ShutdownDialog(QDialog):
@@ -2517,6 +2587,611 @@ class WindowSelector(QDialog):
                     return f"{raw_title}::hwnd={hwnd}"
                 return raw_title
         return ""
+
+# --- Failure/Subtask Manager Dialog ---
+class FailureManagerDialog(QDialog):
+    """可复用的“子任务管理器”对话框：
+    - 默认用于“失败任务管理器”（传入失败项列表）
+    - 也可用于对“勾选的数据行”执行子任务（传入勾选条目列表）
+    """
+    def __init__(self, parent=None, items=None, title="❌ 失败任务管理器", context_task_id=""):
+        super().__init__(parent)
+        self.setWindowTitle(str(title or "❌ 失败任务管理器"))
+        self.resize(980, 720)
+        self.items = list(items or [])
+        self.context_task_id = str(context_task_id or "")
+        self._runtime_entry_key = None
+        self._runtime_parent_step_idx = None
+        self._runtime_running = False
+
+        layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("搜索:"))
+        self.ed_search = QLineEdit()
+        self.ed_search.setPlaceholderText("按任务名 / 行号 / 步骤名 / 错误 / 窗口标题过滤…")
+        self.ed_search.textChanged.connect(self._refresh)
+        top.addWidget(self.ed_search, 1)
+        self.chk_browser_only = QCheckBox("仅浏览器窗口")
+        self.chk_browser_only.stateChanged.connect(self._refresh)
+        top.addWidget(self.chk_browser_only)
+        self.btn_items_all = QPushButton("☑ 全选条目")
+        self.btn_items_all.clicked.connect(lambda: self._set_filtered_entry_checks(True))
+        top.addWidget(self.btn_items_all)
+        self.btn_items_none = QPushButton("☐ 清空条目")
+        self.btn_items_none.clicked.connect(lambda: self._set_filtered_entry_checks(False))
+        top.addWidget(self.btn_items_none)
+        layout.addLayout(top)
+
+        self.grp_parent_steps = QGroupBox("前置步骤")
+        parent_ly = QVBoxLayout(self.grp_parent_steps)
+        self.lbl_parent_steps = QLabel("从当前父任务里勾选要复用的步骤。这些步骤会先于“子任务”执行，并且继续使用当前行自己的数据。")
+        self.lbl_parent_steps.setWordWrap(True)
+        parent_ly.addWidget(self.lbl_parent_steps)
+
+        parent_ctrl = QHBoxLayout()
+        self.btn_parent_steps_all = QPushButton("☑ 全选前置步骤")
+        self.btn_parent_steps_all.clicked.connect(lambda: self._set_parent_step_checks(True))
+        parent_ctrl.addWidget(self.btn_parent_steps_all)
+        self.btn_parent_steps_none = QPushButton("☐ 清空前置步骤")
+        self.btn_parent_steps_none.clicked.connect(lambda: self._set_parent_step_checks(False))
+        parent_ctrl.addWidget(self.btn_parent_steps_none)
+        parent_ctrl.addStretch()
+        parent_ly.addLayout(parent_ctrl)
+
+        self.list_parent_steps = QListWidget()
+        self.list_parent_steps.setMaximumHeight(150)
+        parent_ly.addWidget(self.list_parent_steps)
+
+        self.chk_continue_parent = QCheckBox("执行完前置步骤/子任务后，继续父任务")
+        self.chk_continue_parent.setToolTip("勾选后，执行顺序会变成：前置步骤 → 子任务 → 父任务原流程。")
+        parent_ly.addWidget(self.chk_continue_parent)
+        layout.addWidget(self.grp_parent_steps)
+
+        self._load_parent_steps()
+
+        self.table_widget = QTableWidget(0, 8)
+        self.table_widget.setHorizontalHeaderLabels(["选择", "执行", "状态", "任务", "行号", "步骤", "错误", "窗口"])
+        self.table_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table_widget.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_widget.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_widget.verticalHeader().setDefaultSectionSize(30)
+        self.table_widget.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table_widget.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table_widget.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table_widget.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table_widget.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table_widget.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table_widget.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.table_widget.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        self.table_widget.itemChanged.connect(self._on_table_item_changed)
+        layout.addWidget(self.table_widget, 1)
+
+        bottom = QHBoxLayout()
+        self.btn_activate = QPushButton("🪟 激活窗口")
+        self.btn_activate.clicked.connect(self._activate_selected)
+        bottom.addWidget(self.btn_activate)
+
+        self.btn_jump = QPushButton("🎯 跳到任务/行")
+        self.btn_jump.clicked.connect(self._jump_selected)
+        bottom.addWidget(self.btn_jump)
+
+        self.btn_copy = QPushButton("📋 复制窗口列表")
+        self.btn_copy.clicked.connect(self._copy_browser_windows)
+        bottom.addWidget(self.btn_copy)
+
+        bottom.addStretch()
+
+        self.chk_auto_activate = QCheckBox("自动激活窗口")
+        self.chk_auto_activate.setToolTip("如果条目里捕获到了 hwnd，则在执行子任务前自动插入“激活窗口(::hwnd=xxx)”步骤。")
+        self.chk_auto_activate.setChecked(True)
+        bottom.addWidget(self.chk_auto_activate)
+
+        self.chk_highlight_running = QCheckBox("执行中高亮当前项")
+        self.chk_highlight_running.setToolTip("执行子任务时，在列表里高亮当前正在跑的条目，并同步标出当前前置步骤。")
+        self.chk_highlight_running.setChecked(True)
+        self.chk_highlight_running.stateChanged.connect(self._apply_runtime_marks)
+        bottom.addWidget(self.chk_highlight_running)
+
+        self.chk_scroll_running = QCheckBox("滚动到当前项")
+        self.chk_scroll_running.setToolTip("执行子任务时，自动把列表滚动到当前正在执行的条目/前置步骤。")
+        self.chk_scroll_running.setChecked(True)
+        self.chk_scroll_running.stateChanged.connect(self._apply_runtime_marks)
+        bottom.addWidget(self.chk_scroll_running)
+
+        self.chk_only_selected = QCheckBox("仅执行勾选条目")
+        self.chk_only_selected.setToolTip("勾选后，只对表格里已勾选的条目执行；不勾选则对当前列表(过滤后的全部)执行。")
+        self.chk_only_selected.setChecked(False)
+        bottom.addWidget(self.chk_only_selected)
+
+        self.cb_subtask = QComboBox()
+        self.cb_subtask.setMinimumWidth(260)
+        self.cb_subtask.addItem("(不追加子任务)", "")
+        try:
+            p = self.parent()
+            if p and hasattr(p, "_get_task_names"):
+                for tid in p._get_task_names():
+                    self.cb_subtask.addItem(p._get_task_display_text(tid, with_folder=True), tid)
+        except Exception:
+            pass
+        bottom.addWidget(self.cb_subtask)
+
+        self.btn_new_subtask = QPushButton("➕ 新建子任务(录制)")
+        self.btn_new_subtask.setToolTip("基于当前选中的条目创建一个新的子任务，并尽量自动带上“激活窗口(hwnd)”作为第1步，方便你继续录制后续动作。")
+        self.btn_new_subtask.clicked.connect(self._create_new_subtask_task)
+        bottom.addWidget(self.btn_new_subtask)
+
+        # 用图标代替文字，避免窗口较窄时按钮文字被截断看不见
+        self.btn_run_subtask = QPushButton("")
+        try:
+            self.btn_run_subtask.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+            self.btn_run_subtask.setIconSize(QSize(16, 16))
+        except Exception:
+            pass
+        self.btn_run_subtask.setFixedWidth(34)
+        self.btn_run_subtask.setToolTip("执行子任务（对当前列表/勾选条目批量执行）")
+        self.btn_run_subtask.clicked.connect(self._run_subtask_selected_or_all)
+        bottom.addWidget(self.btn_run_subtask)
+
+        self.btn_close = QPushButton("关闭")
+        self.btn_close.clicked.connect(self.accept)
+        bottom.addWidget(self.btn_close)
+
+        layout.addLayout(bottom)
+        self._refresh()
+
+    def _filtered_items(self):
+        txt = (self.ed_search.text() or "").strip().lower()
+        browser_only = self.chk_browser_only.isChecked()
+        out = []
+        for it in self.items:
+            if not isinstance(it, dict):
+                if isinstance(it, (list, tuple)):
+                    try:
+                        if len(it) >= 2 and isinstance(it[1], dict):
+                            it = dict(it[1])
+                        elif len(it) >= 1 and isinstance(it[0], dict):
+                            it = dict(it[0])
+                        else:
+                            continue
+                    except Exception:
+                        continue
+                else:
+                    continue
+            if browser_only and not bool(it.get("is_browser", False)):
+                continue
+            blob = " ".join([
+                str(it.get("task_display", "")),
+                str(int(it.get("row_index", 0)) + 1),
+                str(it.get("step_name", "")),
+                str(it.get("error", "")),
+                str(it.get("window_title", "")),
+            ]).lower()
+            if txt and txt not in blob:
+                continue
+            out.append(it)
+        return out
+
+    def _refresh(self):
+        items = self._filtered_items()
+        self._refreshing_table = True
+        try:
+            self.table_widget.blockSignals(True)
+            self.table_widget.clearContents()
+            self.table_widget.setRowCount(len(items))
+            for row_idx, it in enumerate(items):
+                if not isinstance(it, dict):
+                    continue
+                checked = bool(it.get("_checked", True))
+                status = str(it.get("status", "") or "").strip()
+                task_text = str(it.get("task_display", ""))
+                row_text = f"第{int(it.get('row_index', 0)) + 1}行"
+                step_text = str(it.get("step_name", "") or f"步骤{int(it.get('step_index', 0))+1}")
+                err_full = str(it.get("error", "") or "").strip()
+                err_short = err_full if len(err_full) <= 120 else err_full[:120] + "…"
+                win_text = str(it.get("window_title", "") or it.get("window_class", "") or "")
+                if not win_text:
+                    win_text = "(未捕获)"
+
+                select_item = QTableWidgetItem()
+                select_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                select_item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                select_item.setTextAlignment(Qt.AlignCenter)
+                select_item.setData(Qt.UserRole, it)
+                self.table_widget.setItem(row_idx, 0, select_item)
+
+                self.table_widget.removeCellWidget(row_idx, 1)
+                # 用图标代替文字，避免窄列下文字不可见
+                btn_run_row = QPushButton("")
+                try:
+                    btn_run_row.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+                    btn_run_row.setIconSize(QSize(14, 14))
+                except Exception:
+                    pass
+                btn_run_row.setToolTip("只执行这一条子任务。")
+                btn_run_row.setFixedSize(30, 24)
+                btn_run_row.clicked.connect(lambda _checked=False, entry=it: self._run_single_subtask_entry(entry))
+                self.table_widget.setCellWidget(row_idx, 1, btn_run_row)
+
+                status_item = QTableWidgetItem()
+                status_item.setFlags(status_item.flags() & ~Qt.ItemIsEditable)
+                status_item.setData(Qt.UserRole, it)
+                self._apply_entry_status_style(status_item, status)
+                self.table_widget.setItem(row_idx, 2, status_item)
+
+                task_item = QTableWidgetItem(task_text)
+                task_item.setFlags(task_item.flags() & ~Qt.ItemIsEditable)
+                task_item.setData(Qt.UserRole, it)
+                task_item.setToolTip(task_text)
+                self.table_widget.setItem(row_idx, 3, task_item)
+
+                row_item = QTableWidgetItem(row_text)
+                row_item.setFlags(row_item.flags() & ~Qt.ItemIsEditable)
+                row_item.setData(Qt.UserRole, it)
+                row_item.setTextAlignment(Qt.AlignCenter)
+                self.table_widget.setItem(row_idx, 4, row_item)
+
+                step_item = QTableWidgetItem(step_text)
+                step_item.setFlags(step_item.flags() & ~Qt.ItemIsEditable)
+                step_item.setData(Qt.UserRole, it)
+                step_item.setToolTip(step_text)
+                self.table_widget.setItem(row_idx, 5, step_item)
+
+                err_item = QTableWidgetItem(err_short if err_short else "(无错误详情)")
+                err_item.setFlags(err_item.flags() & ~Qt.ItemIsEditable)
+                err_item.setData(Qt.UserRole, it)
+                err_item.setToolTip(err_full if err_full else "(无错误详情)")
+                self.table_widget.setItem(row_idx, 6, err_item)
+
+                win_item = QTableWidgetItem(win_text)
+                win_item.setFlags(win_item.flags() & ~Qt.ItemIsEditable)
+                win_item.setData(Qt.UserRole, it)
+                win_item.setToolTip(win_text)
+                self.table_widget.setItem(row_idx, 7, win_item)
+        finally:
+            self.table_widget.blockSignals(False)
+            self._refreshing_table = False
+        if self.table_widget.rowCount() > 0:
+            self.table_widget.setCurrentCell(0, 0)
+        self._apply_runtime_marks()
+
+    def _load_parent_steps(self):
+        self.list_parent_steps.clear()
+        p = self.parent()
+        task_id = self.context_task_id
+        if not p or not task_id or not hasattr(p, "config"):
+            self.grp_parent_steps.setVisible(False)
+            return
+        acts = (p.config.get("tasks", {}) or {}).get(task_id, []) or []
+        if not acts:
+            self.grp_parent_steps.setVisible(False)
+            return
+        self.grp_parent_steps.setVisible(True)
+        for idx, act in enumerate(acts):
+            if not isinstance(act, dict):
+                continue
+            raw_action = str(act.get("action", "") or "")
+            step_name = str(act.get("name", f"步骤{idx+1}") or f"步骤{idx+1}")
+            item = QListWidgetItem(f"{idx+1}. {step_name}  [{raw_action}]")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            item.setData(Qt.UserRole, idx)
+            self.list_parent_steps.addItem(item)
+
+    def _set_parent_step_checks(self, checked):
+        state = Qt.Checked if checked else Qt.Unchecked
+        for i in range(self.list_parent_steps.count()):
+            item = self.list_parent_steps.item(i)
+            if item:
+                item.setCheckState(state)
+
+    def _get_selected_parent_step_indices(self):
+        rows = []
+        for i in range(self.list_parent_steps.count()):
+            item = self.list_parent_steps.item(i)
+            if item and item.checkState() == Qt.Checked:
+                try:
+                    rows.append(int(item.data(Qt.UserRole)))
+                except Exception:
+                    pass
+        return rows
+
+    def _on_table_item_changed(self, item):
+        if getattr(self, "_refreshing_table", False):
+            return
+        if not item or item.column() != 0:
+            return
+        data = item.data(Qt.UserRole)
+        if isinstance(data, dict):
+            data["_checked"] = (item.checkState() == Qt.Checked)
+
+    def _set_filtered_entry_checks(self, checked):
+        target_keys = {self._entry_key(it) for it in self._filtered_items() if isinstance(it, dict)}
+        for it in self.items:
+            if isinstance(it, dict) and self._entry_key(it) in target_keys:
+                it["_checked"] = bool(checked)
+        self._refresh()
+
+    def _apply_entry_status_style(self, item, status):
+        p = self.parent()
+        if p and hasattr(p, "_apply_row_status_style"):
+            p._apply_row_status_style(item, status)
+        else:
+            item.setText(str(status or ""))
+            item.setTextAlignment(Qt.AlignCenter)
+
+    def _get_entry_from_table_row(self, row_idx):
+        if row_idx < 0 or row_idx >= self.table_widget.rowCount():
+            return None
+        for col in [0, 2, 3, 4, 5, 6, 7]:
+            item = self.table_widget.item(row_idx, col)
+            if item:
+                data = item.data(Qt.UserRole)
+                if isinstance(data, dict):
+                    return data
+        return None
+
+    def _get_checked_items(self):
+        out = []
+        for row_idx in range(self.table_widget.rowCount()):
+            item = self.table_widget.item(row_idx, 0)
+            if item and item.checkState() == Qt.Checked:
+                data = item.data(Qt.UserRole)
+                if isinstance(data, dict):
+                    out.append(data)
+        return out
+
+    def _set_runtime_table_row_style(self, row_idx, active=False):
+        for col in [0, 3, 4, 5, 6, 7]:
+            item = self.table_widget.item(row_idx, col)
+            if item:
+                self._set_runtime_item_style(item, active=active, bg="#fff176", fg="#1f2937")
+        btn = self.table_widget.cellWidget(row_idx, 1)
+        if isinstance(btn, QPushButton):
+            btn.setStyleSheet("background:#fff59d; font-weight:bold;" if active else "")
+
+    def update_entry_status(self, entry=None, status="", error=None):
+        entry_key = self._entry_key(entry)
+        if not entry_key:
+            return
+        target_entry = None
+        for it in self.items:
+            if isinstance(it, dict) and self._entry_key(it) == entry_key:
+                target_entry = it
+                break
+        if target_entry is None and isinstance(entry, dict):
+            target_entry = entry
+        if not isinstance(target_entry, dict):
+            return
+
+        target_entry["status"] = str(status or "")
+        if error is not None:
+            target_entry["error"] = str(error or "")
+
+        for row_idx in range(self.table_widget.rowCount()):
+            row_entry = self._get_entry_from_table_row(row_idx)
+            if self._entry_key(row_entry) != entry_key:
+                continue
+            status_item = self.table_widget.item(row_idx, 2)
+            if status_item:
+                status_item.setData(Qt.UserRole, target_entry)
+                self._apply_entry_status_style(status_item, target_entry.get("status", ""))
+            err_item = self.table_widget.item(row_idx, 6)
+            if err_item is not None and error is not None:
+                err_full = str(target_entry.get("error", "") or "").strip()
+                err_short = err_full if len(err_full) <= 120 else err_full[:120] + "…"
+                err_item.setText(err_short if err_short else "(无错误详情)")
+                err_item.setToolTip(err_full if err_full else "(无错误详情)")
+                err_item.setData(Qt.UserRole, target_entry)
+            break
+
+    def _get_selected_item(self):
+        return self._get_entry_from_table_row(self.table_widget.currentRow())
+
+    def _activate_selected(self):
+        it = self._get_selected_item()
+        if not it:
+            return
+        hwnd = it.get("hwnd")
+        if hwnd:
+            try:
+                force_activate_window(int(hwnd))
+            except Exception:
+                pass
+
+    def _jump_selected(self):
+        it = self._get_selected_item()
+        p = self.parent()
+        if not it or not p:
+            return
+        if hasattr(p, "_jump_to_failure"):
+            p._jump_to_failure(it)
+
+    def _copy_browser_windows(self):
+        items = [it for it in self._filtered_items() if it.get("hwnd") and it.get("is_browser")]
+        text_lines = []
+        for it in items:
+            title = it.get("window_title") or ""
+            hwnd = it.get("hwnd")
+            text_lines.append(f"{title}::hwnd={hwnd}")
+        txt = "\n".join(text_lines).strip()
+        if not txt:
+            QMessageBox.information(self, "提示", "当前没有捕获到可复制的窗口(hwnd)。")
+            return
+        try:
+            pyperclip.copy(txt)
+            QMessageBox.information(self, "已复制", f"已复制 {len(text_lines)} 个窗口到剪贴板。")
+        except Exception:
+            QMessageBox.information(self, "提示", txt)
+
+    def _run_subtask_selected_or_all(self):
+        p = self.parent()
+        if not p:
+            return
+        subtask_task_id = self.cb_subtask.currentData()
+        parent_step_indices = self._get_selected_parent_step_indices()
+        continue_parent = self.chk_continue_parent.isChecked() if hasattr(self, "chk_continue_parent") and self.grp_parent_steps.isVisible() else False
+        if not subtask_task_id and not parent_step_indices:
+            QMessageBox.information(self, "提示", "请至少选择一个“前置步骤”或一个“子任务”。")
+            return
+        if not subtask_task_id:
+            subtask_task_id = ""
+        # 默认对列表(过滤后的全部)执行；仅在勾选“仅执行选中条目”时才执行选中项
+        targets = []
+        if hasattr(self, "chk_only_selected") and self.chk_only_selected.isChecked():
+            targets = self._get_checked_items()
+        else:
+            targets = self._filtered_items()
+        if not targets:
+            QMessageBox.information(self, "提示", "当前没有可执行的条目。")
+            return
+        auto_activate = self.chk_auto_activate.isChecked() if hasattr(self, "chk_auto_activate") else True
+        if hasattr(p, "_start_subtask_for_entries"):
+            started = p._start_subtask_for_entries(
+                targets,
+                subtask_task_id,
+                auto_activate_hwnd=auto_activate,
+                parent_step_indices=parent_step_indices,
+                continue_with_parent=continue_parent,
+                context_task_id=self.context_task_id
+            )
+            if started:
+                self.set_runtime_running(True)
+        elif hasattr(p, "_start_repair_for_failures"):
+            # 兼容旧版本：退化为“修复子任务”入口
+            p._start_repair_for_failures(targets, subtask_task_id)
+            self.accept()
+
+    def _create_new_subtask_task(self):
+        p = self.parent()
+        if not p:
+            return
+        sel = self._get_selected_item()
+        if not sel:
+            QMessageBox.information(self, "提示", "请先在列表中选中一条条目。")
+            return
+        if hasattr(p, "_create_repair_task_from_failure"):
+            p._create_repair_task_from_failure(sel)
+        self.accept()
+
+    def _run_single_subtask_entry(self, entry):
+        if not isinstance(entry, dict):
+            return
+        p = self.parent()
+        if not p:
+            return
+        subtask_task_id = self.cb_subtask.currentData()
+        parent_step_indices = self._get_selected_parent_step_indices()
+        continue_parent = self.chk_continue_parent.isChecked() if hasattr(self, "chk_continue_parent") and self.grp_parent_steps.isVisible() else False
+        if not subtask_task_id and not parent_step_indices:
+            QMessageBox.information(self, "提示", "请至少选择一个“前置步骤”或一个“子任务”。")
+            return
+        auto_activate = self.chk_auto_activate.isChecked() if hasattr(self, "chk_auto_activate") else True
+        if hasattr(p, "_start_subtask_for_entries"):
+            started = p._start_subtask_for_entries(
+                [entry],
+                subtask_task_id or "",
+                auto_activate_hwnd=auto_activate,
+                parent_step_indices=parent_step_indices,
+                continue_with_parent=continue_parent,
+                context_task_id=self.context_task_id
+            )
+            if started:
+                self.set_runtime_running(True)
+
+    def _entry_key(self, it):
+        if not isinstance(it, dict):
+            return None
+        try:
+            row_idx = int(it.get("row_index", -1))
+        except Exception:
+            row_idx = -1
+        return (
+            str(it.get("task_id") or ""),
+            row_idx,
+            str(it.get("step_name") or ""),
+            str(it.get("window_title") or ""),
+        )
+
+    def _set_runtime_item_style(self, item, active=False, bg="#fff176", fg="#1f2937"):
+        if not item:
+            return
+        font = item.font()
+        font.setBold(bool(active))
+        item.setFont(font)
+        if active:
+            item.setBackground(QColor(bg))
+            item.setForeground(QColor(fg))
+        else:
+            item.setBackground(QBrush(Qt.NoBrush))
+            item.setForeground(QBrush(Qt.NoBrush))
+
+    def _apply_runtime_marks(self):
+        highlight_enabled = self.chk_highlight_running.isChecked() if hasattr(self, "chk_highlight_running") else True
+        scroll_enabled = self.chk_scroll_running.isChecked() if hasattr(self, "chk_scroll_running") else True
+
+        active_entry_row = None
+        active_entry_key = self._runtime_entry_key
+        for i in range(self.table_widget.rowCount()):
+            item_data = self._get_entry_from_table_row(i)
+            matched = bool(active_entry_key and self._entry_key(item_data) == active_entry_key)
+            self._set_runtime_table_row_style(i, active=bool(highlight_enabled and matched))
+            if matched:
+                active_entry_row = i
+        if active_entry_row is not None and (highlight_enabled or scroll_enabled):
+            self.table_widget.setCurrentCell(active_entry_row, 0)
+            if scroll_enabled:
+                self.table_widget.scrollToItem(self.table_widget.item(active_entry_row, 0), QAbstractItemView.PositionAtCenter)
+
+        active_parent_item = None
+        active_parent_step_idx = self._runtime_parent_step_idx
+        for i in range(self.list_parent_steps.count()):
+            item = self.list_parent_steps.item(i)
+            matched = False
+            if item is not None and active_parent_step_idx is not None:
+                try:
+                    matched = int(item.data(Qt.UserRole)) == int(active_parent_step_idx)
+                except Exception:
+                    matched = False
+            self._set_runtime_item_style(item, active=bool(highlight_enabled and matched), bg="#dbeafe", fg="#1d4ed8")
+            if matched:
+                active_parent_item = item
+        if active_parent_item and (highlight_enabled or scroll_enabled):
+            self.list_parent_steps.setCurrentItem(active_parent_item)
+            if scroll_enabled:
+                self.list_parent_steps.scrollToItem(active_parent_item, QAbstractItemView.PositionAtCenter)
+
+    def set_runtime_progress(self, entry=None, parent_step_idx=None):
+        self._runtime_entry_key = self._entry_key(entry) if entry else None
+        self._runtime_parent_step_idx = int(parent_step_idx) if parent_step_idx is not None and int(parent_step_idx) >= 0 else None
+        self._apply_runtime_marks()
+
+    def clear_runtime_progress(self):
+        self._runtime_entry_key = None
+        self._runtime_parent_step_idx = None
+        self._apply_runtime_marks()
+
+    def set_runtime_running(self, running):
+        self._runtime_running = bool(running)
+        if hasattr(self, "btn_run_subtask"):
+            self.btn_run_subtask.setEnabled(not self._runtime_running)
+            # 运行中也用图标反馈（按钮会被禁用，但图标仍可见）
+            try:
+                icon = QStyle.SP_MediaPause if self._runtime_running else QStyle.SP_MediaPlay
+                self.btn_run_subtask.setIcon(self.style().standardIcon(icon))
+            except Exception:
+                pass
+            self.btn_run_subtask.setText("")
+        if hasattr(self, "table_widget"):
+            for row_idx in range(self.table_widget.rowCount()):
+                btn = self.table_widget.cellWidget(row_idx, 1)
+                if isinstance(btn, QPushButton):
+                    btn.setEnabled(not self._runtime_running)
+        if hasattr(self, "btn_close"):
+            self.btn_close.setText("关闭监看" if self._runtime_running else "关闭")
+        if not self._runtime_running:
+            self.clear_runtime_progress()
+
 
 # --- Schedule Configuration Dialog ---
 class ScheduleDialog(QDialog):
@@ -3892,9 +4567,8 @@ class FloatingProgressWindow(QWidget):
 
         self.resize(520, 210)  # 增大宽度以容纳更多按钮
 
-        # 默认位置：屏幕右上角
-        screen_geo = QApplication.primaryScreen().geometry()
-        self.move(screen_geo.width() - self.width() - 20, 50)
+        # 默认位置：屏幕上方正中央
+        self._move_to_top_center()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -4040,6 +4714,16 @@ class FloatingProgressWindow(QWidget):
         self._dragging = False
         self._drag_pos = QPoint()
 
+    def _move_to_top_center(self, top_margin=20):
+        """把悬浮窗放到当前主屏幕的上方正中央。"""
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        screen_geo = screen.availableGeometry()
+        x = screen_geo.x() + max(0, (screen_geo.width() - self.width()) // 2)
+        y = screen_geo.y() + max(0, int(top_margin))
+        self.move(x, y)
+
     def update_progress(self, task_name, loop, group, total_groups, step, total_steps, step_name, percent):
         info = f"<b>{task_name}</b> | 组 {group}/{total_groups} | 步 {step}/{total_steps}: <font color='#82b1ff'>{step_name}</font>"
         self.lbl_info.setText(info)
@@ -4054,18 +4738,25 @@ class FloatingProgressWindow(QWidget):
                 self._force_topmost(-1)
 
     def mousePressEvent(self, event):
+        child = self.childAt(event.pos())
+        if isinstance(child, (QPushButton, QTextEdit)):
+            event.ignore()
+            return super().mousePressEvent(event)
         if event.button() == Qt.LeftButton:
             self._dragging = True
             self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
             event.accept()
 
     def mouseMoveEvent(self, event):
+        if not self._dragging:
+            return super().mouseMoveEvent(event)
         if self._dragging and event.buttons() & Qt.LeftButton:
             self.move(event.globalPos() - self._drag_pos)
             event.accept()
 
     def mouseReleaseEvent(self, event):
         self._dragging = False
+        super().mouseReleaseEvent(event)
 
     def update_detail(self, text):
         """更新具体的动作详情或倒计时描述。"""
@@ -4137,6 +4828,7 @@ class FloatingProgressWindow(QWidget):
             self.log_area.show()
             self.btn_collapse.setText("🔽 折叠")
             self.adjustSize()
+        self._move_to_top_center()
 
 # --- Engine ---
 # Row status constants
@@ -4159,6 +4851,8 @@ class AutoEngine(QThread):
     hotkey_paused_sig = pyqtSignal(int, int, int)
     detail_sig        = pyqtSignal(str) # [新增] 详细描述信号（用于 OSD 倒计时等）
     deferred_queue_sig = pyqtSignal(object)
+    # (dict) per-row structured result, used for failure aggregation / window extraction in UI.
+    row_result_sig = pyqtSignal(object)
 
     def __init__(self, actions, data_list, loop_delay, start_t=0, start_s=0, loops=1, start_l=0,
                  retry_count=0, on_error="stop", dry_run=False, ignore_data=False, standardize_window=False):
@@ -4172,7 +4866,11 @@ class AutoEngine(QThread):
         self.loops       = loops
         self.start_l     = start_l
         self.retry_count = retry_count   # 0 = no retry
-        self.on_error    = on_error      # "stop" or "skip"
+        # on_error:
+        # - "stop": stop whole task immediately
+        # - "skip": skip current step and continue (may still end up row OK)
+        # - "fail_row": mark current row failed and continue next row
+        self.on_error    = on_error
         self.dry_run     = dry_run       # True = only print, no actual execution
         self.standardize_window = standardize_window # [新增] 是否强制标准化窗口大小位置
         self._stop       = False
@@ -4189,6 +4887,75 @@ class AutoEngine(QThread):
         self._last_error = ""
         self._deferred_queue = []
         self._defer_seq = 0
+        self._row_fail_ctx = None  # per-row failure context snapshot
+        self._row_runtime_ctx = None  # per-row runtime context snapshot (for successful rows too)
+
+    def _extract_hwnd_from_value(self, v):
+        """从类似 'xxx::hwnd=123' 的字符串中解析 hwnd。"""
+        try:
+            if not v:
+                return None
+            s = str(v)
+            if "::hwnd=" not in s:
+                return None
+            tail = s.split("::hwnd=", 1)[1].strip()
+            digits = "".join(ch for ch in tail if ch.isdigit())
+            return int(digits) if digits else None
+        except Exception:
+            return None
+
+    def _snapshot_foreground_window(self):
+        """抓取当前前台窗口信息，用于失败定位。"""
+        if sys.platform != "win32":
+            return {"hwnd": None, "title": "", "class": ""}
+        try:
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            hwnd = int(hwnd) if hwnd else None
+            return {
+                "hwnd": hwnd,
+                "title": get_window_text(hwnd) if hwnd else "",
+                "class": get_window_class_name(hwnd) if hwnd else ""
+            }
+        except Exception:
+            return {"hwnd": None, "title": "", "class": ""}
+
+    def _set_row_fail_ctx(self, l_idx, t_idx, s_idx, step_name, act_type, raw_action, val, err):
+        """记录一次行级失败信息（不影响主流程控制）。"""
+        try:
+            fg = self._snapshot_foreground_window()
+            self._row_fail_ctx = {
+                "loop_index": int(l_idx),
+                "row_index": int(t_idx),
+                "step_index": int(s_idx),
+                "step_name": str(step_name or ""),
+                "act_type": str(act_type or ""),
+                "action": str(raw_action or ""),
+                "value": str(val or ""),
+                "error": str(err or ""),
+                "target_hwnd": self._extract_hwnd_from_value(val),
+                "foreground": fg,
+            }
+        except Exception:
+            self._row_fail_ctx = None
+
+    def _set_row_runtime_ctx(self, l_idx, t_idx, s_idx, step_name, act_type, raw_action, val):
+        """记录当前行最近一次成功执行时的窗口/步骤上下文，便于子任务管理器复用。"""
+        try:
+            fg = self._snapshot_foreground_window()
+            self._row_runtime_ctx = {
+                "loop_index": int(l_idx),
+                "row_index": int(t_idx),
+                "step_index": int(s_idx),
+                "step_name": str(step_name or ""),
+                "act_type": str(act_type or ""),
+                "action": str(raw_action or ""),
+                "value": str(val or ""),
+                "error": "",
+                "target_hwnd": self._extract_hwnd_from_value(val),
+                "foreground": fg,
+            }
+        except Exception:
+            self._row_runtime_ctx = None
 
     def stop(self):
         self._stop_reason = "stopped"
@@ -4221,6 +4988,13 @@ class AutoEngine(QThread):
         while self._paused and not self._stop:
             time.sleep(0.05)
 
+    def _cooperative_abort(self):
+        """在长步骤中主动检查人工控制信号，让步骤尽快让出控制权。"""
+        if self._stop:
+            raise ExecutionInterrupted("任务已停止")
+        if self._next_row or self._skip_step or self._retry_step:
+            raise ExecutionInterrupted("当前步骤已被人工控制打断")
+
     def _interruptible_sleep(self, seconds):
         """Sleep in small increments so stop/pause can break out early."""
         if seconds <= 0:
@@ -4236,6 +5010,45 @@ class AutoEngine(QThread):
                     return
                 end += time.time() - pause_started
             time.sleep(min(0.05, end - time.time()))
+
+    def _cooperative_sleep(self, seconds):
+        self._interruptible_sleep(seconds)
+        self._cooperative_abort()
+
+    def _abort_subprocess(self, process):
+        if not process:
+            return
+        try:
+            if process.poll() is not None:
+                return
+        except Exception:
+            pass
+        try:
+            process.terminate()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    def _wait_process_interruptibly(self, process, poll_interval=0.1):
+        """等待子进程结束，同时响应暂停/停止/跳步等人工控制。"""
+        while True:
+            self._cooperative_abort()
+            if self._paused:
+                self._spin_while_paused()
+                self._cooperative_abort()
+            try:
+                ret = process.poll()
+            except Exception:
+                ret = None
+            if ret is not None:
+                return ret
+            time.sleep(max(0.02, float(poll_interval)))
 
     def _validate_step_guard(self, act, act_type):
         """执行前界面守卫：优先比对录制快照，退化到窗口标题/类名校验。"""
@@ -4576,6 +5389,9 @@ class AutoEngine(QThread):
 
     def _run_row(self, l_idx, t_idx, s_start, total, task_name="", resumed=False, resume_entry=None):
         self._cur_t = t_idx
+        # reset per-row failure snapshot
+        self._row_fail_ctx = None
+        self._row_runtime_ctx = None
         data = self.data_list[t_idx]
         if not self.ignore_data and not data.get("_选中", True):
             self.log_sig.emit(f"⏭️ 跳过第 {t_idx+1} 组 (未勾选执行)", "gray")
@@ -4657,6 +5473,7 @@ class AutoEngine(QThread):
                     if val_raw == "[SKIP_ROW]" or val_raw == "":
                         self.log_sig.emit(f"⏭️ [步骤 {name}] 数据表内容为空或触发词，正在结束当前行...", "orange")
                         row_ok = True
+                        row_state = "skipped"
                         break
 
                 val = str(val_raw) if val_raw is not None else ""
@@ -4676,12 +5493,14 @@ class AutoEngine(QThread):
                     if "[SKIP_ROW]" in val_parts:
                         self.log_sig.emit(f"⏭️ [步骤 {name}] 变量解析为跳过触发词，正在结束当前行...", "orange")
                         row_ok = True
+                        row_state = "skipped"
                         break
 
                     if act_type in ["input", "clear_input", "clear_input_plus", "upload", "drag_file", "open_url", "cmd"]:
                         if not val.strip():
                             self.log_sig.emit(f"⏭️ [步骤 {name}] 输入内容解析为空，正在结束当前行...", "orange")
                             row_ok = True
+                            row_state = "skipped"
                             break
 
             self.highlight_sig.emit(t_idx, s_idx)
@@ -4706,12 +5525,18 @@ class AutoEngine(QThread):
                     break
                 try:
                     result = self._execute_step(act, val, act_type, data)
+                    self._set_row_runtime_ctx(
+                        l_idx, t_idx, s_idx,
+                        name, act_type, act.get("action", ""), val
+                    )
                     if result and result[0] == "jump_if":
                         jump_target = result[1]
                     elif result and result[0] == "defer":
                         self._enqueue_deferred_row(l_idx, t_idx, s_idx, result[1])
                         row_state = "deferred"
                     step_ok = True
+                    break
+                except ExecutionInterrupted:
                     break
                 except StepGuardMismatchError as e:
                     error_detail = str(e) if str(e) else "界面守卫未通过"
@@ -4731,9 +5556,20 @@ class AutoEngine(QThread):
                         self._interruptible_sleep(1)
                     else:
                         self.log_sig.emit(f"❌ 错误: {error_detail}", "red")
+                        # 记录失败上下文，便于执行结束后快速定位失败窗口
+                        self._set_row_fail_ctx(
+                            l_idx, t_idx, s_idx,
+                            name, act_type, act.get("action", ""), val,
+                            error_detail
+                        )
                         if self.on_error == "skip":
                             self.log_sig.emit(f"⏭️ 已跳过步骤: {name}", "orange")
                             step_ok = True
+                        elif self.on_error == "fail_row":
+                            # 只标记当前行失败，继续后续行（不终止整个任务）
+                            row_ok = False
+                            row_state = "failed"
+                            break
                         elif self.on_error == "stop":
                             self._stop_reason = "failed"
                             self._stop = True
@@ -4744,6 +5580,8 @@ class AutoEngine(QThread):
             if row_state == "deferred":
                 break
             if guard_skip_row:
+                break
+            if row_state == "failed":
                 break
 
             if jump_target:
@@ -4789,7 +5627,7 @@ class AutoEngine(QThread):
 
             s_delay = float(row_delay) if (row_delay and str(row_delay).replace('.','',1).isdigit()) else float(act.get('delay', 1))
             if self.dry_run:
-                time.sleep(min(0.1, s_delay))
+                self._interruptible_sleep(min(0.1, s_delay))
             elif s_delay > 0:
                 self._wait_with_countdown(s_delay, f"⏱️ [{name}] 步后延时")
 
@@ -4824,17 +5662,26 @@ class AutoEngine(QThread):
         if self._stop and self._stop_reason in ("stopped", "failed"):
             row_ok = False
 
+        status_emoji = ""
         if row_state == "deferred":
-            self.row_status_sig.emit(t_idx, ROW_STATUS_DEFER)
+            status_emoji = ROW_STATUS_DEFER
+            self.row_status_sig.emit(t_idx, status_emoji)
             row_result_text = "⏸️ 挂起"
+        elif row_state == "skipped":
+            status_emoji = ROW_STATUS_SKIP
+            self.row_status_sig.emit(t_idx, status_emoji)
+            row_result_text = "⏭️ 跳过"
         elif not row_ok:
-            self.row_status_sig.emit(t_idx, ROW_STATUS_FAIL)
+            status_emoji = ROW_STATUS_FAIL
+            self.row_status_sig.emit(t_idx, status_emoji)
             row_result_text = "❌ 失败"
         elif row_state == "manual":
-            self.row_status_sig.emit(t_idx, ROW_STATUS_MANUAL)
+            status_emoji = ROW_STATUS_MANUAL
+            self.row_status_sig.emit(t_idx, status_emoji)
             row_result_text = f"⚠️ {manual_reason or '人工介入'}"
         else:
-            self.row_status_sig.emit(t_idx, ROW_STATUS_OK)
+            status_emoji = ROW_STATUS_OK
+            self.row_status_sig.emit(t_idx, status_emoji)
             row_result_text = "✅ 成功"
 
         self.log_sig.emit(
@@ -4842,6 +5689,22 @@ class AutoEngine(QThread):
             f"已耐时: {self._format_time_display(int((datetime.now()-self._start_time).total_seconds()))} ═══",
             "blue"
         )
+        # 结构化结果：供 UI 在“全部任务结束后”汇总失败项与失败窗口
+        try:
+            self.row_result_sig.emit({
+                "task_id": getattr(self, "_task_id", ""),
+                "task_name": task_name,
+                "loop_index": int(l_idx),
+                "row_index": int(t_idx),
+                "status": status_emoji,
+                "row_state": row_state,
+                "row_ok": bool(row_ok),
+                "last_error": str(self._last_error or ""),
+                "fail_ctx": self._row_fail_ctx,
+                "row_ctx": self._row_runtime_ctx,
+            })
+        except Exception:
+            pass
         return {"state": row_state, "row_ok": row_ok}
 
     def _drain_deferred_queue(self, l_idx, total, task_name="", priority_only=False, wait_for_due=True):
@@ -4902,6 +5765,7 @@ class AutoEngine(QThread):
 
     def _execute_step(self, act, val, act_type, data):
         """Execute one action step; raises on failure. In dry_run mode just logs."""
+        self._cooperative_abort()
         if self.dry_run:
             x, y = act.get('x'), act.get('y')
             if x is not None and y is not None and act_type not in ["run_app", "wait", "screenshot", "open_url", "defer"]:
@@ -4956,13 +5820,14 @@ class AutoEngine(QThread):
                     start_time = time.time()
                     locate_err = None
                     while time.time() - start_time < 3.0:
+                        self._cooperative_abort()
                         try:
                             res = pyautogui.locateCenterOnScreen(img_obj, confidence=0.8)
                             if res: break
                         except Exception as e:
                             locate_err = e
                             res = None
-                        time.sleep(0.5)
+                        self._cooperative_sleep(0.5)
                     if locate_err is not None and res is None:
                         log_internal_issue(f"图像点击识别异常: {img_path}", locate_err)
                 
@@ -5016,7 +5881,7 @@ class AutoEngine(QThread):
         elif act_type == "double_click":   pyautogui.doubleClick(act.get('x',0), act.get('y',0))
         elif act_type == "right_click":    pyautogui.rightClick(act.get('x',0), act.get('y',0))
         elif act_type == "move":           pyautogui.moveTo(act.get('x',0), act.get('y',0))
-        elif act_type == "hover_click":    pyautogui.moveTo(act.get('x',0), act.get('y',0)); time.sleep(0.5); pyautogui.click()
+        elif act_type == "hover_click":    pyautogui.moveTo(act.get('x',0), act.get('y',0)); self._cooperative_sleep(0.5); pyautogui.click()
         elif act_type == "input":
             final_val = self._replace_vars(val, data)
             self.log_sig.emit(f"✍️ 正在输入文本: {final_val[:20]}{'...' if len(final_val)>20 else ''}", "gray")
@@ -5057,7 +5922,7 @@ class AutoEngine(QThread):
                 pyautogui.click(x, y)
                 self._interruptible_sleep(0.8)
             pyperclip.copy(abs_path); self._interruptible_sleep(0.5)
-            pyautogui.hotkey('ctrl', 'v'); time.sleep(0.8); pyautogui.press('enter')
+            pyautogui.hotkey('ctrl', 'v'); self._cooperative_sleep(0.8); pyautogui.press('enter')
             self.log_sig.emit("✅ 已尝试粘贴路径并回车", "green")
         elif act_type == "drag_file":
             if not val: self.log_sig.emit("⚠️ 拖拽文件路径为空，跳过", "orange"); return None
@@ -5161,7 +6026,7 @@ class AutoEngine(QThread):
                 
                 done = 0
                 while done < abs_clicks:
-                    if self._stop: break
+                    self._cooperative_abort()
                     curr = min(step, abs_clicks - done)
                     pyautogui.scroll(curr * direction)
                     done += curr
@@ -5181,7 +6046,12 @@ class AutoEngine(QThread):
                 else:
                     # 解决 echo 等内置命令在 Popen 中的编码问题，确保中文内容正确写入
                     process = subprocess.Popen(cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='gbk' if sys.platform == 'win32' else 'utf-8', errors='replace')
-                    stdout, _ = process.communicate()
+                    try:
+                        self._wait_process_interruptibly(process)
+                        stdout, _ = process.communicate()
+                    except ExecutionInterrupted:
+                        self._abort_subprocess(process)
+                        raise
                     if stdout:
                         self.log_sig.emit(f"📝 CMD 输出: {stdout.strip()}", "gray")
                     if process.returncode == 0:
@@ -5226,6 +6096,7 @@ class AutoEngine(QThread):
 
             found = False
             for _ in range(5):
+                self._cooperative_abort()
                 # ── [最高优先级] 直接用 hwnd 激活，完全不依赖标题匹配 ────────────
                 if _target_hwnd and sys.platform == 'win32':
                     try:
@@ -5300,7 +6171,7 @@ class AutoEngine(QThread):
                     except Exception as e:
                         log_internal_issue(f"UIA 标签匹配失败: {target_title}", e)
                 if found: break
-                time.sleep(1.0)
+                self._cooperative_sleep(1.0)
 
             if not found:
                 _hint = target_title or display_name
@@ -5334,6 +6205,40 @@ class AutoEngine(QThread):
             
             if not url.startswith(('http://', 'https://', 'file://')):
                 url = "https://" + url
+
+            # [增强] 支持把“账号(profile)”位置填成已打开窗口（::hwnd=xxx）。
+            # 当检测到 hwnd 时，优先激活该窗口并在其地址栏打开 url（不依赖账号识别）。
+            target_hwnd = None
+            try:
+                target_hwnd = self._extract_hwnd_from_value(profile) or self._extract_hwnd_from_value(options)
+            except Exception:
+                target_hwnd = None
+            if not target_hwnd and profile and sys.platform == "win32":
+                try:
+                    target_hwnd = find_browser_window_hwnd_by_hint(profile)
+                except Exception:
+                    target_hwnd = None
+            if target_hwnd and sys.platform == "win32":
+                try:
+                    self.log_sig.emit(f"🌐 使用已打开窗口打开网址: {get_profile_display_name(profile)}", "gray")
+                    force_activate_window(int(target_hwnd))
+                    self._cooperative_sleep(0.2)
+                    try:
+                        pyperclip.copy(url)
+                    except Exception:
+                        pass
+                    pyautogui.hotkey('ctrl', 'l')
+                    self._cooperative_sleep(0.05)
+                    # 粘贴优先，失败则退回输入
+                    try:
+                        pyautogui.hotkey('ctrl', 'v')
+                    except Exception:
+                        pyautogui.typewrite(url, interval=0.01)
+                    self._cooperative_sleep(0.05)
+                    pyautogui.press('enter')
+                    return None
+                except Exception as e:
+                    raise RuntimeError(f"使用已打开窗口打开网址失败: {e}")
 
             # [终极修复版] 解决多账户切换、映射路径识别与书签栏坐标统一。
             if profile and sys.platform == 'win32':
@@ -5385,9 +6290,9 @@ class AutoEngine(QThread):
                         try:
                             _user32 = ctypes.windll.user32
                             _user32.ShowWindow(hwnd, 9) # Restore
-                            time.sleep(0.1)
+                            self._interruptible_sleep(0.1)
                             _user32.SetForegroundWindow(hwnd)
-                            time.sleep(0.1)
+                            self._interruptible_sleep(0.1)
                             _user32.ShowWindow(hwnd, 3) # Maximize
                             # 触发重新渲染
                             try:
@@ -5395,7 +6300,7 @@ class AutoEngine(QThread):
                                 w = pgw.Window(hwnd)
                                 rect = w._rect
                                 _user32.MoveWindow(hwnd, rect.left, rect.top, rect.width - 1, rect.height - 1, True)
-                                time.sleep(0.05)
+                                self._interruptible_sleep(0.05)
                                 _user32.ShowWindow(hwnd, 3)
                             except Exception as e:
                                 log_internal_issue(f"窗口重绘微调失败: hwnd={hwnd}", e)
@@ -5518,12 +6423,12 @@ class AutoEngine(QThread):
         elif act_type == "defer":
             defer_raw = self._replace_vars(val, data)
             return ("defer", self._parse_defer_value(defer_raw, self._cur_s))
-        elif act_type == "wait": time.sleep(float(val) if val else 1)
+        elif act_type == "wait": self._wait_with_countdown(float(val) if val else 1, "⏳ 等待中")
         
         # 如果标记了需要标准化，在动作执行完、窗口出现后执行
         if should_std:
             # 额外等待 1 秒确保窗口已渲染
-            time.sleep(1)
+            self._cooperative_sleep(1)
             self._standardize_browser_window()
             
         return None
@@ -6376,6 +7281,9 @@ class AutoManager(QMainWindow):
         self._timer_enabled = False
         self._loading_schedule_ui = False
         self._row_statuses = {}  # task -> {row_idx: status_emoji}
+        # 本次“批量执行”产生的失败记录（跨任务汇总）
+        self._last_run_row_results = []  # raw row_result_sig payload list
+        self._last_run_failures = []     # filtered failure list for quick navigation
         self._hotkey_hooks = []  # keyboard hook handles
         self._task_queue = []  # pending tasks for sequential run
         self._is_initializing = True # [新增] 初始化标志位，防止提前触发 UI 逻辑导致崩溃
@@ -6753,6 +7661,15 @@ class AutoManager(QMainWindow):
         self.btn_select_all = QPushButton("☑️ 全选"); self.btn_select_all.clicked.connect(lambda: self._set_all_row_check_state(True)); data_ctrl.addWidget(self.btn_select_all)
         self.btn_deselect_all = QPushButton("☐ 取消全选"); self.btn_deselect_all.clicked.connect(lambda: self._set_all_row_check_state(False)); data_ctrl.addWidget(self.btn_deselect_all)
         self.btn_invert_select = QPushButton("🔁 反选"); self.btn_invert_select.clicked.connect(self._invert_row_check_state); data_ctrl.addWidget(self.btn_invert_select)
+        self.btn_select_unsuccessful = QPushButton("⚠️ 选未成功"); self.btn_select_unsuccessful.setToolTip("一键勾选本次执行里未成功的行，例如失败、跳过、挂起或需人工介入的行。"); self.btn_select_unsuccessful.clicked.connect(self._select_unsuccessful_rows); data_ctrl.addWidget(self.btn_select_unsuccessful)
+
+        # 子任务管理器：对“勾选的行”批量执行某个子任务（不限失败项）
+        self.btn_subtask_mgr = QPushButton("🧩 子任务管理")
+        self.btn_subtask_mgr.setMinimumWidth(122)
+        self.btn_subtask_mgr.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self.btn_subtask_mgr.setToolTip("打开子任务管理器：对当前任务里“已勾选”的数据行，批量执行你选择的子任务（可选自动激活窗口）。")
+        self.btn_subtask_mgr.clicked.connect(self._open_subtask_manager)
+        data_ctrl.addWidget(self.btn_subtask_mgr)
 
         self.btn_more_data_ops = QPushButton("⚙️ 更多")
         self.btn_more_data_ops.setToolTip("打开批量数据的更多操作和开关。")
@@ -6782,6 +7699,7 @@ class AutoManager(QMainWindow):
         self.data_col_width_slider.setToolTip("统一调整批量数据区所有行的高度。")
         self.data_col_width_slider.valueChanged.connect(self._set_data_row_height)
         self.chk_only_current = QCheckBox("仅执行当前任务"); self.chk_only_current.setChecked(True)
+        self.chk_continue_on_fail = QCheckBox("❌ 失败也继续"); self.chk_continue_on_fail.setToolTip("当某个任务因“停止策略”失败时，是否继续执行后续任务；失败项会在最后汇总。"); self.chk_continue_on_fail.setChecked(True)
         self.chk_auto_shutdown = QCheckBox("🏁 任务完关机")
         self.chk_show_osd = QCheckBox("🖥️ 显示置顶进度条"); self.chk_show_osd.setChecked(True)
         self.chk_std_win = QCheckBox("📏 自动标准化窗口"); self.chk_std_win.setToolTip("开启后，每次打开网址或激活窗口，都会自动将窗口移动到(0,0)并全屏，确保点击位置准确。"); self.chk_std_win.setChecked(True)
@@ -6790,7 +7708,7 @@ class AutoManager(QMainWindow):
         data_ctrl.addWidget(self.data_col_width_slider)
         data_ly.addLayout(data_ctrl)
         
-        self.data_table = DataEditorTable(0, 0); self.data_table.setColumnCount(1); self.data_table.setHorizontalHeaderLabels(["状态"])
+        self.data_table = DataEditorTable(0, 0); self.data_table.setColumnCount(3); self.data_table.setHorizontalHeaderLabels(["选择", "执行", "状态"])
         self.data_table.setHorizontalHeader(ManualWidthHeader(Qt.Horizontal, self.data_table))
         self.data_table.verticalHeader().setDefaultSectionSize(int(layout_cfg.get("data_row_height", 28))) # 批量数据区默认更紧凑，同时允许统一调整
         self.data_table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -6884,8 +7802,8 @@ class AutoManager(QMainWindow):
         self.retry_spin.setToolTip("步骤出错时自动重试次数，0=不重试"); h_ctrl.addWidget(self.retry_spin)
         h_ctrl.addWidget(QLabel("出错策略:"))
         self.error_combo = QComboBox()
-        self.error_combo.addItems(["🛑 停止", "⏭️ 跳过步骤"])
-        self.error_combo.setToolTip("出错时：停止整个任务，或跳过当前步骤继续执行")
+        self.error_combo.addItems(["🛑 停止", "⏭️ 跳过步骤", "❌ 标记失败并继续"])
+        self.error_combo.setToolTip("出错时：停止整个任务 / 跳过当前步骤 / 标记当前行失败并继续下一行")
         h_ctrl.addWidget(self.error_combo)
         
         self.btn_timer = QPushButton("⏰ 计划时间"); self.btn_timer.setCheckable(True); self.btn_timer.setFixedHeight(45); self.btn_timer.clicked.connect(self._toggle_timer); h_ctrl.addWidget(self.btn_timer)
@@ -6990,8 +7908,16 @@ class AutoManager(QMainWindow):
                     # Migrate data for all rows from old_name to new_name
                     if self.current_task in self.config['task_data']:
                         for row in self.config['task_data'][self.current_task]:
-                            if old_name in row:
-                                row[unique_name] = row.pop(old_name)
+                            if not isinstance(row, dict):
+                                continue
+                            rename_pairs = [
+                                (old_name, unique_name),
+                                (f"{old_name}_延时", f"{unique_name}_延时"),
+                                (f"{old_name}_跳过", f"{unique_name}_跳过"),
+                            ]
+                            for old_key, new_key in rename_pairs:
+                                if old_key in row:
+                                    row[new_key] = row.pop(old_key)
                     self._rename_defer_target_references(old_name, unique_name)
                     save_config(self.config)
                     self._refresh_defer_target_options()
@@ -7053,11 +7979,16 @@ class AutoManager(QMainWindow):
         widths = self.config.get("tasks_layout", {}).get(self.current_task, [])
         acts = self.config.get('tasks', {}).get(self.current_task, [])
         show_delay = self.btn_toggle_delay.isChecked() if hasattr(self, "btn_toggle_delay") else False
-        default_widths = [42, 54]
+        default_widths = [42, 64, 54]
         for action in acts:
             default_widths.append(self._get_data_column_width(action))
             if show_delay:
                 default_widths.append(self._get_data_column_width(is_delay=True))
+
+        expected_old_count = 2 + len(acts) * (2 if show_delay else 1)
+        expected_new_count = 3 + len(acts) * (2 if show_delay else 1)
+        if len(widths) == expected_old_count and expected_new_count == expected_old_count + 1:
+            widths = [widths[0], 64, widths[1], *widths[2:]]
 
         target_count = self.data_table.columnCount()
         if target_count <= 0:
@@ -7639,15 +8570,7 @@ class AutoManager(QMainWindow):
             index += 1
 
     def _clear_exported_step_coordinates(self, step):
-        step = dict(step if isinstance(step, dict) else {})
-        step.pop("x", None)
-        step.pop("y", None)
-        step.pop("guard_image", None)
-        step.pop("guard_region", None)
-        step.pop("guard_window_title", None)
-        step.pop("guard_window_class", None)
-        step.pop("guard_threshold", None)
-        return step
+        return dict(step if isinstance(step, dict) else {})
 
     def _build_task_template_payload(self, task_ids):
         import copy
@@ -7678,8 +8601,8 @@ class AutoManager(QMainWindow):
             "format": "task_template_bundle",
             "version": 1,
             "exported_at": datetime.now().isoformat(timespec="seconds"),
-            "coordinates_removed": True,
-            "note": "导出的任务模板默认不包含坐标和界面守卫，导入后请重新录制相关步骤坐标。",
+            "coordinates_removed": False,
+            "note": "导出的任务模板会完整保留坐标和界面守卫，导入后也会原样保留，后续可按需手动修改。",
             "tasks": exported_tasks,
         }
 
@@ -8357,6 +9280,7 @@ class AutoManager(QMainWindow):
         if index >= len(task_list):
             self._log("✅ 所有排程任务已完成", "green")
             if self.chk_sched_shutdown.isChecked():
+                self._log("🏁 所有排程任务已完成，即将按设置进入自动关机倒计时", "green")
                 ShutdownDialog(self).exec_()
             return
 
@@ -8463,12 +9387,12 @@ class AutoManager(QMainWindow):
             self._reload_task_combo_after_config_change(preferred_task)
             self._refresh_schedule_task_options()
             self._log(f"📥 已导入 {len(added_task_ids)} 个任务模板", "green")
-            import_hint = "\n请重新录制相关点击步骤坐标后再执行。" if total_coord_steps else ""
+            import_hint = "\n文件中的步骤坐标和界面守卫已一并保留，可按需手动修改。" if total_coord_steps else ""
             QMessageBox.information(
                 self,
                 "导入完成",
                 f"已导入 {len(added_task_ids)} 个任务。\n\n"
-                f"这些模板会保留步骤和批量数据，但坐标/界面守卫已清空。"
+                f"这些模板会保留步骤、批量数据、坐标和界面守卫。"
                 f"{import_hint}"
             )
         except Exception as e:
@@ -8503,12 +9427,12 @@ class AutoManager(QMainWindow):
 
             coord_count = sum(len(task.get("coordinate_step_names", [])) for task in payload.get("tasks", []))
             self._log(f"📤 已导出 {len(payload.get('tasks', []))} 个任务模板", "blue")
-            export_hint = "\n对方导入后需重新录制相关步骤坐标。" if coord_count else ""
+            export_hint = "\n导出文件已完整保留相关步骤坐标和界面守卫，后续可按需手动修改。" if coord_count else ""
             QMessageBox.information(
                 self,
                 "导出完成",
                 f"已导出 {len(payload.get('tasks', []))} 个任务模板。\n\n"
-                "导出文件默认已去掉坐标和界面守卫，适合发给别人复用。"
+                "导出文件会完整保留坐标和界面守卫，适合备份，也可发给别人后再手动调整。"
                 f"{export_hint}"
             )
         except Exception as e:
@@ -8652,7 +9576,7 @@ class AutoManager(QMainWindow):
                 val_parts = str(a.get('value', '')).split('|')
                 url_val = val_parts[0] if val_parts else ""; prof_val = val_parts[1] if len(val_parts) > 1 else ""
                 le = QLineEdit(url_val); le.setPlaceholderText("输入网址..."); le.editingFinished.connect(lambda idx=i: self._update_url_config(idx))
-                btn_prof = QPushButton(get_profile_display_name(prof_val)); btn_prof.setToolTip("点击搜索并选择 Chrome 账户")
+                btn_prof = QPushButton(get_profile_display_name(prof_val)); btn_prof.setToolTip("点击选择账号或已打开窗口")
                 btn_prof.setProperty("profile_id", prof_val)  # Fix: must store the raw profile ID so _update_url_config can read it
                 btn_prof.clicked.connect(lambda chk, idx=i, b=btn_prof: self._pick_profile_for_action(idx, b))
                 l.addWidget(le, 2); l.addWidget(btn_prof, 1); self.action_table.setCellWidget(i, 3, w)
@@ -9100,10 +10024,23 @@ class AutoManager(QMainWindow):
         self._refresh_data_table()
 
     def _pick_profile_for_action(self, idx, btn):
-        sel = ChromeProfileSelector(self); pid = sel.get_selection()
-        if pid is not None:
-            btn.setProperty("profile_id", pid); btn.setText(get_profile_display_name(pid))
-            self._update_url_config(idx, btn)
+        # [增强] open_url 支持两种目标：
+        # 1) 账号 profile（原逻辑）
+        # 2) 已打开窗口（::hwnd=xxx），用于直接激活已打开的浏览器再打开网址
+        menu = QMenu(self)
+        act_acc = menu.addAction("选择账号…")
+        act_win = menu.addAction("选择已打开窗口…")
+        chosen = menu.exec_(btn.mapToGlobal(btn.rect().bottomLeft()))
+        if chosen == act_acc:
+            sel = ChromeProfileSelector(self); pid = sel.get_selection()
+            if pid is not None:
+                btn.setProperty("profile_id", pid); btn.setText(get_profile_display_name(pid))
+                self._update_url_config(idx, btn)
+        elif chosen == act_win:
+            s = WindowSelector(self).get_selection()
+            if s:
+                btn.setProperty("profile_id", s); btn.setText(get_profile_display_name(s))
+                self._update_url_config(idx, btn)
 
     def _show_cmd_presets(self, row, target_le):
         dlg = CommandPresetDialog(self)
@@ -9173,6 +10110,7 @@ class AutoManager(QMainWindow):
         if reply == QMessageBox.Yes:
             # 同步前先把流程编辑区尚未失焦的最新输入写回 config（尤其是增强版前缀|内容）
             self._force_sync_action_widgets()
+            self._save_data_table(flush=True)
             self._apply_task_data_schema(overwrite=False)
             self._refresh_data_table(force_sync=False)
 
@@ -9191,6 +10129,7 @@ class AutoManager(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         self._force_sync_action_widgets()
+        self._save_data_table(flush=True)
         self._apply_task_data_schema(overwrite=True)
         self._refresh_data_table(force_sync=False)
         QMessageBox.information(self, "完成", "已重置为流程预设值。")
@@ -9273,6 +10212,11 @@ class AutoManager(QMainWindow):
         act_only_current.setChecked(self.chk_only_current.isChecked())
         act_only_current.triggered.connect(self.chk_only_current.setChecked)
 
+        act_continue_on_fail = menu.addAction("❌ 失败也继续")
+        act_continue_on_fail.setCheckable(True)
+        act_continue_on_fail.setChecked(self.chk_continue_on_fail.isChecked())
+        act_continue_on_fail.triggered.connect(self.chk_continue_on_fail.setChecked)
+
         act_auto_shutdown = menu.addAction("🏁 任务完关机")
         act_auto_shutdown.setCheckable(True)
         act_auto_shutdown.setChecked(self.chk_auto_shutdown.isChecked())
@@ -9351,11 +10295,23 @@ class AutoManager(QMainWindow):
             return
         self._set_data_row_height(new_size, save=True)
 
+    def _data_select_col(self):
+        return 0
+
+    def _data_run_col(self):
+        return 1
+
+    def _data_status_col(self):
+        return 2
+
+    def _data_first_value_col(self):
+        return 3
+
     def _update_data_select_header(self):
         """同步第一列表头的全选状态提示。"""
         if not hasattr(self, "data_table") or self.data_table.columnCount() <= 0:
             return
-        header_item = self.data_table.horizontalHeaderItem(0)
+        header_item = self.data_table.horizontalHeaderItem(self._data_select_col())
         if not header_item:
             return
         has_any = False
@@ -9363,7 +10319,7 @@ class AutoManager(QMainWindow):
         for r in range(self.data_table.rowCount()):
             if not self._is_data_row_selectable(r):
                 continue
-            item = self.data_table.item(r, 0)
+            item = self.data_table.item(r, self._data_select_col())
             if not item:
                 continue
             has_any = True
@@ -9373,14 +10329,14 @@ class AutoManager(QMainWindow):
 
     def _on_data_header_clicked(self, logical_index):
         """点击“选择”表头时直接全选/取消全选。"""
-        if logical_index != 0:
+        if logical_index != self._data_select_col():
             return
         has_any = False
         all_checked = True
         for r in range(self.data_table.rowCount()):
             if not self._is_data_row_selectable(r):
                 continue
-            item = self.data_table.item(r, 0)
+            item = self.data_table.item(r, self._data_select_col())
             if not item:
                 continue
             has_any = True
@@ -9393,7 +10349,7 @@ class AutoManager(QMainWindow):
     def _set_all_row_check_state(self, checked):
         self.data_table.blockSignals(True)
         for r in range(self.data_table.rowCount()):
-            item = self.data_table.item(r, 0)
+            item = self.data_table.item(r, self._data_select_col())
             if item:
                 can_check = self._is_data_row_selectable(r)
                 item.setCheckState(Qt.Checked if checked and can_check else Qt.Unchecked)
@@ -9404,7 +10360,7 @@ class AutoManager(QMainWindow):
     def _invert_row_check_state(self):
         self.data_table.blockSignals(True)
         for r in range(self.data_table.rowCount()):
-            item = self.data_table.item(r, 0)
+            item = self.data_table.item(r, self._data_select_col())
             if item:
                 if not self._is_data_row_selectable(r):
                     item.setCheckState(Qt.Unchecked)
@@ -9429,7 +10385,7 @@ class AutoManager(QMainWindow):
         self.data_table.blockSignals(True)
         try:
             for r in range(start, end + 1):
-                item = self.data_table.item(r, 0)
+                item = self.data_table.item(r, self._data_select_col())
                 if item:
                     item.setCheckState(state if checked and self._is_data_row_selectable(r) else Qt.Unchecked)
         finally:
@@ -9441,6 +10397,598 @@ class AutoManager(QMainWindow):
     def _toggle_select_all(self, checked):
         """兼容旧调用，内部仍转到独立的全选/取消全选逻辑。"""
         self._set_all_row_check_state(bool(checked))
+
+    def _select_unsuccessful_rows(self):
+        if not self.current_task:
+            return
+        statuses = self._row_statuses.get(self.current_task, {})
+        if not statuses:
+            QMessageBox.information(self, "提示", "当前还没有可用于筛选的执行结果。")
+            return
+
+        target_statuses = {ROW_STATUS_FAIL, ROW_STATUS_SKIP, ROW_STATUS_DEFER, ROW_STATUS_MANUAL}
+        matched_rows = []
+        self.data_table.blockSignals(True)
+        try:
+            for r in range(self.data_table.rowCount()):
+                item = self.data_table.item(r, self._data_select_col())
+                if not item:
+                    continue
+                should_check = (statuses.get(r) in target_statuses) and self._is_data_row_selectable(r)
+                item.setCheckState(Qt.Checked if should_check else Qt.Unchecked)
+                if should_check:
+                    matched_rows.append(r)
+        finally:
+            self.data_table.blockSignals(False)
+
+        self._update_data_select_header()
+        self._save_data_table()
+        if matched_rows:
+            self._log(f"⚠️ 已选中 {len(matched_rows)} 行未成功数据", "orange")
+        else:
+            QMessageBox.information(self, "提示", "当前没有未成功的执行行。")
+
+    def _get_checked_data_rows(self):
+        """获取“批量数据”里勾选的行索引列表。"""
+        if not hasattr(self, "data_table"):
+            return []
+        rows = []
+        for r in range(self.data_table.rowCount()):
+            item = self.data_table.item(r, self._data_select_col())
+            if not item:
+                continue
+            if item.checkState() != Qt.Checked:
+                continue
+            if not self._is_data_row_selectable(r):
+                continue
+            rows.append(r)
+        return rows
+
+    def _build_subtask_entries_from_rows(self, rows):
+        """把勾选的行转换为“子任务管理器”可识别的条目结构。"""
+        out = []
+        if not self.current_task:
+            return out
+
+        # 最近一次执行的行结果里，尝试提取窗口上下文（hwnd/title/class）
+        latest_payload_by_row = {}
+        try:
+            for payload in reversed(getattr(self, "_last_run_row_results", []) or []):
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("task_id") != self.current_task:
+                    continue
+                r_idx = int(payload.get("row_index", -1))
+                if r_idx < 0:
+                    continue
+                if r_idx not in latest_payload_by_row:
+                    latest_payload_by_row[r_idx] = payload
+        except Exception:
+            latest_payload_by_row = {}
+
+        statuses = self._row_statuses.get(self.current_task, {}) or {}
+        row_data_list = (self.config.get("task_data", {}) or {}).get(self.current_task, []) or []
+        for r in rows:
+            payload = latest_payload_by_row.get(int(r), {}) if isinstance(latest_payload_by_row, dict) else {}
+            ctx = (payload.get("fail_ctx") or payload.get("row_ctx") or {}) if isinstance(payload, dict) else {}
+            fg = (ctx.get("foreground") or {}) if isinstance(ctx, dict) else {}
+            row_data = row_data_list[int(r)] if 0 <= int(r) < len(row_data_list) and isinstance(row_data_list[int(r)], dict) else {}
+
+            hwnd = ctx.get("target_hwnd") or fg.get("hwnd") or row_data.get("_窗口hwnd") or None
+            try:
+                hwnd = int(hwnd) if hwnd else None
+            except Exception:
+                hwnd = None
+
+            win_title = str(fg.get("title") or row_data.get("_窗口标题") or "")
+            win_class = str(fg.get("class") or row_data.get("_窗口类名") or "")
+            win_hint = str(row_data.get("_窗口提示") or "")
+            is_browser = bool((win_class == "Chrome_WidgetWin_1") or row_data.get("_是否浏览器窗口", False))
+
+            if sys.platform == "win32" and not hwnd:
+                try:
+                    target_hint = win_hint or win_title
+                    if target_hint:
+                        hwnd = find_browser_window_hwnd_by_hint(target_hint)
+                except Exception:
+                    hwnd = None
+            if sys.platform == "win32" and hwnd:
+                try:
+                    hwnd = int(hwnd)
+                    if not win_title:
+                        win_title = str(get_window_text(hwnd) or "")
+                    if not win_class:
+                        win_class = str(get_window_class_name(hwnd) or "")
+                    if not win_hint:
+                        win_hint = str(build_window_display_text(win_title, hwnd) or win_title or "")
+                    if win_class == "Chrome_WidgetWin_1":
+                        is_browser = True
+                except Exception:
+                    pass
+
+            entry = {
+                "task_id": self.current_task,
+                "task_display": self._get_task_display_text(self.current_task, with_folder=True) if hasattr(self, "_get_task_display_text") else str(self.current_task),
+                "row_index": int(r),
+                "status": str(statuses.get(int(r), "") or ""),
+                "_checked": True,
+                "step_index": int(ctx.get("step_index", 0) or 0) if isinstance(ctx, dict) else 0,
+                "step_name": str(ctx.get("step_name", "") or "") if isinstance(ctx, dict) else "",
+                "error": str(ctx.get("error", payload.get("last_error", "")) or "") if isinstance(payload, dict) else "",
+                "hwnd": hwnd,
+                "window_title": win_title,
+                "window_class": win_class,
+                "window_hint": win_hint,
+                "is_browser": bool(is_browser),
+            }
+            out.append(entry)
+        return out
+
+    def _open_subtask_manager(self):
+        """对勾选行打开“子任务管理器”。"""
+        try:
+            if not self.current_task:
+                return
+            rows = self._get_checked_data_rows()
+            if not rows:
+                QMessageBox.information(self, "提示", "请先在“批量数据”里勾选至少一行。")
+                return
+            entries = self._build_subtask_entries_from_rows(rows)
+            dlg = FailureManagerDialog(self, entries)
+            try:
+                dlg.setWindowTitle("🧩 子任务管理器")
+            except Exception:
+                pass
+            try:
+                dlg.context_task_id = self.current_task
+                if hasattr(dlg, "_load_parent_steps"):
+                    dlg._load_parent_steps()
+            except Exception:
+                pass
+            self._subtask_progress_dialog = dlg
+            try:
+                dlg.exec_()
+            finally:
+                if getattr(self, "_subtask_progress_dialog", None) is dlg:
+                    self._subtask_progress_dialog = None
+        except Exception as e:
+            # 记录详细调用栈到日志区；弹窗只给出精简信息，避免噪音
+            tb = traceback.format_exc()
+            try:
+                self._log(f"❌ 打开子任务管理器失败: {e}\n\n{tb}", "red")
+            except Exception:
+                pass
+            tail = "\n".join((tb or "").strip().splitlines()[-12:]) if tb else ""
+            QMessageBox.warning(
+                self,
+                "打开失败",
+                f"{e}\n\n最近调用栈(末尾):\n{tail}"
+            )
+
+    def _sync_subtask_manager_runtime(self, entry=None, parent_step_idx=None, running=None):
+        dlg = getattr(self, "_subtask_progress_dialog", None)
+        if not dlg:
+            return
+        try:
+            if running is not None and hasattr(dlg, "set_runtime_running"):
+                dlg.set_runtime_running(bool(running))
+            if hasattr(dlg, "set_runtime_progress"):
+                dlg.set_runtime_progress(entry=entry, parent_step_idx=parent_step_idx)
+        except RuntimeError:
+            self._subtask_progress_dialog = None
+        except Exception:
+            pass
+
+    def _sync_subtask_manager_entry_status(self, entry=None, status="", error=None):
+        dlg = getattr(self, "_subtask_progress_dialog", None)
+        if not dlg:
+            return
+        try:
+            if hasattr(dlg, "update_entry_status"):
+                dlg.update_entry_status(entry=entry, status=status, error=error)
+        except RuntimeError:
+            self._subtask_progress_dialog = None
+        except Exception:
+            pass
+
+    def _update_task_row_status_cache(self, task_id, row_idx, status):
+        if not task_id:
+            return
+        try:
+            row_idx = int(row_idx)
+        except Exception:
+            return
+        if row_idx < 0:
+            return
+        self._row_statuses.setdefault(task_id, {})[row_idx] = status
+        if task_id == self.current_task:
+            self._on_row_status(row_idx, status)
+
+    def _persist_row_window_context(self, payload):
+        """把每行最近一次捕获到的窗口上下文写回 task_data，重开软件后也能继续复用。"""
+        try:
+            if not isinstance(payload, dict):
+                return
+            task_id = str(payload.get("task_id") or self.current_task or "")
+            row_idx = int(payload.get("row_index", -1))
+            if not task_id or row_idx < 0:
+                return
+            data_rows = self.config.get("task_data", {}).get(task_id, [])
+            if row_idx >= len(data_rows) or not isinstance(data_rows[row_idx], dict):
+                return
+
+            row_dict = data_rows[row_idx]
+            ctx = payload.get("fail_ctx") or payload.get("row_ctx") or {}
+            fg = ctx.get("foreground") or {}
+            hwnd = ctx.get("target_hwnd") or fg.get("hwnd") or row_dict.get("_窗口hwnd") or None
+            try:
+                hwnd = int(hwnd) if hwnd else None
+            except Exception:
+                hwnd = None
+
+            win_title = str(fg.get("title") or row_dict.get("_窗口标题") or "")
+            win_class = str(fg.get("class") or row_dict.get("_窗口类名") or "")
+            is_browser = bool((win_class == "Chrome_WidgetWin_1") or row_dict.get("_是否浏览器窗口", False))
+            if sys.platform == "win32" and hwnd:
+                try:
+                    if not win_title:
+                        win_title = str(get_window_text(hwnd) or "")
+                    if not win_class:
+                        win_class = str(get_window_class_name(hwnd) or "")
+                    if win_class == "Chrome_WidgetWin_1":
+                        is_browser = True
+                except Exception:
+                    pass
+
+            try:
+                win_hint = str(build_window_display_text(win_title, hwnd) or win_title or "")
+            except Exception:
+                win_hint = win_title
+
+            row_dict["_窗口hwnd"] = int(hwnd) if hwnd else None
+            row_dict["_窗口标题"] = win_title
+            row_dict["_窗口类名"] = win_class
+            row_dict["_窗口提示"] = win_hint
+            row_dict["_是否浏览器窗口"] = bool(is_browser)
+            self._schedule_config_flush()
+        except Exception:
+            pass
+
+    def _on_subtask_row_status(self, status, entry=None):
+        status_text = str(status or "")
+        self._subtask_last_row_status = status_text
+        target_entry = entry if isinstance(entry, dict) else getattr(self, "_current_subtask_entry", None)
+        if isinstance(target_entry, dict):
+            self._sync_subtask_manager_entry_status(entry=target_entry, status=status_text, error=None)
+            self._update_task_row_status_cache(
+                str(target_entry.get("task_id") or ""),
+                target_entry.get("row_index", -1),
+                status_text
+            )
+
+    def _on_subtask_row_result(self, payload, entry=None):
+        self._subtask_last_row_result = payload if isinstance(payload, dict) else None
+        if isinstance(payload, dict):
+            self._persist_row_window_context(payload)
+        if isinstance(payload, dict) and payload.get("status"):
+            self._on_subtask_row_status(payload.get("status"), entry=entry)
+
+    def _update_subtask_progress(self, percent):
+        if getattr(self, "_ui_stop_reset_pending", False):
+            return
+        total_count = max(int(getattr(self, "_subtask_total_count", 0) or 0), 1)
+        pending_count = len(getattr(self, "_subtask_queue", []) or [])
+        completed_count = max(0, total_count - pending_count - 1)
+        try:
+            percent = int(percent)
+        except Exception:
+            percent = 0
+        percent = max(0, min(100, percent))
+        overall = int(round(((completed_count + percent / 100.0) / total_count) * 100))
+        self.progress.setValue(max(0, min(100, overall)))
+        self._update_osd_subtask(percent)
+
+    def _on_subtask_engine_highlight(self, entry, parent_step_indices, auto_activate_inserted, row_idx, step_idx):
+        parent_step_idx = None
+        try:
+            step_idx = int(step_idx)
+        except Exception:
+            step_idx = -1
+        try:
+            parent_step_indices = [int(i) for i in (parent_step_indices or [])]
+        except Exception:
+            parent_step_indices = []
+
+        parent_start = 1 if auto_activate_inserted else 0
+        parent_end = parent_start + len(parent_step_indices)
+        if parent_start <= step_idx < parent_end:
+            parent_step_idx = parent_step_indices[step_idx - parent_start]
+        self._sync_subtask_manager_runtime(entry=entry, parent_step_idx=parent_step_idx, running=True)
+
+    def _start_subtask_for_entries(self, entries, subtask_task_id, auto_activate_hwnd=True, parent_step_indices=None, continue_with_parent=False, context_task_id=""):
+        """对条目列表顺序执行子任务（每个条目跑一次子任务流程）。"""
+        try:
+            if hasattr(self, '_engine') and self._engine.isRunning():
+                QMessageBox.warning(self, "执行中", "请先等待当前执行结束或停止后再启动子任务。")
+                return False
+            if subtask_task_id and subtask_task_id not in self.config.get("tasks", {}):
+                QMessageBox.warning(self, "提示", "子任务不存在。")
+                return False
+            if not subtask_task_id and not parent_step_indices:
+                QMessageBox.warning(self, "提示", "没有可执行的前置步骤或子任务。")
+                return False
+            self._subtask_queue = list(entries or [])
+            self._subtask_task_id = subtask_task_id
+            self._subtask_auto_activate_hwnd = bool(auto_activate_hwnd)
+            self._subtask_origin_task = self.current_task
+            self._subtask_parent_step_indices = sorted({int(i) for i in (parent_step_indices or []) if int(i) >= 0})
+            self._subtask_continue_with_parent = bool(continue_with_parent)
+            self._subtask_context_task_id = str(context_task_id or self.current_task or "")
+            self._subtask_total_count = len(self._subtask_queue)
+            self._subtask_completed_count = 0
+            self._subtask_stopped = False
+            self._ui_stop_reset_pending = False
+            self._subtask_last_row_status = ""
+            self._subtask_last_row_result = None
+            self._current_subtask_entry = None
+            self.progress.setValue(0)
+            subtask_label = self._get_task_display_text(subtask_task_id, with_folder=True) if subtask_task_id else "(无额外子任务)"
+            self._log(f"🧩 准备执行子任务：共 {len(self._subtask_queue)} 项 | 子任务={subtask_label}", "purple")
+            self._show_osd_for_subtask()
+            self._sync_subtask_manager_runtime(entry=None, parent_step_idx=None, running=True)
+            self._run_next_subtask_entry()
+            return True
+        except Exception as e:
+            QMessageBox.warning(self, "子任务启动失败", str(e))
+            self._sync_subtask_manager_runtime(entry=None, parent_step_idx=None, running=False)
+            self.osd.hide()
+            return False
+
+    def _run_next_subtask_entry(self):
+        """顺序执行子任务队列。"""
+        try:
+            if not getattr(self, "_subtask_queue", None):
+                # 子任务完成：回到开始前所在主任务
+                self._current_subtask_entry = None
+                if not getattr(self, "_subtask_stopped", False):
+                    self.progress.setValue(100)
+                elif getattr(self, "_ui_stop_reset_pending", False):
+                    self.progress.setValue(0)
+                self._subtask_total_count = 0
+                origin = getattr(self, "_subtask_origin_task", "")
+                if origin:
+                    self._activate_task_by_id(origin)
+                self.btn_run.setEnabled(True); self.btn_run.setText("🚀 开始批量执行")
+                self.btn_stop.setEnabled(False); self.btn_resume.setEnabled(False)
+                self.btn_dry_run.setEnabled(True)
+                self.btn_pause.setEnabled(False)
+                if getattr(self, "_subtask_stopped", False):
+                    self._log("🛑 子任务已停止，剩余队列已取消。", "orange")
+                else:
+                    self._log("✅ 子任务已全部执行完毕。", "green")
+                self._sync_subtask_manager_runtime(entry=None, parent_step_idx=None, running=False)
+                self.osd.hide()
+                return
+
+            entry = self._subtask_queue.pop(0)
+            if not isinstance(entry, dict):
+                QTimer.singleShot(0, self._run_next_subtask_entry)
+                return
+            self._current_subtask_entry = entry
+
+            src_task_id = entry.get("task_id") or getattr(self, "_subtask_origin_task", "")
+            row_idx = int(entry.get("row_index", 0) or 0)
+            hwnd = entry.get("hwnd")
+            try:
+                hwnd = int(hwnd) if hwnd else None
+            except Exception:
+                hwnd = None
+            if sys.platform == "win32" and not hwnd:
+                try:
+                    hint = str(entry.get("window_hint") or entry.get("window_title") or "").strip()
+                    if hint:
+                        hwnd = find_browser_window_hwnd_by_hint(hint)
+                        if hwnd:
+                            entry["hwnd"] = int(hwnd)
+                except Exception:
+                    hwnd = None
+
+            row_data_list = (self.config.get("task_data", {}) or {}).get(src_task_id, []) or []
+            row_data = {}
+            if 0 <= row_idx < len(row_data_list):
+                if isinstance(row_data_list[row_idx], dict):
+                    row_data = row_data_list[row_idx]
+
+            import copy
+            src_task_actions = copy.deepcopy(self.config.get("tasks", {}).get(src_task_id, []) or [])
+            subtask_actions = copy.deepcopy(self.config.get("tasks", {}).get(self._subtask_task_id, []) or []) if getattr(self, "_subtask_task_id", "") else []
+
+            selected_parent_actions = []
+            parent_step_indices = list(getattr(self, "_subtask_parent_step_indices", []) or [])
+            if src_task_id == getattr(self, "_subtask_context_task_id", src_task_id):
+                for idx in parent_step_indices:
+                    if 0 <= idx < len(src_task_actions):
+                        selected_parent_actions.append(copy.deepcopy(src_task_actions[idx]))
+
+            actions = []
+            has_parent_window_step = any(CMD_MAP.get(act.get("action"), "") in ["win_active", "open_url"] for act in selected_parent_actions)
+            inserted_auto_activate = False
+            # 如果本行已捕获到 hwnd，且前置步骤里没有窗口相关动作，则自动加一条激活窗口
+            if getattr(self, "_subtask_auto_activate_hwnd", True) and hwnd and not has_parent_window_step:
+                inserted_auto_activate = True
+                actions.append({
+                    "name": "[子任务] 激活窗口",
+                    "action": "激活窗口",
+                    "value": f"::hwnd={int(hwnd)}",
+                    "x": 0, "y": 0,
+                    "delay": 0,
+                    "guard_enabled": False
+                })
+
+            actions.extend(selected_parent_actions)
+            actions.extend(subtask_actions)
+            if getattr(self, "_subtask_continue_with_parent", False):
+                actions.extend(src_task_actions)
+
+            self._subtask_last_row_status = ""
+            self._subtask_last_row_result = None
+            self._sync_subtask_manager_runtime(entry=entry, parent_step_idx=None, running=True)
+            self._sync_subtask_manager_entry_status(entry=entry, status="", error=None)
+
+            if not actions:
+                self._log("⚠️ 当前条目没有可执行的步骤，已跳过。", "orange")
+                self._sync_subtask_manager_entry_status(entry=entry, status=ROW_STATUS_SKIP, error="当前条目没有可执行的步骤")
+                QTimer.singleShot(0, self._run_next_subtask_entry)
+                return
+
+            # UI 状态
+            self.btn_run.setEnabled(False); self.btn_resume.setEnabled(False); self.btn_stop.setEnabled(True)
+            self.btn_run.setText("🧩 子任务中...")
+            self.btn_pause.setEnabled(True); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
+            self._show_osd_for_subtask(entry=entry)
+
+            label_task = str(entry.get("task_display", "") or src_task_id)
+            label_row = row_idx + 1
+            extra_desc = []
+            if selected_parent_actions:
+                extra_desc.append(f"前置{len(selected_parent_actions)}步")
+            if subtask_actions:
+                extra_desc.append(f"子任务{len(subtask_actions)}步")
+            if getattr(self, "_subtask_continue_with_parent", False):
+                extra_desc.append(f"继续父任务{len(src_task_actions)}步")
+            extra_text = " | ".join(extra_desc) if extra_desc else "无额外说明"
+            self._log(f"🧩 子任务执行：{label_task} | 第 {label_row} 行 | {extra_text}", "blue")
+
+            self._engine = AutoEngine(
+                actions, [row_data], 0, 0, 0, loops=1, start_l=0,
+                retry_count=self.retry_spin.value(),
+                on_error="fail_row",
+                ignore_data=False,
+                standardize_window=self.chk_std_win.isChecked()
+            )
+            subtask_name = self._get_task_display_text(self._subtask_task_id, with_folder=True) if getattr(self, "_subtask_task_id", "") else "前置步骤"
+            self._engine._task_name = f"[子任务] {subtask_name}"
+            self._engine._task_id = self._subtask_task_id or src_task_id
+            self._engine.log_sig.connect(self._log)
+            self._engine.prog_sig.connect(self._update_subtask_progress)
+            self._engine.done_sig.connect(self._on_subtask_done)
+            self._engine.row_status_sig.connect(lambda _row_idx, status, current_entry=entry: self._on_subtask_row_status(status, entry=current_entry))
+            self._engine.row_result_sig.connect(lambda payload, current_entry=entry: self._on_subtask_row_result(payload, entry=current_entry))
+            self._engine.highlight_sig.connect(
+                lambda row_idx, step_idx, current_entry=entry, parent_rows=parent_step_indices, inserted_auto=inserted_auto_activate:
+                    self._on_subtask_engine_highlight(current_entry, parent_rows, inserted_auto, row_idx, step_idx)
+            )
+            self._engine.detail_sig.connect(self.osd.update_detail)
+            self._engine.start()
+        except Exception as e:
+            self._log(f"❌ 子任务异常: {e}", "red")
+            self._sync_subtask_manager_entry_status(
+                entry=getattr(self, "_current_subtask_entry", None),
+                status=ROW_STATUS_FAIL,
+                error=str(e)
+            )
+            QTimer.singleShot(0, self._run_next_subtask_entry)
+
+    def _on_subtask_done(self):
+        """单个子任务执行结束，继续下一个。"""
+        try:
+            final_status = getattr(getattr(self, '_engine', None), '_final_status', 'done')
+            last_error = getattr(getattr(self, '_engine', None), '_last_error', '')
+            current_entry = getattr(self, "_current_subtask_entry", None)
+            if final_status == "stopped":
+                # 用户停止：终止剩余队列
+                self._subtask_stopped = True
+                self._subtask_queue = []
+                self._sync_subtask_manager_entry_status(entry=current_entry, status=ROW_STATUS_MANUAL, error="用户停止")
+                if isinstance(current_entry, dict):
+                    self._update_task_row_status_cache(
+                        str(current_entry.get("task_id") or ""),
+                        current_entry.get("row_index", -1),
+                        ROW_STATUS_MANUAL
+                    )
+                QTimer.singleShot(50, self._run_next_subtask_entry)
+                return
+            if final_status == "failed":
+                self._sync_subtask_manager_entry_status(entry=current_entry, status=ROW_STATUS_FAIL, error=last_error)
+                if isinstance(current_entry, dict):
+                    self._update_task_row_status_cache(
+                        str(current_entry.get("task_id") or ""),
+                        current_entry.get("row_index", -1),
+                        ROW_STATUS_FAIL
+                    )
+                self._log(f"⚠️ 子任务执行失败: {last_error}", "orange")
+            else:
+                row_status = str(getattr(self, "_subtask_last_row_status", "") or "")
+                if not row_status:
+                    payload = getattr(self, "_subtask_last_row_result", None)
+                    if isinstance(payload, dict):
+                        row_status = str(payload.get("status", "") or "")
+                if row_status not in {ROW_STATUS_OK, ROW_STATUS_FAIL, ROW_STATUS_SKIP, ROW_STATUS_DEFER, ROW_STATUS_MANUAL}:
+                    row_status = ROW_STATUS_OK
+                self._sync_subtask_manager_entry_status(entry=current_entry, status=row_status, error="")
+                if isinstance(current_entry, dict):
+                    self._update_task_row_status_cache(
+                        str(current_entry.get("task_id") or ""),
+                        current_entry.get("row_index", -1),
+                        row_status
+                    )
+            total_count = max(int(getattr(self, "_subtask_total_count", 0) or 0), 1)
+            self._subtask_completed_count = min(total_count, int(getattr(self, "_subtask_completed_count", 0) or 0) + 1)
+            self.progress.setValue(int(round(self._subtask_completed_count * 100 / total_count)))
+            self.btn_run.setText("🧩 子任务中...")
+            QTimer.singleShot(120, self._run_next_subtask_entry)
+        except Exception:
+            QTimer.singleShot(120, self._run_next_subtask_entry)
+
+    def _show_osd_for_subtask(self, entry=None):
+        if not getattr(self, "chk_show_osd", None) or not self.chk_show_osd.isChecked():
+            self.osd.hide()
+            return
+
+        current_entry = entry if isinstance(entry, dict) else getattr(self, "_current_subtask_entry", None)
+        if isinstance(current_entry, dict):
+            task_label = str(current_entry.get("task_display", "") or current_entry.get("task_id", "") or self.current_task)
+            row_label = int(current_entry.get("row_index", 0) or 0) + 1
+            self.osd.lbl_info.setText(f"🧩 准备执行子任务: {task_label} | 第 {row_label} 行")
+        else:
+            subtask_name = self._get_task_display_text(self._subtask_task_id, with_folder=True) if getattr(self, "_subtask_task_id", "") else "前置步骤"
+            total_count = int(getattr(self, "_subtask_total_count", 0) or 0)
+            self.osd.lbl_info.setText(f"🧩 准备启动子任务: {subtask_name} | 共 {total_count} 项")
+
+        self.osd.bar.setValue(0)
+        self.osd.lbl_pct.setText("0%")
+        self.osd.lbl_detail.setText("准备就绪")
+        self.osd.show()
+        self.osd.raise_()
+        if sys.platform == 'win32':
+            self.osd._force_topmost(-1)
+
+    def _update_osd_subtask(self, percent):
+        if getattr(self, "_ui_stop_reset_pending", False):
+            return
+        if not self.chk_show_osd.isChecked():
+            self.osd.hide()
+            return
+
+        if hasattr(self, '_engine') and self._engine.isRunning():
+            e = self._engine
+            cur_act = e.actions[e._cur_s] if e._cur_s < len(e.actions) else {}
+            current_entry = getattr(self, "_current_subtask_entry", None) or {}
+            total_groups = max(int(getattr(self, "_subtask_total_count", 0) or 0), 1)
+            pending_groups = len(getattr(self, "_subtask_queue", []) or [])
+            current_group = min(max(total_groups - pending_groups, 1), total_groups)
+            task_label = str(current_entry.get("task_display", "") or current_entry.get("task_id", "") or self.current_task)
+            row_label = int(current_entry.get("row_index", 0) or 0) + 1
+            self.osd.update_progress(
+                f"[子任务] {task_label} | 第 {row_label} 行",
+                e._cur_l,
+                current_group,
+                total_groups,
+                e._cur_s + 1,
+                len(e.actions),
+                cur_act.get('name', 'Step'),
+                percent
+            )
 
     def _schedule_config_flush(self, delay_ms=260):
         """合并短时间内的频繁保存请求，减少输入时卡顿。"""
@@ -9505,7 +11053,7 @@ class AutoManager(QMainWindow):
     def _apply_data_table_column_visibility(self, acts, show_delay):
         """按开关隐藏不可编辑步骤，但不改变底层列顺序，避免数据错位。"""
         show_noneditable = self.btn_toggle_noneditable.isChecked() if hasattr(self, "btn_toggle_noneditable") else True
-        col_idx = 2
+        col_idx = self._data_first_value_col()
         for action in acts:
             act_type = CMD_MAP.get(action.get('action'), "click")
             hide_this = self._is_compact_data_action(act_type) and not show_noneditable
@@ -9524,19 +11072,20 @@ class AutoManager(QMainWindow):
             self._render_timer.stop()
             
         acts = self.config['tasks'].get(self.current_task, []); show_delay = self.btn_toggle_delay.isChecked()
-        headers = ["选择", "状态"]
+        headers = ["选择", "执行", "状态"]
         for idx, a in enumerate(acts, 1):
             name = a.get('name', 'Step')
             headers.append(f"{idx}.{name}")
             if show_delay: headers.append(f"{idx}.{name}_延时")
-        if len(headers) == 1: headers = ["状态", "(等待添加步骤)"]
+        if len(headers) == self._data_first_value_col(): headers = ["选择", "执行", "状态", "(等待添加步骤)"]
         
         self.data_table.blockSignals(True)
+        self.data_table.clearContents()
         old_data = self.config['task_data'].get(self.current_task, [])
         self.data_table.setColumnCount(len(headers))
         self.data_table.setHorizontalHeaderLabels(headers)
         default_delegate = QStyledItemDelegate(self.data_table)
-        col_idx = 2
+        col_idx = self._data_first_value_col()
         for a in acts:
             act_type = CMD_MAP.get(a.get('action'), "click")
             if act_type in ["input", "clear_input"]:
@@ -9557,15 +11106,31 @@ class AutoManager(QMainWindow):
             s_item = QTableWidgetItem(statuses.get(r, ""))
             s_item.setFlags(s_item.flags() & ~Qt.ItemIsEditable); s_item.setTextAlignment(Qt.AlignCenter)
             self._apply_row_status_style(s_item, statuses.get(r, ""))
-            self.data_table.setItem(r, 1, s_item)
+            self.data_table.setItem(r, self._data_status_col(), s_item)
             chk_item = QTableWidgetItem()
             chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
             row_has_data = self._row_has_meaningful_data(row_dict, acts)
             is_checked = bool(row_dict.get("_选中", True)) if row_has_data else False
             chk_item.setCheckState(Qt.Checked if is_checked else Qt.Unchecked)
-            self.data_table.setItem(r, 0, chk_item)
+            self.data_table.setItem(r, self._data_select_col(), chk_item)
 
-            col_idx = 2
+            self.data_table.removeCellWidget(r, self._data_run_col())
+            # 用图标代替文字，避免按钮列较窄时文字不可见
+            btn_run_row = QPushButton("")
+            try:
+                btn_run_row.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+                btn_run_row.setIconSize(QSize(14, 14))
+            except Exception:
+                pass
+            btn_run_row.setToolTip("单独执行这一行任务，不依赖“选择”勾选。")
+            btn_run_row.setProperty("data_row", r)
+            btn_run_row.setFixedHeight(max(24, self.config.get("layout", {}).get("data_row_height", 28) - 4))
+            btn_run_row.setFixedWidth(30)
+            btn_run_row.clicked.connect(lambda _checked=False, data_row=r: self._run_single_data_row(data_row))
+            btn_run_row.setEnabled(r < len(old_data) and bool(acts))
+            self.data_table.setCellWidget(r, self._data_run_col(), btn_run_row)
+
+            col_idx = self._data_first_value_col()
             for a in acts:
                 self.data_table.removeCellWidget(r, col_idx) # 清理旧控件
                 name = a.get('name', 'Step'); raw_act_type = a.get('action'); act_type = CMD_MAP.get(raw_act_type, "click")
@@ -9611,7 +11176,7 @@ class AutoManager(QMainWindow):
             
         r = self._render_row_idx
         row_dict = old_data[r] if r < len(old_data) else {}
-        col_idx = 2
+        col_idx = self._data_first_value_col()
         
         for a in acts:
             raw_act_type = a.get('action'); act_type = CMD_MAP.get(raw_act_type, "click")
@@ -9637,7 +11202,10 @@ class AutoManager(QMainWindow):
                 btn.setFixedWidth(92)
                 btn.setStyleSheet("border: none; background: #d1e9ff; text-align: left; padding-left: 5px;")
                 le.setToolTip(str(val))
-                btn.setToolTip(f"当前账号: {get_profile_display_name(p_p)}")
+                if isinstance(p_p, str) and "::hwnd=" in p_p:
+                    btn.setToolTip(f"当前目标: 已打开窗口\n{p_p}\n\n点击可切换账号或选择已打开窗口")
+                else:
+                    btn.setToolTip(f"当前目标: {get_profile_display_name(p_p)}\n\n点击可切换账号或选择已打开窗口")
                 btn.clicked.connect(lambda chk, r=r, c=col_idx, b=btn: self._pick_profile_for_data_cell(r, c, b))
                 l.addWidget(le, 2); l.addWidget(btn, 1); self.data_table.setCellWidget(r, col_idx, w)
                 col_idx += 1
@@ -9703,13 +11271,18 @@ class AutoManager(QMainWindow):
         rs = self.data_table.rowCount(); cs = self.data_table.columnCount()
         if rs == 0: return
         acts = self.config['tasks'].get(self.current_task, [])
+        old_rows = self.config.get('task_data', {}).get(self.current_task, []) or []
         show_delay = self.btn_toggle_delay.isChecked()
         hs = [self.data_table.horizontalHeaderItem(i).text() for i in range(cs)]
         nd = []
         for r in range(rs):
             row_dict = {}
-            col_idx = 2  # skip select(0) and status(1) columns
-            chk_item = self.data_table.item(r, 0)
+            old_row_dict = old_rows[r] if r < len(old_rows) and isinstance(old_rows[r], dict) else {}
+            for k, v in old_row_dict.items():
+                if isinstance(k, str) and k.startswith("_") and k != "_选中":
+                    row_dict[k] = v
+            col_idx = self._data_first_value_col()  # skip select/execute/status columns
+            chk_item = self.data_table.item(r, self._data_select_col())
             row_dict["_选中"] = (chk_item.checkState() == Qt.Checked) if chk_item else True
             for a in acts:
                 raw_act_type = a.get('action')
@@ -9854,7 +11427,7 @@ class AutoManager(QMainWindow):
                 old_checked = bool(row_dict.get("_选中", False))
                 row_dict["_选中"] = should_check
                 if row < self.data_table.rowCount():
-                    chk_item = self.data_table.item(row, 0)
+                    chk_item = self.data_table.item(row, self._data_select_col())
                     target_state = Qt.Checked if should_check else Qt.Unchecked
                     if chk_item and chk_item.checkState() != target_state:
                         chk_item.setCheckState(target_state)
@@ -9863,7 +11436,7 @@ class AutoManager(QMainWindow):
                         chk_item = QTableWidgetItem()
                         chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
                         chk_item.setCheckState(target_state)
-                        self.data_table.setItem(row, 0, chk_item)
+                        self.data_table.setItem(row, self._data_select_col(), chk_item)
                         changed = True
                 if old_checked != should_check:
                     changed = True
@@ -9885,10 +11458,20 @@ class AutoManager(QMainWindow):
         val = f"{le.text()}|{btn.property('profile_id') or ''}"; self._on_cell_widget_changed(row, col, val)
 
     def _pick_profile_for_data_cell(self, row, col, btn):
-        sel = ChromeProfileSelector(self); pid = sel.get_selection()
-        if pid is not None:
-            btn.setProperty("profile_id", pid); btn.setText(get_profile_display_name(pid))
-            self._on_url_cell_changed(row, col)
+        menu = QMenu(self)
+        act_acc = menu.addAction("选择账号…")
+        act_win = menu.addAction("选择已打开窗口…")
+        chosen = menu.exec_(btn.mapToGlobal(btn.rect().bottomLeft()))
+        if chosen == act_acc:
+            sel = ChromeProfileSelector(self); pid = sel.get_selection()
+            if pid is not None:
+                btn.setProperty("profile_id", pid); btn.setText(get_profile_display_name(pid))
+                self._on_url_cell_changed(row, col)
+        elif chosen == act_win:
+            s = WindowSelector(self).get_selection()
+            if s:
+                btn.setProperty("profile_id", s); btn.setText(get_profile_display_name(s))
+                self._on_url_cell_changed(row, col)
 
     def _batch_assign_profiles(self):
         """批量处理中心：支持多步骤同时填充、分类过滤等。"""
@@ -9898,7 +11481,7 @@ class AutoManager(QMainWindow):
         
         # 1. 识别所有可批量编辑的列
         edit_cols = [] # [(col_idx, step_idx, step_name, act_type), ...]
-        col_i = 2
+        col_i = self._data_first_value_col()
         for s_idx, a in enumerate(acts):
             raw_act = a.get('action')
             act_type = CMD_MAP.get(raw_act, '')
@@ -10296,11 +11879,16 @@ class AutoManager(QMainWindow):
                                 if sub == "prefix": val = parts[0] if len(parts) > 0 else ""
                                 else: val = parts[1] if len(parts) > 1 else ""
                         elif act_type == "open_url":
-                            parts = raw_val.split('|', 1)
-                            if sub == "url": val = parts[0] if len(parts) > 0 else ""
+                            skip_token = "[SKIP_ROW]"
+                            if raw_val.strip() == skip_token:
+                                val = skip_token if sub == "url" else ""
                             else:
-                                p_id = parts[1] if len(parts) > 1 else ""
-                                val = get_profile_display_name(p_id) if p_id else ""
+                                parts = raw_val.split('|', 1)
+                                if sub == "url":
+                                    val = parts[0] if len(parts) > 0 else ""
+                                else:
+                                    p_id = parts[1] if len(parts) > 1 else ""
+                                    val = get_profile_display_name(p_id) if p_id else ""
                         else:
                             val = raw_val
                     elif act_type in ["input", "clear_input", "upload", "run_app"]:
@@ -10311,7 +11899,20 @@ class AutoManager(QMainWindow):
                     it.setData(Qt.UserRole, real_row)
                     it.setData(Qt.UserRole + 1, real_col)
                     it.setData(Qt.UserRole + 2, sub)
-                    it.setToolTip(val)
+                    if act_type == "open_url" and sub == "profile":
+                        p_id = ""
+                        if item_backing:
+                            raw_val = item_backing.text()
+                            if raw_val.strip() != "[SKIP_ROW]":
+                                parts = raw_val.split('|', 1)
+                                p_id = parts[1] if len(parts) > 1 else ""
+                        if p_id:
+                            it.setData(Qt.UserRole + 10, f"|{p_id}")
+                            it.setToolTip(p_id)
+                        else:
+                            it.setToolTip(val)
+                    else:
+                        it.setToolTip(val)
                     preview_table.setItem(r_idx, pc_idx, it)
             preview_table.blockSignals(False)
             if preserved_state:
@@ -11621,6 +13222,7 @@ class AutoManager(QMainWindow):
                         default_exts = smart_rules.get("file_exts_text", SMART_FILL_FILE_EXTS_TEXT)
                     return {
                         "step_name": step_name,
+                        "enabled": True,
                         "target_kind": "file",
                         "exts_text": str(default_exts),
                         "consume_mode": "sequential",
@@ -11634,6 +13236,7 @@ class AutoManager(QMainWindow):
                 )
                 return {
                     "step_name": step_name,
+                    "enabled": True,
                     "target_kind": "text",
                     "exts_text": str(text_default_exts),
                     "consume_mode": "sequential",
@@ -11649,7 +13252,7 @@ class AutoManager(QMainWindow):
                     if not isinstance(raw, dict) and legacy_step_key:
                         raw = raw_map.get(legacy_step_key)
                     if isinstance(raw, dict):
-                        for k in ["exts_text", "consume_mode", "text_fill_mode", "shortage_action"]:
+                        for k in ["enabled", "exts_text", "consume_mode", "text_fill_mode", "shortage_action"]:
                             if k in raw:
                                 base[k] = raw[k]
                 base["parsed_exts"] = _parse_exts_text(base.get("exts_text"), base.get("exts_text"))
@@ -11693,10 +13296,17 @@ class AutoManager(QMainWindow):
                     if act_type == "clear_input_plus":
                         type_text = "增强文本内容"
 
-                    it_name = QTableWidgetItem(step_name)
-                    it_name.setToolTip(f"步骤序号: {step_idx + 1} | 列索引: {real_col} | 动作类型: {act_type}")
+                    chk_enabled = QCheckBox(step_name)
+                    chk_enabled.setChecked(bool(rule.get("enabled", True)))
+                    chk_enabled.setToolTip(f"步骤序号: {step_idx + 1} | 列索引: {real_col} | 动作类型: {act_type}")
+                    step_widget = QWidget()
+                    step_widget_ly = QHBoxLayout(step_widget)
+                    step_widget_ly.setContentsMargins(4, 0, 4, 0)
+                    step_widget_ly.setSpacing(0)
+                    step_widget_ly.addWidget(chk_enabled)
+                    step_widget_ly.addStretch()
                     it_type = QTableWidgetItem(type_text)
-                    rule_table.setItem(row_idx, 0, it_name)
+                    rule_table.setCellWidget(row_idx, 0, step_widget)
                     rule_table.setItem(row_idx, 1, it_type)
 
                     cb_exts = _create_exts_combo(
@@ -11733,17 +13343,29 @@ class AutoManager(QMainWindow):
                         cb_shortage.setCurrentIndex(idx)
                     rule_table.setCellWidget(row_idx, 5, cb_shortage)
 
-                    row_widgets.append({
+                    row_data = {
                         "step_key": step_key,
                         "step_name": step_name,
                         "act_type": act_type,
                         "sub": sub,
                         "target_kind": rule["target_kind"],
+                        "chk_enabled": chk_enabled,
                         "cb_exts": cb_exts,
                         "cb_consume": cb_consume,
                         "cb_text_mode": cb_text_mode,
                         "cb_shortage": cb_shortage,
-                    })
+                    }
+
+                    def _sync_step_row_enabled(rd):
+                        enabled = rd["chk_enabled"].isChecked()
+                        rd["cb_exts"].setEnabled(enabled)
+                        rd["cb_consume"].setEnabled(enabled)
+                        rd["cb_shortage"].setEnabled(enabled)
+                        rd["cb_text_mode"].setEnabled(enabled and rd["target_kind"] == "text")
+
+                    _sync_step_row_enabled(row_data)
+                    chk_enabled.toggled.connect(lambda _checked, rd=row_data: _sync_step_row_enabled(rd))
+                    row_widgets.append(row_data)
 
                 tip = QLabel(
                     "规则说明：\n"
@@ -11776,6 +13398,7 @@ class AutoManager(QMainWindow):
                             row_data["sub"],
                             get_default_smart_fill_rules()
                         )
+                        row_data["chk_enabled"].setChecked(bool(default_rule.get("enabled", True)))
                         row_data["cb_exts"].setEditText(str(default_rule.get("exts_text", "")))
                         idx = row_data["cb_consume"].findData(default_rule.get("consume_mode", "sequential"))
                         if idx >= 0:
@@ -11789,17 +13412,25 @@ class AutoManager(QMainWindow):
 
                 def _confirm_step_rules():
                     new_step_rules = {}
+                    enabled_count = 0
                     for row_data in row_widgets:
+                        enabled = row_data["chk_enabled"].isChecked()
+                        if enabled:
+                            enabled_count += 1
                         exts_text = _get_combo_text(row_data["cb_exts"])
-                        if not exts_text:
+                        if enabled and not exts_text:
                             QMessageBox.warning(dlg_step, "提示", f"步骤「{row_data['step_name']}」请至少填写一个扩展名。")
                             return
                         new_step_rules[row_data["step_key"]] = {
+                            "enabled": enabled,
                             "exts_text": exts_text,
                             "consume_mode": row_data["cb_consume"].currentData(),
                             "text_fill_mode": row_data["cb_text_mode"].currentData(),
                             "shortage_action": row_data["cb_shortage"].currentData(),
                         }
+                    if enabled_count <= 0:
+                        QMessageBox.warning(dlg_step, "提示", "请至少勾选一个需要参与智能填充的步骤。")
+                        return
                     dlg_step._step_rules_result = new_step_rules
                     dlg_step.accept()
 
@@ -12008,13 +13639,31 @@ class AutoManager(QMainWindow):
                     (cell_act_type == "clear_input_plus" and cell_sub == "content")
                 )
 
-            def _iter_preview_targets_for_smart_fill(target_mode="append_empty"):
+            def _is_enabled_smart_fill_cell(item, smart_rules=None):
+                if not _is_smart_fill_target_cell(item):
+                    return False
+                if not isinstance(smart_rules, dict):
+                    return True
+                real_col, step_idx, step_name, cell_act_type, cell_sub = preview_cols[item.column()]
+                step_key = _make_smart_fill_step_key(step_idx, cell_act_type, cell_sub)
+                legacy_step_key = _make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
+                step_rule = _get_effective_step_rule(
+                    step_key,
+                    step_name,
+                    cell_act_type,
+                    cell_sub,
+                    smart_rules,
+                    legacy_step_key=legacy_step_key
+                )
+                return bool(step_rule.get("enabled", True))
+
+            def _iter_preview_targets_for_smart_fill(target_mode="append_empty", smart_rules=None):
                 selected_indexes = preview_table.selectedIndexes()
                 targets = []
                 if target_mode == "selected_only":
                     for idx in selected_indexes:
                         it = preview_table.item(idx.row(), idx.column())
-                        if it and _is_smart_fill_target_cell(it):
+                        if it and _is_enabled_smart_fill_cell(it, smart_rules=smart_rules):
                             targets.append(it)
                 else:
                     candidate_rows = []
@@ -12023,7 +13672,7 @@ class AutoManager(QMainWindow):
                         row_has_value = False
                         for cc in range(preview_table.columnCount()):
                             it = preview_table.item(rr, cc)
-                            if not it or not _is_smart_fill_target_cell(it):
+                            if not it or not _is_enabled_smart_fill_cell(it, smart_rules=smart_rules):
                                 continue
                             row_items.append(it)
                             if str(it.text()).strip():
@@ -12113,6 +13762,10 @@ class AutoManager(QMainWindow):
                         step_key, step_name, cell_act_type, cell_sub, smart_rules, legacy_step_key=legacy_step_key
                     )
                     runtime["step_rules"][step_key] = rule
+                    if not bool(rule.get("enabled", True)):
+                        runtime["step_items"][step_key] = []
+                        runtime["step_cursors"][step_key] = [0]
+                        continue
                     runtime["step_items"][step_key] = _build_bundle_step_items(bundle, rule, pending_texts=pending_texts)
                     runtime["step_cursors"][step_key] = [0]
                 return runtime
@@ -12141,10 +13794,15 @@ class AutoManager(QMainWindow):
                 text_step_keys = []
                 file_step_keys = []
                 for step_key, rule in (bundle_runtime.get("step_rules") or {}).items():
+                    if not bool(rule.get("enabled", True)):
+                        continue
                     if str(rule.get("target_kind", "text")) == "file":
                         file_step_keys.append(step_key)
                     else:
                         text_step_keys.append(step_key)
+
+                if not text_step_keys and not file_step_keys:
+                    return "未启用任何步骤"
 
                 for step_key in text_step_keys:
                     if not bundle_runtime.get("step_items", {}).get(step_key):
@@ -12229,12 +13887,16 @@ class AutoManager(QMainWindow):
                             text_step_keys.append(step_key)
                 if pending_text_only and text_step_keys:
                     for step_key in text_step_keys:
+                        step_rule = bundle_runtime["step_rules"].get(step_key, {})
+                        if not bool(step_rule.get("enabled", True)):
+                            continue
                         items = bundle_runtime["step_items"].get(step_key, [])
                         cursor_holder = bundle_runtime["step_cursors"].setdefault(step_key, [0])
                         if cursor_holder[0] < len(items):
                             break
                     else:
                         return False
+                has_enabled_step = False
                 has_sequential = False
                 for it in target_items:
                     real_col, step_idx, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
@@ -12247,17 +13909,32 @@ class AutoManager(QMainWindow):
                         smart_rules,
                         legacy_step_key=_make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
                     )
+                    if not bool(rule.get("enabled", True)):
+                        continue
+                    has_enabled_step = True
                     items = bundle_runtime["step_items"].get(step_key, [])
                     cursor_holder = bundle_runtime["step_cursors"].setdefault(step_key, [0])
                     if str(rule.get("consume_mode", "sequential")) == "sequential":
                         has_sequential = True
                         if cursor_holder[0] < len(items):
                             return True
+                if not has_enabled_step:
+                    return False
                 if has_sequential:
                     return False
                 for it in target_items:
-                    real_col, step_idx, _, cell_act_type, cell_sub = preview_cols[it.column()]
+                    real_col, step_idx, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
                     step_key = _make_smart_fill_step_key(step_idx, cell_act_type, cell_sub)
+                    rule = bundle_runtime["step_rules"].get(step_key) or _get_effective_step_rule(
+                        step_key,
+                        step_name,
+                        cell_act_type,
+                        cell_sub,
+                        smart_rules,
+                        legacy_step_key=_make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
+                    )
+                    if not bool(rule.get("enabled", True)):
+                        continue
                     if bundle_runtime["step_items"].get(step_key):
                         return True
                 return False
@@ -12279,6 +13956,16 @@ class AutoManager(QMainWindow):
                     for it in target_items:
                         real_col, step_idx, step_name, cell_act_type, cell_sub = preview_cols[it.column()]
                         step_key = _make_smart_fill_step_key(step_idx, cell_act_type, cell_sub)
+                        step_rule = bundle_runtime["step_rules"].get(step_key) or _get_effective_step_rule(
+                            step_key,
+                            step_name,
+                            cell_act_type,
+                            cell_sub,
+                            smart_rules,
+                            legacy_step_key=_make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
+                        )
+                        if not bool(step_rule.get("enabled", True)):
+                            continue
                         if (
                             (cell_act_type in ["input", "clear_input"] and cell_sub is None) or
                             (cell_act_type == "clear_input_plus" and cell_sub == "content")
@@ -12376,6 +14063,8 @@ class AutoManager(QMainWindow):
                         smart_rules,
                         legacy_step_key=_make_smart_fill_legacy_step_key(real_col, cell_act_type, cell_sub)
                     )
+                    if not bool(step_rule.get("enabled", True)):
+                        continue
                     consume_mode = str(step_rule.get("consume_mode", "sequential"))
                     repeat_single = (consume_mode == "repeat_first")
                     step_items = bundle_runtime["step_items"].get(step_key, [])
@@ -12460,12 +14149,28 @@ class AutoManager(QMainWindow):
                     save_config(self.config)
                     smart_rules = merged_rules
 
+                enabled_step_count = 0
+                for _pc_idx, real_col, step_idx, step_name, act_type, sub, step_key in _get_smart_fill_target_columns():
+                    rule = _get_effective_step_rule(
+                        step_key,
+                        step_name,
+                        act_type,
+                        sub,
+                        smart_rules,
+                        legacy_step_key=_make_smart_fill_legacy_step_key(real_col, act_type, sub)
+                    )
+                    if bool(rule.get("enabled", True)):
+                        enabled_step_count += 1
+                if enabled_step_count <= 0:
+                    QMessageBox.warning(dlg, "提示", "请至少勾选一个需要参与智能填充的步骤。")
+                    return
+
                 bundles = collect_smart_fill_bundles(folder_path, smart_rules)
                 if not bundles:
                     QMessageBox.warning(dlg, "提示", "所选目录中没有找到可用于智能填充的图片或文本文件。")
                     return
 
-                row_targets = _iter_preview_targets_for_smart_fill(target_mode=target_mode)
+                row_targets = _iter_preview_targets_for_smart_fill(target_mode=target_mode, smart_rules=smart_rules)
                 if not row_targets:
                     if target_mode == "selected_only":
                         QMessageBox.warning(dlg, "提示", "请先选中要覆盖的目标单元格或整行，再使用“覆盖选区”。")
@@ -12880,17 +14585,20 @@ class AutoManager(QMainWindow):
                 # 核心批量填充逻辑：将选中的源数据按当前选区顺序填入目标格
                 for i, it in enumerate(target_items):
                     val = source_vals[i % len(source_vals)]
-                    _, _, _, cell_act_type, _ = preview_cols[it.column()]
+                    _, _, _, cell_act_type, cell_sub = preview_cols[it.column()]
                     # [修复] 账号类型：val 是 (显示名, profile_id) 元组，需拆分处理
                     if isinstance(val, tuple):
                         disp_name, pid = val
                         it.setText(disp_name)
                         it.setData(Qt.UserRole + 10, f"|{pid}")
-                    elif cell_act_type == "win_active" and "::hwnd=" in str(val):
-                        # [修复] win_active 预览表显示纯标题，完整标识存入 UserRole+10
-                        _disp = val.split('::hwnd=')[0]
+                    elif "::hwnd=" in str(val) and cell_act_type in ["win_active", "open_url"]:
+                        # [修复] 窗口类目标显示纯标题，完整标识存入额外字段
+                        _disp = val.split('::hwnd=')[0] or "已打开窗口"
                         it.setText(_disp)
-                        it.setData(Qt.UserRole + 10, val)  # 存储完整标识
+                        if cell_act_type == "open_url" and cell_sub == "profile":
+                            it.setData(Qt.UserRole + 10, f"|{val}")
+                        else:
+                            it.setData(Qt.UserRole + 10, val)
                     else:
                         it.setText(val)
                         it.setData(Qt.UserRole + 10, None)
@@ -13055,6 +14763,10 @@ class AutoManager(QMainWindow):
                     final_val = f"{data['prefix']}|{data['content']}"
                 elif act_type == "open_url":
                     p_id = data["p_id"]
+                    if not p_id:
+                        typed_profile = str(data.get("profile", "") or "").strip()
+                        if typed_profile and typed_profile != "[SKIP_ROW]":
+                            p_id = typed_profile
                     if not p_id:
                         orig_it = self.data_table.item(real_row, real_col)
                         if orig_it and "|" in orig_it.text():
@@ -13320,6 +15032,8 @@ class AutoManager(QMainWindow):
         col = self.data_table.columnAt(pos.x())
         if row < 0: return
         menu = QMenu(self)
+        menu.addAction(f"▶️ 单独执行此行：第{row+1}行").triggered.connect(lambda: self._run_single_data_row(row))
+        menu.addSeparator()
         step_idx = self._col_to_step_idx(col)
         if step_idx >= 0:
             acts = self.config['tasks'].get(self.current_task, [])
@@ -13350,10 +15064,10 @@ class AutoManager(QMainWindow):
             self._refresh_data_table()
 
     def _col_to_step_idx(self, col):
-        if col < 2: return -1
+        if col < self._data_first_value_col(): return -1
         acts = self.config['tasks'].get(self.current_task, [])
         show_delay = self.btn_toggle_delay.isChecked()
-        curr_col = 2
+        curr_col = self._data_first_value_col()
         for i in range(len(acts)):
             if curr_col == col: return i
             curr_col += 1
@@ -13769,22 +15483,61 @@ class AutoManager(QMainWindow):
             self._row_statuses[self.current_task] = {}
         self._row_statuses[self.current_task][row_idx] = status
         if row_idx < self.data_table.rowCount():
-            item = self.data_table.item(row_idx, 1)
+            item = self.data_table.item(row_idx, self._data_status_col())
             if not item:
                 item = QTableWidgetItem(); item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                self.data_table.setItem(row_idx, 1, item)
+                self.data_table.setItem(row_idx, self._data_status_col(), item)
             self._apply_row_status_style(item, status)
+
+    def _on_row_result(self, payload):
+        """汇总每一行执行结果，便于执行结束后快速定位失败项/失败窗口。"""
+        try:
+            if not isinstance(payload, dict):
+                return
+            self._last_run_row_results.append(payload)
+            self._persist_row_window_context(payload)
+            if payload.get("status") != ROW_STATUS_FAIL:
+                return
+
+            ctx = payload.get("fail_ctx") or payload.get("row_ctx") or {}
+            fg = ctx.get("foreground") or {}
+            task_id = payload.get("task_id") or self.current_task
+            hwnd = ctx.get("target_hwnd") or fg.get("hwnd") or None
+
+            win_title = fg.get("title") or ""
+            win_class = fg.get("class") or ""
+            if sys.platform == "win32" and hwnd and not win_class:
+                try:
+                    win_class = get_window_class_name(int(hwnd)) or ""
+                except Exception:
+                    win_class = ""
+            is_browser = (str(win_class) == "Chrome_WidgetWin_1")
+
+            self._last_run_failures.append({
+                "task_id": task_id,
+                "task_display": self._get_task_display_text(task_id, with_folder=True) if hasattr(self, "_get_task_display_text") else str(task_id),
+                "row_index": int(payload.get("row_index", 0)),
+                "step_index": int(ctx.get("step_index", payload.get("step_index", 0) or 0)),
+                "step_name": str(ctx.get("step_name", "") or ""),
+                "error": str(ctx.get("error", payload.get("last_error", "")) or ""),
+                "hwnd": int(hwnd) if hwnd else None,
+                "window_title": str(win_title or ""),
+                "window_class": str(win_class or ""),
+                "is_browser": bool(is_browser),
+            })
+        except Exception:
+            pass
 
     def _on_highlight(self, row_idx, step_idx):
         """Highlight the currently-executing data row; clear when row_idx==-1."""
         for r in range(self.data_table.rowCount()):
-            for c in range(2, self.data_table.columnCount()):
+            for c in range(self._data_first_value_col(), self.data_table.columnCount()):
                 item = self.data_table.item(r, c)
                 if item:
                     acts = self.config['tasks'].get(self.current_task, [])
                     show_delay = self.btn_toggle_delay.isChecked()
                     # Recompute base color
-                    col_data_idx = c - 2  # 0-based, skipping select and status cols
+                    col_data_idx = c - self._data_first_value_col()  # 0-based, skipping固定控制列
                     a_idx = col_data_idx // (2 if show_delay else 1)
                     if 0 <= a_idx < len(acts):
                         act_type = CMD_MAP.get(acts[a_idx].get('action'), "click")
@@ -13805,7 +15558,7 @@ class AutoManager(QMainWindow):
                         elif st == ROW_STATUS_MANUAL: item.setBackground(QColor("#ffe0b2"))
                         else: item.setBackground(QColor(base_color))
         if row_idx >= 0:
-            self.data_table.scrollToItem(self.data_table.item(row_idx, 2) or self.data_table.item(row_idx, 1))
+            self.data_table.scrollToItem(self.data_table.item(row_idx, self._data_first_value_col()) or self.data_table.item(row_idx, self._data_status_col()))
 
     def _move_row_action(self, delta):
         rows = self._get_selected_action_rows(fallback_row=self.action_table.currentRow())
@@ -14130,6 +15883,10 @@ class AutoManager(QMainWindow):
         
         # 核心修复：确保单步测试不触发任务链队列
         self._task_queue = [] 
+        # [修复] 避免沿用上一次批量执行的失败列表，导致执行完自动弹窗（被误认为“自动打开子任务”）
+        self._last_run_row_results = []
+        self._last_run_failures = []
+        self._suppress_failure_dialog_once = True
         
         single_act = [acts[row]]
         # 修复：如果是从流程编排页（Index 0）触发，使用步骤默认参数
@@ -14169,6 +15926,9 @@ class AutoManager(QMainWindow):
         
         # 核心修复：确保单格测试不触发任务链队列
         self._task_queue = [] 
+        self._last_run_row_results = []
+        self._last_run_failures = []
+        self._suppress_failure_dialog_once = True
         
         all_data = self.config['task_data'].get(self.current_task, [{}])
         row_data = all_data[data_row] if data_row < len(all_data) else {}
@@ -14181,6 +15941,73 @@ class AutoManager(QMainWindow):
         self._engine = AutoEngine(single_act, single_data, 0, 0, 0, loops=1)
         self._engine.log_sig.connect(self._log)
         self._engine.done_sig.connect(self._on_done)
+        self._engine.start()
+
+    def _run_single_data_row(self, data_row):
+        """单独执行批量数据中的某一行，忽略该行是否被勾选。"""
+        if not self.current_task:
+            return
+        if hasattr(self, '_engine') and self._engine.isRunning():
+            QMessageBox.warning(self, "执行中", "请先停止当前执行再单独运行这一行。")
+            return
+
+        self._force_sync_action_widgets()
+        self._refresh_defer_target_options(persist_changes=True)
+        self._save_data_table()
+
+        acts = self.config['tasks'].get(self.current_task, [])
+        all_data = self.config.get('task_data', {}).get(self.current_task, [])
+        if not acts:
+            QMessageBox.information(self, "提示", "当前任务还没有步骤可执行。")
+            return
+        if data_row < 0 or data_row >= len(all_data):
+            QMessageBox.information(self, "提示", "这一行还没有可执行的数据。")
+            return
+
+        import copy
+        row_data = copy.deepcopy(all_data[data_row] if isinstance(all_data[data_row], dict) else {})
+        row_data["_选中"] = True
+
+        self._task_queue = []
+        self._current_on_finished = None
+        self._last_run_row_results = []
+        self._last_run_failures = []
+        self._suppress_failure_dialog_once = True
+        self._ui_stop_reset_pending = False
+        self._row_statuses.setdefault(self.current_task, {})[data_row] = ""
+        self._refresh_data_table()
+        self.resume_point = (0, data_row, 0)
+
+        if self.chk_show_osd.isChecked():
+            self.osd.lbl_info.setText(f"🚀 准备单独执行第 {data_row+1} 行...")
+            self.osd.bar.setValue(0)
+            self.osd.show()
+            self.osd.raise_()
+
+        self._log(f"▶️ 单独执行第 {data_row+1} 行任务（共 {len(acts)} 步）", "blue")
+        self.btn_run.setEnabled(False); self.btn_resume.setEnabled(False); self.btn_stop.setEnabled(True); self.btn_run.setText("正在执行...")
+        self.btn_pause.setEnabled(True); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
+
+        on_error_map = {0: "stop", 1: "skip", 2: "fail_row"}
+        on_error = on_error_map.get(self.error_combo.currentIndex(), "stop")
+        self._engine = AutoEngine(
+            acts, [row_data], self.delay_spin.value(), 0, 0, 1, 0,
+            retry_count=self.retry_spin.value(), on_error=on_error,
+            ignore_data=False, standardize_window=self.chk_std_win.isChecked()
+        )
+        self._engine._task_name = self.current_task
+        self._engine._task_id = self.current_task
+        self._engine.log_sig.connect(self._log)
+        self._engine.prog_sig.connect(self.progress.setValue)
+        self._engine.prog_sig.connect(lambda p: self._update_osd(p))
+        self._engine.pause_sig.connect(self._on_pause)
+        self._engine.done_sig.connect(self._on_done)
+        self._engine.row_status_sig.connect(lambda _row_idx, status, target_row=data_row: self._on_row_status(target_row, status))
+        self._engine.row_result_sig.connect(self._on_row_result)
+        self._engine.highlight_sig.connect(lambda row_idx, step_idx, target_row=data_row: self._on_highlight(target_row if row_idx >= 0 else -1, step_idx))
+        self._engine.hotkey_paused_sig.connect(self._on_hotkey_paused)
+        self._engine.detail_sig.connect(self.osd.update_detail)
+        self._engine.deferred_queue_sig.connect(self._on_deferred_queue_update)
         self._engine.start()
     # [v3] OSD 新增按钮处理方法 ─────────────────────────────────────────────
     def _osd_skip_step(self):
@@ -14220,9 +16047,28 @@ class AutoManager(QMainWindow):
 
     def _stop_execution(self):
         if hasattr(self, '_engine') and self._engine.isRunning():
+            self._ui_stop_reset_pending = True
             self._engine.stop()
+            for sig in (getattr(self._engine, "prog_sig", None), getattr(self._engine, "detail_sig", None)):
+                if sig is None:
+                    continue
+                try:
+                    sig.disconnect()
+                except Exception:
+                    pass
             self._log("🛑 正在停止执行...", "red")
+        if hasattr(self, "_subtask_queue"):
+            self._subtask_stopped = True
+            self._subtask_queue = []
+            self._current_subtask_entry = None
+            self._sync_subtask_manager_runtime(entry=None, parent_step_idx=None, running=False)
+        if hasattr(self, "_repair_queue"):
+            self._repair_stopped = True
+            self._repair_queue = []
         self.osd.hide() # 停止执行，隐藏悬浮窗
+        self.osd.lbl_detail.setText("")
+        self.osd.bar.setValue(0)
+        self.osd.lbl_pct.setText("0%")
         self._clear_deferred_queue_panel()
         self._task_queue = []
         self._current_on_finished = None
@@ -14234,6 +16080,9 @@ class AutoManager(QMainWindow):
     def _run_all(self, on_finished=None):
         # 保存回调
         self._current_on_finished = on_finished
+        # 清理上一次“批量执行”的失败汇总（跨任务）
+        self._last_run_row_results = []
+        self._last_run_failures = []
         # 在日志文件写入任务开始分隔线
         _start_banner = (
             f"\n{'='*60}\n"
@@ -14294,9 +16143,24 @@ class AutoManager(QMainWindow):
                             acts[i]['value'] = new_val
                             self._log(f"🔒 [运行前同步] 步骤「{acts[i].get('name', f'步骤{i+1}')}」网址/账户已同步", "blue")
                 elif act_type == "✨ 清空并输入(增强版)":
+                    # 这里的内容区可能是 MultiLineTextEdit（而不是 QLineEdit）
                     edits = w.findChildren(QLineEdit)
                     prefix_text = edits[0].text() if len(edits) > 0 else ""
                     content_text = edits[1].text() if len(edits) > 1 else ""
+                    if content_text == "":
+                        try:
+                            mles = w.findChildren(MultiLineTextEdit)
+                            if mles and hasattr(mles[0], "text"):
+                                content_text = mles[0].text()
+                        except Exception:
+                            pass
+                    if content_text == "":
+                        try:
+                            tes = w.findChildren(QTextEdit)
+                            if tes and hasattr(tes[0], "toPlainText"):
+                                content_text = tes[0].toPlainText()
+                        except Exception:
+                            pass
                     new_val = f"{prefix_text}|{content_text}"
                     if acts[i].get('value', '') != new_val:
                         acts[i]['value'] = new_val
@@ -14368,20 +16232,23 @@ class AutoManager(QMainWindow):
 
         if as_:
             self._clear_deferred_queue_panel()
+            self._ui_stop_reset_pending = False
             self.btn_run.setEnabled(False); self.btn_resume.setEnabled(False); self.btn_stop.setEnabled(True); self.btn_run.setText("正在执行...")
             self.btn_pause.setEnabled(True); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
-            on_error_map = {0: "stop", 1: "skip"}
+            on_error_map = {0: "stop", 1: "skip", 2: "fail_row"}
             on_error = on_error_map.get(self.error_combo.currentIndex(), "stop")
             self._engine = AutoEngine(as_, ds, self.delay_spin.value(), t, s, loops_to_run, l,
                                           retry_count=self.retry_spin.value(), on_error=on_error, ignore_data=is_test,
                                           standardize_window=self.chk_std_win.isChecked())
             self._engine._task_name = self.current_task  # 注入任务名称供进度文件使用
+            self._engine._task_id = self.current_task
             self._engine.log_sig.connect(self._log)
             self._engine.prog_sig.connect(self.progress.setValue)
             self._engine.prog_sig.connect(lambda p: self._update_osd(p)) # 同步更新 OSD
             self._engine.pause_sig.connect(self._on_pause)
             self._engine.done_sig.connect(self._on_done)
             self._engine.row_status_sig.connect(self._on_row_status)
+            self._engine.row_result_sig.connect(self._on_row_result)
             self._engine.highlight_sig.connect(self._on_highlight)
             self._engine.hotkey_paused_sig.connect(self._on_hotkey_paused)
             self._engine.detail_sig.connect(self.osd.update_detail)  # [v3] 修复: 延时倒计时同步到 OSD
@@ -14392,6 +16259,8 @@ class AutoManager(QMainWindow):
         self.osd.lbl_info.setText(f"⏸ <b>已暂停</b> | 组 {t+1} | 步 {s+1}")
 
     def _update_osd(self, percent):
+        if getattr(self, "_ui_stop_reset_pending", False):
+            return
         if not self.chk_show_osd.isChecked():
             self.osd.hide()
             return
@@ -14529,24 +16398,48 @@ class AutoManager(QMainWindow):
         self.btn_stop.setEnabled(False); self.btn_dry_run.setEnabled(True)
         self.btn_run.setText("🚀 开始批量执行")
         self.btn_pause.setEnabled(False); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
-        self.progress.setValue(0)
         self.osd.hide() # 任务完成，隐藏悬浮窗
         final_status = getattr(getattr(self, '_engine', None), '_final_status', 'done')
         last_error = getattr(getattr(self, '_engine', None), '_last_error', '')
+        if final_status == "done":
+            self.progress.setValue(100)
+        elif final_status in ("failed", "stopped"):
+            if final_status == "stopped" and getattr(self, "_ui_stop_reset_pending", False):
+                self.progress.setValue(0)
+            else:
+                self.progress.setValue(max(0, int(getattr(getattr(self, '_engine', None), '_last_percent', self.progress.value() or 0))))
+        else:
+            self.progress.setValue(0)
 
         if final_status == "stopped":
+            self._ui_stop_reset_pending = False
             self._task_queue = []
             self._current_on_finished = None
             self._log("🛑 当前任务已停止，未继续执行后续任务。", "orange")
             return
 
         if final_status == "failed":
-            self._task_queue = []
-            self._current_on_finished = None
             fail_msg = "❌ 当前任务执行失败，已停止后续任务。"
             if last_error:
                 fail_msg += f"\n错误详情：{last_error}"
             self._log(fail_msg, "red")
+            # 若开启“失败也继续”，则不弹窗打断流程，继续跑后续任务；失败项会在最后统一汇总
+            if getattr(self, '_task_queue', []) and hasattr(self, "chk_continue_on_fail") and self.chk_continue_on_fail.isChecked():
+                next_task = self._task_queue.pop(0)
+                if next_task in self.config.get('tasks', {}):
+                    self._log(
+                        f"⚠️ 任务 [{self._get_task_display_text(self.current_task, with_folder=True)}] 失败，但已开启“失败也继续”，将切到下一个任务: [{self._get_task_display_text(next_task, with_folder=True)}]",
+                        "orange"
+                    )
+                    self._activate_task_by_id(next_task)
+                    self._row_statuses[next_task] = {}
+                    self._refresh_data_table()
+                    self.resume_point = (0, 0, 0)
+                    self._execute(0, 0, 0)
+                    return
+            # 默认行为：停止后续任务
+            self._task_queue = []
+            self._current_on_finished = None
             QMessageBox.warning(self, "执行失败", fail_msg)
             return
 
@@ -14582,11 +16475,208 @@ class AutoManager(QMainWindow):
                 return
         self._task_queue = []
         
+        suppress_dialog = bool(getattr(self, "_suppress_failure_dialog_once", False))
+        self._suppress_failure_dialog_once = False
+
+        # 全部任务结束后：失败项仅记录日志，不再自动弹出失败管理器，避免打断批量执行收尾
+        try:
+            if (not suppress_dialog) and getattr(self, "_last_run_failures", []):
+                self._log(f"⚠️ 本次执行有 {len(self._last_run_failures)} 个失败项；如需处理，可手动打开失败管理器。", "orange")
+        except Exception:
+            pass
+
         # 自动关机逻辑
         if self.chk_auto_shutdown.isChecked():
+            self._log("🏁 全部任务执行完毕，即将按设置进入自动关机倒计时", "green")
             ShutdownDialog(self).exec_()
         else:
-            QMessageBox.information(self, "完成", "全部任务执行完毕！")
+            self._log("🏁 全部任务执行完毕", "green")
+
+    def _jump_to_failure(self, failure_item):
+        """从失败管理器跳回对应任务/行，方便人工处理或重跑。"""
+        try:
+            task_id = failure_item.get("task_id", "") if isinstance(failure_item, dict) else ""
+            row_idx = int(failure_item.get("row_index", 0)) if isinstance(failure_item, dict) else 0
+            if task_id:
+                self._activate_task_by_id(task_id)
+            # 切到“批量数据”页（默认 index=1）
+            try:
+                self.tabs.setCurrentIndex(1)
+            except Exception:
+                pass
+            if hasattr(self, "data_table") and 0 <= row_idx < self.data_table.rowCount():
+                self.data_table.selectRow(row_idx)
+                self.data_table.setCurrentCell(row_idx, self._data_status_col())
+                it = self.data_table.item(row_idx, self._data_first_value_col()) or self.data_table.item(row_idx, self._data_status_col())
+                if it:
+                    self.data_table.scrollToItem(it)
+        except Exception:
+            pass
+
+    def _start_repair_for_failures(self, failures, repair_task_id):
+        """批量对失败项执行“修复子任务”，修复步骤与原流程独立。"""
+        try:
+            if hasattr(self, '_engine') and self._engine.isRunning():
+                QMessageBox.warning(self, "执行中", "请先等待当前执行结束或停止后再启动修复子任务。")
+                return
+            if not repair_task_id or repair_task_id not in self.config.get("tasks", {}):
+                QMessageBox.warning(self, "提示", "修复子任务不存在或未选择。")
+                return
+            self._repair_queue = list(failures or [])
+            self._repair_stopped = False
+            self._repair_task_id = repair_task_id
+            self._repair_origin_task = self.current_task
+            self._log(f"🛠️ 准备批量修复：共 {len(self._repair_queue)} 个失败项 | 修复任务={self._get_task_display_text(repair_task_id, with_folder=True)}", "purple")
+            self._run_next_repair_item()
+        except Exception as e:
+            QMessageBox.warning(self, "修复启动失败", str(e))
+
+    def _create_repair_task_from_failure(self, failure_item):
+        """基于某个失败项快速创建一个新的“修复任务”，供你现场录制并保存。"""
+        try:
+            if not isinstance(failure_item, dict):
+                return
+
+            # 1) 尽量把失败窗口先激活，便于你马上录制修复动作
+            hwnd = failure_item.get("hwnd")
+            if hwnd:
+                try:
+                    force_activate_window(int(hwnd))
+                except Exception:
+                    pass
+
+            # 2) 生成任务名称（尽量可读且不冲突）
+            base_name = "修复"
+            step_name = str(failure_item.get("step_name", "") or "").strip()
+            if step_name:
+                step_name = step_name.replace("/", "_").replace("\\", "_")
+                base_name = f"修复_{step_name}"
+            ts = datetime.now().strftime("%m%d_%H%M%S")
+            name = f"{base_name}_{ts}"
+
+            # 3) 创建任务（建议放到“修复”文件夹）
+            self._sync_tree_structure_to_config()
+            task_id = _new_task_id(set(self.config.get("tasks", {}).keys()))
+            self.config.setdefault('tasks', {})
+            self.config.setdefault('task_data', {})
+            self.config['tasks'][task_id] = []
+            self.config['task_data'][task_id] = []
+
+            repair_folder = "修复"
+            self.config.setdefault('folders', [])
+            if repair_folder not in self.config['folders']:
+                self.config['folders'].append(repair_folder)
+            self._set_task_location(task_id, folder=repair_folder, name=name)
+
+            # 4) 第 1 步：激活失败窗口（如果捕获到 hwnd）
+            if hwnd:
+                self.config['tasks'][task_id].append({
+                    "name": "[修复] 激活失败窗口",
+                    "action": "激活窗口",
+                    "value": f"::hwnd={int(hwnd)}",
+                    "x": 0, "y": 0,
+                    "delay": 0,
+                    "guard_enabled": False
+                })
+
+            save_config(self.config)
+            self._reload_task_combo_after_config_change(task_id)
+            self._refresh_schedule_task_options()
+
+            # 5) 自动切换到新任务，并切到“流程编排”页方便录制
+            try:
+                self._activate_task_by_id(task_id)
+            except Exception:
+                pass
+            try:
+                self.tabs.setCurrentIndex(0)
+            except Exception:
+                pass
+
+            self._log(f"✅ 已创建修复任务: [{self._get_task_display_text(task_id, with_folder=True)}]，现在你可以继续录制修复步骤并保存。", "green")
+            QMessageBox.information(self, "已创建修复任务",
+                "已为你创建一个新的修复任务，并自动写入「激活失败窗口(hwnd)」作为第1步。\n\n"
+                "接下来你只需要像平时一样新增步骤、录制坐标/输入，即可把修复动作存起来。")
+        except Exception as e:
+            QMessageBox.warning(self, "创建修复任务失败", str(e))
+
+    def _run_next_repair_item(self):
+        """顺序执行修复队列，每个失败项跑一次修复流程。"""
+        try:
+            if not getattr(self, "_repair_queue", None):
+                # 修复完成：回到修复前所在主任务
+                origin = getattr(self, "_repair_origin_task", "")
+                if origin:
+                    self._activate_task_by_id(origin)
+                # 恢复主按钮状态
+                self.btn_run.setEnabled(True); self.btn_run.setText("🚀 开始批量执行")
+                self.btn_stop.setEnabled(False); self.btn_resume.setEnabled(False)
+                self.btn_dry_run.setEnabled(True)
+                self.btn_pause.setEnabled(False); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
+                if getattr(self, "_repair_stopped", False):
+                    self._log("🛑 修复子任务已停止，剩余队列已取消。", "orange")
+                else:
+                    self._log("✅ 修复子任务已全部执行完毕。你可以在失败管理器里选择失败项进行重跑。", "green")
+                return
+
+            entry = self._repair_queue.pop(0)
+            hwnd = entry.get("hwnd") if isinstance(entry, dict) else None
+            if not hwnd:
+                self._log("⚠️ 跳过一个失败项：未捕获到窗口句柄(hwnd)。", "orange")
+                QTimer.singleShot(0, self._run_next_repair_item)
+                return
+
+            import copy
+            base_actions = copy.deepcopy(self.config.get("tasks", {}).get(self._repair_task_id, []) or [])
+            activate_action = {
+                "name": "[修复] 激活失败窗口",
+                "action": "激活窗口",
+                "value": f"::hwnd={int(hwnd)}",
+                "x": 0, "y": 0,
+                "delay": 0,
+                "guard_enabled": False
+            }
+            actions = [activate_action] + base_actions
+
+            # UI 状态
+            self.btn_run.setEnabled(False); self.btn_resume.setEnabled(False); self.btn_stop.setEnabled(True)
+            self.btn_run.setText("🛠️ 修复中...")
+            self.btn_pause.setEnabled(True); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
+
+            self._engine = AutoEngine(
+                actions, [{}], 0, 0, 0, loops=1, start_l=0,
+                retry_count=self.retry_spin.value(),
+                on_error="fail_row",
+                ignore_data=True,
+                standardize_window=self.chk_std_win.isChecked()
+            )
+            self._engine._task_name = f"[修复] {self._get_task_display_text(self._repair_task_id, with_folder=True)}"
+            self._engine._task_id = self._repair_task_id
+            self._engine.log_sig.connect(self._log)
+            self._engine.prog_sig.connect(self.progress.setValue)
+            self._engine.done_sig.connect(self._on_repair_done)
+            self._engine.start()
+        except Exception as e:
+            self._log(f"❌ 修复子任务异常: {e}", "red")
+            QTimer.singleShot(0, self._run_next_repair_item)
+
+    def _on_repair_done(self):
+        """单个失败项修复结束，继续下一个。"""
+        try:
+            final_status = getattr(getattr(self, '_engine', None), '_final_status', 'done')
+            if final_status == "stopped":
+                self._repair_stopped = True
+                self._repair_queue = []
+                QTimer.singleShot(100, self._run_next_repair_item)
+                return
+            if final_status == "failed":
+                err = getattr(getattr(self, '_engine', None), '_last_error', '')
+                self._log(f"⚠️ 修复子任务执行失败: {err}", "orange")
+            # 恢复按钮文案（仍在修复队列中就继续）
+            self.btn_run.setText("🛠️ 修复中...")
+            QTimer.singleShot(100, self._run_next_repair_item)
+        except Exception:
+            QTimer.singleShot(100, self._run_next_repair_item)
 
     # ── Feature 8: Global Hotkeys ─────────────────────────────────────────────
     def _default_hotkeys(self):
@@ -14748,15 +16838,17 @@ class AutoManager(QMainWindow):
         if not as_: self._log("⚠️ 没有步骤可执行", "orange"); return
         self.btn_run.setEnabled(False); self.btn_dry_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        on_error_map = {0: "stop", 1: "skip"}
+        on_error_map = {0: "stop", 1: "skip", 2: "fail_row"}
         on_error = on_error_map.get(self.error_combo.currentIndex(), "stop")
         self._engine = AutoEngine(as_, ds, 0, 0, 0, self.loop_spin.value(), 0,
                                       retry_count=0, on_error=on_error, dry_run=True)
         self._engine._task_name = self.current_task  # 注入任务名称供进度文件使用
+        self._engine._task_id = self.current_task
         self._engine.log_sig.connect(self._log)
         self._engine.prog_sig.connect(self.progress.setValue)
         self._engine.done_sig.connect(self._on_done)
         self._engine.row_status_sig.connect(self._on_row_status)
+        self._engine.row_result_sig.connect(self._on_row_result)
         self._engine.highlight_sig.connect(self._on_highlight)
         self._engine.start()
 
