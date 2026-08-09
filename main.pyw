@@ -127,6 +127,17 @@ def init_drag_debug_log():
     write_drag_debug(f"BASE_DIR={BASE_DIR}")
     write_drag_debug(f"DEBUG_LOG_FILE={DRAG_DEBUG_LOG_FILE}")
 
+def is_windows_11():
+    """按系统版本号判断是否为 Win11。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        ver = sys.getwindowsversion()
+        build = int(getattr(ver, "build", 0) or 0)
+        return build >= 22000
+    except Exception:
+        return False
+
 def _load_pywin32_drag_modules():
     """按需加载 Windows 原生拖拽所需模块。"""
     if sys.platform != "win32":
@@ -276,25 +287,48 @@ def perform_native_file_drag(file_paths, target_x, target_y, log_func=None):
     target_y = max(5, min(screen_h - 5, int(target_y)))
 
     down_event = threading.Event()
+    release_event = threading.Event()
     worker_error = []
-    pyautogui.moveTo(start_x, start_y, duration=0.12)
+    _set_cursor_pos(start_x, start_y)
+    time.sleep(0.05)
 
     def _mouse_worker():
         try:
             time.sleep(0.08)
-            pyautogui.mouseDown(button="left")
+            _mouse_left_down()
             down_event.set()
             time.sleep(0.06)
-            pyautogui.moveRel(18, 0, duration=0.08)
-            pyautogui.moveTo(target_x, target_y, duration=0.32)
+            _set_cursor_pos(start_x + 18, start_y)
             time.sleep(0.08)
-            pyautogui.mouseUp(button="left")
+            _set_cursor_pos(target_x, target_y)
+            time.sleep(0.12)
+            _mouse_left_up()
+            release_event.set()
         except Exception as e:
             worker_error.append(e)
             down_event.set()
+            try:
+                _mouse_left_up()
+            except Exception:
+                pass
+            release_event.set()
+
+    def _release_watchdog():
+        """防止 DoDragDrop 因鼠标释放状态未被系统识别而长期挂起。"""
+        time.sleep(2.5)
+        if not release_event.is_set():
+            try:
+                _mouse_left_up()
+                _drag_log("watchdog: 已强制释放左键，避免 OLE 拖拽卡死")
+            except Exception as e:
+                log_internal_issue("watchdog 强制释放左键失败", e)
+            finally:
+                release_event.set()
 
     drag_thread = threading.Thread(target=_mouse_worker, daemon=True)
+    watchdog_thread = threading.Thread(target=_release_watchdog, daemon=True)
     drag_thread.start()
+    watchdog_thread.start()
 
     if not down_event.wait(1.2):
         raise RuntimeError("鼠标按下超时，无法启动真实拖拽")
@@ -313,6 +347,7 @@ def perform_native_file_drag(file_paths, target_x, target_y, log_func=None):
         else:
             pythoncom.CoUninitialize()
         drag_thread.join(timeout=2.0)
+        watchdog_thread.join(timeout=0.2)
 
     if worker_error:
         raise worker_error[0]
@@ -322,17 +357,35 @@ def perform_native_file_drag(file_paths, target_x, target_y, log_func=None):
     return effect
 
 def _move_window_away_from_target(hwnd, target_x, target_y):
-    """把窗口缩到对角小窗，尽量不遮挡目标区域。"""
+    """尽量把窗口移开目标区域，但保留原始尺寸，避免文件项坐标失真。"""
     if sys.platform != "win32" or not hwnd:
         return
-    screen_w, screen_h = pyautogui.size()
-    win_w = max(220, min(300, screen_w // 6))
-    win_h = max(160, min(220, screen_h // 4))
-    margin = 10
-    left = margin if target_x >= screen_w // 2 else max(margin, screen_w - win_w - margin)
-    top = margin if target_y >= screen_h // 2 else max(margin, screen_h - win_h - margin)
     try:
-        ctypes.windll.user32.MoveWindow(int(hwnd), int(left), int(top), int(win_w), int(win_h), True)
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(int(hwnd), ctypes.byref(rect)):
+            raise RuntimeError("GetWindowRect 失败")
+
+        screen_w, screen_h = pyautogui.size()
+        margin = 12
+        width = max(260, int(rect.right - rect.left))
+        height = max(180, int(rect.bottom - rect.top))
+
+        candidates = [
+            (margin, margin),
+            (max(margin, screen_w - width - margin), margin),
+            (margin, max(margin, screen_h - height - margin)),
+            (max(margin, screen_w - width - margin), max(margin, screen_h - height - margin)),
+        ]
+
+        def _distance_from_target(pos):
+            left, top = pos
+            cx = left + width / 2.0
+            cy = top + height / 2.0
+            return math.hypot(cx - float(target_x), cy - float(target_y))
+
+        best_left, best_top = max(candidates, key=_distance_from_target)
+        user32.MoveWindow(int(hwnd), int(best_left), int(best_top), int(width), int(height), True)
     except Exception as e:
         log_internal_issue(f"移动资源管理器窗口失败: hwnd={hwnd}", e)
 
@@ -476,7 +529,8 @@ def perform_explorer_assisted_drag(file_path, target_x, target_y, log_func=None,
         if not hwnd:
             raise RuntimeError("未等到资源管理器窗口")
 
-        force_activate_window(hwnd)
+        if not force_activate_window(hwnd):
+            _drag_log(f"资源管理器窗口激活未确认成功: hwnd={hwnd}")
         _move_window_away_from_target(hwnd, int(target_x), int(target_y))
         time.sleep(0.8)
 
@@ -494,8 +548,8 @@ def perform_explorer_assisted_drag(file_path, target_x, target_y, log_func=None,
         if target_hwnd:
             try:
                 if ctypes.windll.user32.IsWindow(int(target_hwnd)):
-                    force_activate_window(int(target_hwnd))
-                    _drag_log(f"拖拽途中已切回目标窗口: hwnd={int(target_hwnd)}")
+                    activated = force_activate_window(int(target_hwnd))
+                    _drag_log(f"拖拽途中切回目标窗口: hwnd={int(target_hwnd)} activated={activated}")
                     time.sleep(0.18)
             except Exception as e:
                 log_internal_issue(f"拖拽途中切回目标窗口失败: hwnd={target_hwnd}", e)
@@ -1191,14 +1245,14 @@ def get_chrome_profiles(force_refresh=False):
     return profiles
 
 def force_activate_window(hwnd):
-    """使用 Win32 API 强制激活窗口，确保不破坏最大化状态。"""
-    if sys.platform != 'win32': return
+    """尽量稳定地激活目标窗口，兼容 Win10/Win11 与录屏软件干扰。"""
+    if sys.platform != 'win32' or not hwnd:
+        return False
     try:
-        import ctypes
-        from ctypes import wintypes
+        hwnd = int(hwnd)
         user32 = ctypes.windll.user32
-        # SW_SHOW=5, SW_RESTORE=9, SW_SHOWMAXIMIZED=3
-        # 检查窗口状态
+        kernel32 = ctypes.windll.kernel32
+
         class WINDOWPLACEMENT(ctypes.Structure):
             _fields_ = [
                 ("length", wintypes.UINT),
@@ -1208,16 +1262,59 @@ def force_activate_window(hwnd):
                 ("ptMaxPosition", wintypes.POINT),
                 ("rcNormalPosition", wintypes.RECT),
             ]
+
+        if not user32.IsWindow(hwnd):
+            return False
+
         placement = WINDOWPLACEMENT()
         placement.length = ctypes.sizeof(WINDOWPLACEMENT)
         user32.GetWindowPlacement(hwnd, ctypes.byref(placement))
-        
-        if placement.showCmd == 2: # SW_SHOWMINIMIZED
-            user32.ShowWindow(hwnd, 9) # SW_RESTORE
-        
-        user32.SetForegroundWindow(hwnd)
-    except:
-        pass
+        if placement.showCmd == 2:  # SW_SHOWMINIMIZED
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        else:
+            user32.ShowWindow(hwnd, 5)  # SW_SHOW
+
+        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+        foreground_hwnd = user32.GetForegroundWindow()
+        foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
+        current_thread = kernel32.GetCurrentThreadId()
+
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOACTIVATE = 0x0010
+
+        attached_threads = set()
+
+        def _attach(thread_id):
+            if thread_id and thread_id != current_thread:
+                if user32.AttachThreadInput(current_thread, thread_id, True):
+                    attached_threads.add(thread_id)
+
+        try:
+            _attach(target_thread)
+            _attach(foreground_thread)
+
+            for _ in range(3):
+                user32.BringWindowToTop(hwnd)
+                user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+                user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                user32.SetForegroundWindow(hwnd)
+                user32.SetActiveWindow(hwnd)
+                user32.SetFocus(hwnd)
+                time.sleep(0.08)
+                if user32.GetForegroundWindow() == hwnd:
+                    return True
+        finally:
+            for thread_id in attached_threads:
+                try:
+                    user32.AttachThreadInput(current_thread, thread_id, False)
+                except Exception:
+                    pass
+    except Exception as e:
+        log_internal_issue(f"强制激活窗口失败: hwnd={hwnd}", e)
+    return False
 
 def get_root_window_from_point(x, y):
     """按屏幕坐标获取顶层窗口句柄。"""
@@ -5970,9 +6067,14 @@ class AutoEngine(QThread):
             if not x and not y:
                 self.log_sig.emit("⚠️ 拖拽指令未设置目标坐标，跳过", "orange"); return None
             drag_target_hwnd = 0
+            try:
+                drag_target_hwnd = get_root_window_from_point(x, y)
+                if drag_target_hwnd:
+                    self.log_sig.emit(f"🪟 已识别目标窗口 hwnd={drag_target_hwnd}", "gray")
+            except Exception as e:
+                self.log_sig.emit(f"⚠️ 识别目标窗口失败: {str(e)}", "orange")
             if act.get('activate_target_before_drag', False):
                 try:
-                    drag_target_hwnd = get_root_window_from_point(x, y)
                     pyautogui.click(x, y)
                     if drag_target_hwnd:
                         self.log_sig.emit(f"🪟 拖拽前已点击目标坐标: ({x}, {y}) hwnd={drag_target_hwnd}", "gray")
@@ -5983,27 +6085,20 @@ class AutoEngine(QThread):
                     self.log_sig.emit(f"⚠️ 拖拽前点击目标坐标失败: {str(e)}", "orange")
             
             self.log_sig.emit(f"🖱️ 正在执行真实拖拽上传: {os.path.basename(abs_path)}", "gray")
-            try:
-                perform_explorer_assisted_drag(
-                    abs_path,
-                    x,
-                    y,
-                    log_func=lambda msg: self.log_sig.emit(f"🧩 {msg}", "gray"),
-                    target_hwnd=drag_target_hwnd
-                )
-                self.log_sig.emit("✅ 资源管理器真实拖拽已完成", "green")
-            except Exception as explorer_err:
-                self.log_sig.emit(f"⚠️ 资源管理器真实拖拽失败，回退 OLE 合成拖拽: {str(explorer_err)}", "orange")
+            prefer_explorer_first = bool(is_windows_11())
+            if prefer_explorer_first:
+                self.log_sig.emit("🧭 检测到 Win11，已跳过 OLE 合成拖拽，优先使用资源管理器真实拖拽", "gray")
                 try:
-                    perform_native_file_drag(
-                        [abs_path],
+                    perform_explorer_assisted_drag(
+                        abs_path,
                         x,
                         y,
-                        log_func=lambda msg: self.log_sig.emit(f"🧩 {msg}", "gray")
+                        log_func=lambda msg: self.log_sig.emit(f"🧩 {msg}", "gray"),
+                        target_hwnd=drag_target_hwnd
                     )
-                    self.log_sig.emit("✅ OLE 合成拖拽已完成", "green")
-                except Exception as native_err:
-                    self.log_sig.emit(f"⚠️ OLE 合成拖拽失败，回退窗口级拖放: {str(native_err)}", "orange")
+                    self.log_sig.emit("✅ 资源管理器真实拖拽已完成", "green")
+                except Exception as explorer_err:
+                    self.log_sig.emit(f"⚠️ 资源管理器真实拖拽失败，回退窗口级拖放: {str(explorer_err)}", "orange")
                     try:
                         # 1. 获取目标坐标处的窗口句柄
                         hwnd = get_root_window_from_point(x, y)
@@ -6045,6 +6140,69 @@ class AutoEngine(QThread):
                         self.log_sig.emit("✅ 已发送窗口级拖放消息", "green")
                     except Exception as legacy_err:
                         raise RuntimeError(f"资源管理器拖拽、OLE 拖拽与窗口级拖放均失败: {legacy_err}") from legacy_err
+            else:
+                try:
+                    perform_native_file_drag(
+                        [abs_path],
+                        x,
+                        y,
+                        log_func=lambda msg: self.log_sig.emit(f"🧩 {msg}", "gray")
+                    )
+                    self.log_sig.emit("✅ OLE 合成拖拽已完成", "green")
+                except Exception as native_err:
+                    self.log_sig.emit(f"⚠️ OLE 合成拖拽失败，回退资源管理器真实拖拽: {str(native_err)}", "orange")
+                    try:
+                        perform_explorer_assisted_drag(
+                            abs_path,
+                            x,
+                            y,
+                            log_func=lambda msg: self.log_sig.emit(f"🧩 {msg}", "gray"),
+                            target_hwnd=drag_target_hwnd
+                        )
+                        self.log_sig.emit("✅ 资源管理器真实拖拽已完成", "green")
+                    except Exception as explorer_err:
+                        self.log_sig.emit(f"⚠️ 资源管理器真实拖拽失败，回退窗口级拖放: {str(explorer_err)}", "orange")
+                        try:
+                            # 1. 获取目标坐标处的窗口句柄
+                            hwnd = get_root_window_from_point(x, y)
+                            if not hwnd: raise RuntimeError("无法定位目标窗口")
+                            
+                            # 2. 构造 DROPFILES 结构体
+                            class DROPFILES(ctypes.Structure):
+                                _fields_ = [("pFiles", wintypes.DWORD),
+                                            ("pt", wintypes.POINT),
+                                            ("fNC", wintypes.BOOL),
+                                            ("fWide", wintypes.BOOL)]
+
+                            files = abs_path + '\0\0'
+                            files_u16 = files.encode('utf-16le')
+                            offset = ctypes.sizeof(DROPFILES)
+                            size = offset + len(files_u16)
+                            
+                            GHND = 0x0042
+                            hGlobal = ctypes.windll.kernel32.GlobalAlloc(GHND, size)
+                            if not hGlobal: raise RuntimeError("全局内存分配失败")
+                            
+                            pGlobal = ctypes.windll.kernel32.GlobalLock(hGlobal)
+                            if not pGlobal:
+                                ctypes.windll.kernel32.GlobalFree(hGlobal)
+                                raise RuntimeError("GlobalLock 失败，无法写入拖放数据")
+                            df = DROPFILES()
+                            df.pFiles = offset
+                            df.pt = wintypes.POINT(x, y)
+                            df.fNC = False
+                            df.fWide = True
+                            
+                            ctypes.memmove(pGlobal, ctypes.addressof(df), offset)
+                            ctypes.memmove(pGlobal + offset, files_u16, len(files_u16))
+                            ctypes.windll.kernel32.GlobalUnlock(hGlobal)
+                            
+                            WM_DROPFILES = 0x0233
+                            ctypes.windll.user32.PostMessageW(hwnd, WM_DROPFILES, hGlobal, 0)
+                            pyautogui.moveTo(x, y, duration=0.2)
+                            self.log_sig.emit("✅ 已发送窗口级拖放消息", "green")
+                        except Exception as legacy_err:
+                            raise RuntimeError(f"资源管理器拖拽、OLE 拖拽与窗口级拖放均失败: {legacy_err}") from legacy_err
         elif act_type == "press":    pyautogui.press(val)
         elif act_type == "hotkey":   pyautogui.hotkey(*val.split('+'))
         elif act_type == "scroll":
