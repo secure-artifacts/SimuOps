@@ -1,11 +1,14 @@
 import sys
 import os
 import json
+import json
+import sqlite3
 import ctypes
 from ctypes import wintypes
 import math
 import time
 import csv
+import copy
 import re
 import struct
 import shutil
@@ -17,6 +20,7 @@ import pyperclip
 import pygetwindow as gw
 import subprocess
 import glob
+from functools import lru_cache
 from io import StringIO
 try:
     import openpyxl
@@ -47,7 +51,7 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItemIterator, QStackedWidget, QGridLayout, QStyle, QFrame, QSizePolicy,
     QStyledItemDelegate, QSlider, QScrollArea
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint, QSize, QDate, QTime, QDateTime, QRect, QItemSelectionModel, QEvent
+from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal, QTimer, QPoint, QSize, QDate, QTime, QDateTime, QRect, QItemSelectionModel, QEvent
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap, QCursor, QIcon, QFont, QBrush, QDrag, QTextOption
 from PyQt5.QtWidgets import QRubberBand
 
@@ -64,6 +68,611 @@ except Exception as e:
 
 # --- Fix for Qt Platform Plugin ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# --- 打开网址：基于账号标识（Profile）绑定的窗口句柄固定文件 ---
+# 文件位置固定在程序目录下，所有任务共享。每种账号/Profile 对应一个固定浏览器句柄，
+# 无论任务行数如何变化、顺序如何打乱，只要账号相同就能精准切换到对应的浏览器窗口。
+OPEN_URL_HANDLE_STORE_DIR = os.path.join(BASE_DIR, "runtime_data")
+OPEN_URL_HANDLE_STORE_PATH = os.path.join(OPEN_URL_HANDLE_STORE_DIR, "open_url_window_handles.json")
+OPEN_URL_HANDLE_STORE_LOCK = threading.RLock()
+OPEN_URL_HANDLE_FILE_TOKEN = "__OPEN_URL_HANDLE_FILE__"
+OPEN_URL_HANDLE_CLAIM_LOCK = threading.RLock()
+OPEN_URL_HANDLE_ACTIVE_CLAIMS = {}
+PROCESS_PARENT_MAP_LOCK = threading.RLock()
+PROCESS_PARENT_MAP_CACHE = {"ts": 0.0, "data": {}}
+
+# Windows 徽标键组合不能稳定依赖 pyautogui 的通用路径：部分系统会吞掉点击后的 Win 事件。
+# 对含 Win 的组合改用 user32.keybd_event，直接投递系统级虚拟键按下/释放序列。
+_WINDOWS_HOTKEY_VK = {
+    "winleft": 0x5B, "winright": 0x5C,
+    "ctrl": 0x11, "shift": 0x10, "alt": 0x12,
+    "tab": 0x09, "enter": 0x0D, "esc": 0x1B, "space": 0x20,
+    "backspace": 0x08, "delete": 0x2E, "insert": 0x2D,
+    "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+}
+
+
+def _windows_hotkey_virtual_key(key_name):
+    """将组合键名称转换为 Windows 虚拟键码；返回 0 表示不支持系统级发送。"""
+    key = str(key_name or "").strip().lower()
+    if key in _WINDOWS_HOTKEY_VK:
+        return int(_WINDOWS_HOTKEY_VK[key])
+    if len(key) == 1 and ("a" <= key <= "z" or "0" <= key <= "9"):
+        return ord(key.upper())
+    if key.startswith("f") and key[1:].isdigit():
+        fn = int(key[1:])
+        if 1 <= fn <= 24:
+            return 0x6F + fn
+    return 0
+
+
+def _send_windows_logo_hotkey(keys):
+    """用 user32.keybd_event 发送包含 Windows 徽标键的系统级组合键。"""
+    if sys.platform != "win32":
+        return False
+    virtual_keys = [_windows_hotkey_virtual_key(key) for key in list(keys or [])]
+    if not virtual_keys or any(not key for key in virtual_keys):
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        for virtual_key in virtual_keys:
+            user32.keybd_event(int(virtual_key), 0, 0, 0)
+            time.sleep(0.025)
+        time.sleep(0.08)
+        return True
+    finally:
+        # 无论目标程序是否吞键，均按反向顺序释放，避免 Windows 键或修饰键残留。
+        try:
+            for virtual_key in reversed(virtual_keys):
+                user32.keybd_event(int(virtual_key), 0, 0x0002, 0)
+                time.sleep(0.015)
+        except Exception:
+            pass
+
+# 仅用于排除浏览器崩溃后的“小型恢复提示窗”。此过滤不会作用于正常浏览器主窗口，
+# 因而不会改变快速多开、按 PID 捕获、或按 hwnd 逐行切换的既有流程。
+BROWSER_RESTORE_PROMPT_MARKERS = (
+    "恢复页面", "恢复标签页", "恢复会话", "恢复浏览会话", "恢复之前的页面",
+    "是否恢复", "还原页面", "重新打开页面", "恢复浏览",
+    "restore pages", "restore tabs", "restore session", "restore browsing",
+    "restore your pages", "didn't shut down correctly", "did not shut down correctly",
+)
+
+
+def _is_compact_browser_restore_prompt(hwnd):
+    """只排除标题明确为恢复会话、且尺寸明显小于主窗口的顶层提示窗。"""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        hwnd = int(hwnd)
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+            return False
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+        width = max(0, int(rect.right - rect.left))
+        height = max(0, int(rect.bottom - rect.top))
+        # 仅处理用户所述“小窗口”。任何常规或最大化浏览器窗口都直接保留。
+        if width <= 0 or height <= 0 or width > 760 or height > 480:
+            return False
+        title = str(get_window_text(hwnd) or "").strip().lower()
+        return bool(title) and any(marker in title for marker in BROWSER_RESTORE_PROMPT_MARKERS)
+    except Exception:
+        return False
+
+
+def _open_url_handle_store_default():
+    # profiles: 规范 Profile Key → 当前绑定记录；bindings: binding_id → Profile Key。
+    return {"version": 4, "updated_at": "", "profiles": {}, "bindings": {}}
+
+
+def _open_url_handle_now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_open_url_store(store):
+    if not isinstance(store, dict):
+        store = _open_url_handle_store_default()
+    profiles = store.get("profiles")
+    if not isinstance(profiles, dict):
+        # 兼容旧版本 rows 或 entries 格式
+        old_rows = store.get("rows", {})
+        old_entries = store.get("entries", [])
+        profiles = {}
+        if isinstance(old_rows, dict):
+            for _, raw in old_rows.items():
+                if isinstance(raw, dict):
+                    hwnd = int(raw.get("hwnd", 0) or 0)
+                    prof = str(raw.get("profile", "") or "").strip()
+                    if hwnd and prof:
+                        profiles[prof] = {"hwnd": hwnd, "updated_at": raw.get("updated_at", _open_url_handle_now()), "title": raw.get("title", "")}
+        elif isinstance(old_entries, list):
+            for raw in old_entries:
+                if isinstance(raw, dict):
+                    hwnd = int(raw.get("hwnd", 0) or 0)
+                    prof = str(raw.get("profile", "") or "").strip()
+                    if hwnd and prof:
+                        profiles[prof] = {"hwnd": hwnd, "updated_at": raw.get("created_at", _open_url_handle_now()), "title": raw.get("title", "")}
+
+    normalized_profiles = {}
+    for prof_key, raw_val in profiles.items():
+        if not prof_key or not isinstance(raw_val, dict):
+            continue
+        try:
+            hwnd = int(raw_val.get("hwnd", 0) or 0)
+        except Exception:
+            hwnd = 0
+        try:
+            pid = int(raw_val.get("pid", 0) or 0)
+        except Exception:
+            pid = 0
+        if not hwnd and not pid:
+            continue
+        binding_id = str(raw_val.get("binding_id") or "").strip()
+        try:
+            process_started_at = int(raw_val.get("process_started_at", 0) or 0)
+        except Exception:
+            process_started_at = 0
+        normalized_profiles[str(prof_key)] = {
+            "profile": str(raw_val.get("profile") or prof_key),
+            "profile_key": str(raw_val.get("profile_key") or prof_key),
+            "binding_id": binding_id,
+            "hwnd": hwnd,
+            "pid": pid,
+            "process_started_at": process_started_at,
+            "binding_method": str(raw_val.get("binding_method") or ""),
+            "updated_at": str(raw_val.get("updated_at") or _open_url_handle_now()),
+            "title": str(raw_val.get("title") or ""),
+        }
+    normalized_bindings = {
+        entry["binding_id"]: profile_key
+        for profile_key, entry in normalized_profiles.items()
+        if str(entry.get("binding_id") or "").strip()
+    }
+    return {
+        "version": 4,
+        "updated_at": str(store.get("updated_at") or _open_url_handle_now()),
+        "profiles": normalized_profiles,
+        "bindings": normalized_bindings,
+    }
+
+
+def _load_open_url_handle_store():
+    with OPEN_URL_HANDLE_STORE_LOCK:
+        try:
+            if not os.path.exists(OPEN_URL_HANDLE_STORE_PATH):
+                return _open_url_handle_store_default()
+            with open(OPEN_URL_HANDLE_STORE_PATH, "r", encoding="utf-8") as f:
+                return _normalize_open_url_store(json.load(f))
+        except Exception as e:
+            log_internal_issue("读取网址窗口句柄记录文件失败", e)
+            return _open_url_handle_store_default()
+
+
+def _save_open_url_handle_store(store):
+    with OPEN_URL_HANDLE_STORE_LOCK:
+        normalized = _normalize_open_url_store(store)
+        normalized["updated_at"] = _open_url_handle_now()
+        try:
+            os.makedirs(OPEN_URL_HANDLE_STORE_DIR, exist_ok=True)
+            tmp_path = OPEN_URL_HANDLE_STORE_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(normalized, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, OPEN_URL_HANDLE_STORE_PATH)
+            return True
+        except Exception as e:
+            log_internal_issue("保存网址窗口句柄记录文件失败", e)
+            return False
+
+
+def _is_browser_window_handle(hwnd):
+    if not hwnd:
+        return False
+    if sys.platform != "win32":
+        return True
+    try:
+        hwnd = int(hwnd)
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+            return False
+        class_name = get_window_class_name(hwnd)
+        if class_name not in ("Chrome_WidgetWin_1", "MozillaWindowClass", "OperaWindowClass"):
+            return False
+        return not _is_compact_browser_restore_prompt(hwnd)
+    except Exception:
+        return False
+
+
+def _list_browser_window_handles():
+    """枚举可见浏览器顶层窗口；优先使用原生 EnumWindows，不依赖窗口标题。"""
+    if sys.platform != "win32":
+        return set()
+    result = set()
+    try:
+        user32 = ctypes.windll.user32
+        window_classes = {"Chrome_WidgetWin_1", "MozillaWindowClass", "OperaWindowClass"}
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+        @callback_type
+        def _enum_callback(hwnd, _lparam):
+            try:
+                hwnd_int = int(hwnd or 0)
+                if not hwnd_int or not user32.IsWindowVisible(hwnd_int):
+                    return True
+                if get_window_class_name(hwnd_int) in window_classes and _is_browser_window_handle(hwnd_int):
+                    result.add(hwnd_int)
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_enum_callback, 0)
+        return result
+    except Exception as native_error:
+        # 原生枚举异常时保留旧实现作为兼容兜底。
+        try:
+            for win in gw.getWindowsWithTitle(""):
+                hwnd = int(getattr(win, "_hWnd", 0) or 0)
+                if _is_browser_window_handle(hwnd):
+                    result.add(hwnd)
+        except Exception as fallback_error:
+            log_internal_issue("枚举浏览器窗口句柄失败", fallback_error)
+        if not result:
+            log_internal_issue("原生枚举浏览器窗口失败", native_error)
+        return result
+
+
+def _open_url_profile_store_key(profile):
+    """生成跨任务稳定的 Profile 存储键；路径大小写与斜杠差异不应丢失既有窗口映射。"""
+    raw = str(profile or "").strip()
+    if not raw:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(raw))
+    except Exception:
+        return raw.casefold()
+
+
+def _find_open_url_profile_store_entry(profiles, profile):
+    """按稳定键读取 Profile；仅唯一目录名时兼容相对名与完整路径的历史映射。"""
+    if not isinstance(profiles, dict):
+        return "", None
+    canonical = _open_url_profile_store_key(profile)
+    if canonical and isinstance(profiles.get(canonical), dict):
+        return canonical, profiles.get(canonical)
+    raw = str(profile or "").strip()
+    if raw and isinstance(profiles.get(raw), dict):
+        return raw, profiles.get(raw)
+    # 不按 Profile 目录名、邮箱显示名或标题做任何兼容猜测。
+    # 旧版没有规范键的记录必须重新通过“独立打开”建立绑定。
+    return "", None
+
+
+def _get_hwnd_owner_pid(hwnd):
+    """返回顶层窗口当前所属进程 PID；只作为窗口身份证的一部分，绝不单独用它找账号。"""
+    if sys.platform != "win32" or not hwnd:
+        return 0
+    try:
+        owner = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(owner))
+        return int(owner.value or 0)
+    except Exception:
+        return 0
+
+
+def _get_process_started_at(pid):
+    """返回 Windows 进程创建 FILETIME 整数；PID 被系统复用时该值会改变。"""
+    if sys.platform != "win32" or not pid:
+        return 0
+    handle = None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return 0
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+            return 0
+        return (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+    except Exception:
+        return 0
+    finally:
+        try:
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _record_open_url_profile_handle(profile, hwnd, target_pid=0, binding_method="strict_profile"):
+    """将 Profile 与浏览器窗口记录持久化。
+
+    ``strict_profile`` 表示可由当前窗口进程命令行精确确认；
+    ``isolated_new_window`` 仅用于同一 User Data 内多 Profile 共用 Chrome 进程的场景，
+    它要求“单次独占启动后只出现一个新顶层窗口”，以 HWND 作为窗口身份，PID 只用于检测该窗口是否被替换。
+    """
+    hwnd = int(hwnd or 0)
+    target_pid = int(target_pid or 0)
+    profile = str(profile or "").strip()
+    profile_key = _open_url_profile_store_key(profile)
+    if not profile_key:
+        return None
+    
+    # 记录窗口“实际 owner PID”，不保留可能已转交给 Chrome 现有进程的启动 PID。
+    if hwnd and sys.platform == "win32":
+        owner_pid = _get_hwnd_owner_pid(hwnd)
+        if owner_pid:
+            target_pid = owner_pid
+
+    # 如果没有 hwnd，但有 target_pid，尝试通过 pid 找 hwnd
+    if not hwnd and target_pid and sys.platform == "win32":
+        hwnd = find_hwnd_by_pid(target_pid)
+
+    hwnd = int(hwnd or 0)
+    if not hwnd or not _is_browser_window_handle(hwnd):
+        return None
+
+    with OPEN_URL_HANDLE_STORE_LOCK:
+        store = _load_open_url_handle_store()
+        binding_id = uuid.uuid4().hex
+        entry = {
+            "profile": profile,
+            "profile_key": profile_key,
+            "binding_id": binding_id,
+            "hwnd": hwnd,
+            "pid": target_pid,
+            "process_started_at": _get_process_started_at(target_pid),
+            "binding_method": str(binding_method or "strict_profile"),
+            "updated_at": _open_url_handle_now(),
+            "title": get_window_text(hwnd),
+        }
+        # 同一账号重新“独立打开”即建立新绑定并撤销旧 binding_id；不允许一账号映射多个猜测窗口。
+        old_entry = store["profiles"].get(profile_key)
+        old_binding = str(old_entry.get("binding_id") or "") if isinstance(old_entry, dict) else ""
+        if old_binding:
+            store.setdefault("bindings", {}).pop(old_binding, None)
+        store.setdefault("bindings", {})[binding_id] = profile_key
+        store["profiles"][profile_key] = entry
+        if _save_open_url_handle_store(store):
+            return entry
+    return None
+
+
+def _record_open_url_window_handle(hwnd, profile):
+    """兼容旧调用签名：按 (hwnd, profile) 顺序写入句柄记录。"""
+    return _record_open_url_profile_handle(profile, hwnd)
+
+
+def _get_open_url_profile_handle(profile):
+    """按规范 Profile Key 直取 binding_id 对应窗口；不扫描、不猜测、不按 PID 反查。"""
+    profile = str(profile or "").strip()
+    profile_key = _open_url_profile_store_key(profile)
+    if not profile_key:
+        return None
+
+    with OPEN_URL_HANDLE_STORE_LOCK:
+        store = _load_open_url_handle_store()
+        _stored_key, entry = _find_open_url_profile_store_entry(store.get("profiles", {}), profile_key)
+        if not _stored_key or not isinstance(entry, dict):
+            return None
+        binding_id = str(entry.get("binding_id") or "").strip()
+        stored_hwnd = int(entry.get("hwnd", 0) or 0)
+        stored_pid = int(entry.get("pid", 0) or 0)
+        stored_started_at = int(entry.get("process_started_at", 0) or 0)
+        # 旧记录缺少 binding_id 或进程出生时间，一律要求重新独立打开建立可信绑定。
+        if not binding_id or not stored_hwnd or not stored_pid or not stored_started_at:
+            return None
+        if store.get("bindings", {}).get(binding_id) != _stored_key:
+            return None
+        if not _is_browser_window_handle(stored_hwnd):
+            return None
+        owner_pid = _get_hwnd_owner_pid(stored_hwnd)
+        if owner_pid != stored_pid:
+            return None
+        if _get_process_started_at(owner_pid) != stored_started_at:
+            return None
+        return int(stored_hwnd)
+
+    return None
+
+
+def _remove_open_url_profile_handle(profile, expected_hwnd=0):
+    """清理指定账号的窗口句柄记录；可选限制为匹配的窗口句柄。"""
+    profile = str(profile or "").strip()
+    if not profile:
+        return False
+    with OPEN_URL_HANDLE_STORE_LOCK:
+        store = _load_open_url_handle_store()
+        profiles = store.get("profiles", {}) if isinstance(store, dict) else {}
+        _stored_key, current = _find_open_url_profile_store_entry(profiles, profile)
+        if not _stored_key or not isinstance(current, dict):
+            return False
+        try:
+            current_hwnd = int(current.get("hwnd", 0) or 0)
+        except Exception:
+            current_hwnd = 0
+        if expected_hwnd and current_hwnd != int(expected_hwnd):
+            return False
+        old_binding = str(current.get("binding_id") or "")
+        profiles.pop(_stored_key, None)
+        if old_binding:
+            store.setdefault("bindings", {}).pop(old_binding, None)
+        return _save_open_url_handle_store(store)
+
+
+def _claim_next_open_url_window_handle():
+    """从固定句柄文件中按记录时间顺序领取一个尚未被本轮执行占用的窗口。"""
+    with OPEN_URL_HANDLE_CLAIM_LOCK:
+        store = _load_open_url_handle_store()
+        profiles = store.get("profiles", {}) if isinstance(store, dict) else {}
+        stale_profiles = []
+        candidates = []
+
+        for profile, raw in profiles.items():
+            if not isinstance(raw, dict):
+                continue
+            hwnd = int(raw.get("hwnd", 0) or 0)
+            if not hwnd:
+                stale_profiles.append(profile)
+                continue
+            if not _is_browser_window_handle(hwnd):
+                stale_profiles.append(profile)
+                continue
+            candidates.append((
+                str(raw.get("updated_at") or ""),
+                str(profile),
+                {
+                    "id": str(profile),
+                    "profile": str(profile),
+                    "hwnd": hwnd,
+                    "title": str(raw.get("title") or ""),
+                }
+            ))
+
+        if stale_profiles:
+            for profile in stale_profiles:
+                profiles.pop(profile, None)
+            _save_open_url_handle_store(store)
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+
+        for _, _, entry in candidates:
+            active = OPEN_URL_HANDLE_ACTIVE_CLAIMS.get(entry["id"])
+            if active:
+                continue
+            claim_token = str(uuid.uuid4())
+            OPEN_URL_HANDLE_ACTIVE_CLAIMS[entry["id"]] = {
+                "claim_token": claim_token,
+                "claimed_at": _open_url_handle_now(),
+                "hwnd": entry["hwnd"],
+            }
+            entry["claim_token"] = claim_token
+            return entry
+    return None
+
+
+def _finish_open_url_window_claim(claim_id, claim_token, success, reason=""):
+    """结束一次窗口领取，释放本轮占用；若窗口已失效则顺便清理固定文件。"""
+    claim_id = str(claim_id or "").strip()
+    claim_token = str(claim_token or "").strip()
+    if not claim_id or not claim_token:
+        return False
+
+    with OPEN_URL_HANDLE_CLAIM_LOCK:
+        active = OPEN_URL_HANDLE_ACTIVE_CLAIMS.get(claim_id)
+        if not active or str(active.get("claim_token") or "") != claim_token:
+            return False
+        hwnd = int(active.get("hwnd", 0) or 0)
+        OPEN_URL_HANDLE_ACTIVE_CLAIMS.pop(claim_id, None)
+
+    should_prune = (not success) and (not _is_browser_window_handle(hwnd))
+    if should_prune:
+        with OPEN_URL_HANDLE_STORE_LOCK:
+            store = _load_open_url_handle_store()
+            profiles = store.get("profiles", {}) if isinstance(store, dict) else {}
+            current = profiles.get(claim_id)
+            if isinstance(current, dict) and int(current.get("hwnd", 0) or 0) == hwnd:
+                profiles.pop(claim_id, None)
+                _save_open_url_handle_store(store)
+    return True
+
+
+def _wait_for_new_browser_window_handle(before_handles, timeout=12.0):
+    before_handles = set(before_handles or set())
+    deadline = time.time() + max(1.0, float(timeout))
+    while time.time() < deadline:
+        candidates = _list_browser_window_handles() - before_handles
+        if candidates:
+            foreground = 0
+            try:
+                foreground = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+            except Exception:
+                foreground = 0
+            if foreground in candidates:
+                return foreground
+            return sorted(candidates)[-1]
+        time.sleep(0.2)
+    return None
+def _get_windows_process_parent_map(max_age=0.35):
+    """批量读取 Windows 进程父子关系，并短暂缓存以降低并发预开时的系统查询负担。"""
+    if sys.platform != "win32":
+        return {}
+    now = time.time()
+    with PROCESS_PARENT_MAP_LOCK:
+        cached = PROCESS_PARENT_MAP_CACHE.get("data", {})
+        if cached and now - float(PROCESS_PARENT_MAP_CACHE.get("ts", 0.0) or 0.0) <= max_age:
+            return dict(cached)
+        parent_map = {}
+        try:
+            output = subprocess.check_output(
+                "wmic process get ParentProcessId,ProcessId /format:csv",
+                shell=True,
+                stderr=subprocess.DEVNULL,
+            ).decode("gbk", errors="ignore")
+            for raw_line in output.splitlines():
+                line = str(raw_line or "").strip()
+                if not line or "ProcessId" in line:
+                    continue
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) < 3:
+                    continue
+                try:
+                    parent_pid = int(parts[-2] or 0)
+                    process_pid = int(parts[-1] or 0)
+                except Exception:
+                    continue
+                if process_pid:
+                    parent_map[process_pid] = parent_pid
+        except Exception as e:
+            log_internal_issue("读取 Windows 进程树失败", e)
+        PROCESS_PARENT_MAP_CACHE["ts"] = now
+        PROCESS_PARENT_MAP_CACHE["data"] = dict(parent_map)
+        return parent_map
+
+
+def _find_browser_window_handle_by_pid(pid):
+    """按启动 PID 及其 Chrome 子进程树定位浏览器顶层窗口，不依赖窗口标题。"""
+    if sys.platform != "win32" or not pid:
+        return None
+    try:
+        root_pid = int(pid)
+        user32 = ctypes.windll.user32
+        parent_map = _get_windows_process_parent_map()
+
+        def _belongs_to_launch_tree(owner_pid):
+            current = int(owner_pid or 0)
+            visited = set()
+            # Chrome 的窗口通常由启动进程本身或其 browser 子进程拥有；最多向上追溯 16 层。
+            for _ in range(16):
+                if not current or current in visited:
+                    return False
+                if current == root_pid:
+                    return True
+                visited.add(current)
+                current = int(parent_map.get(current, 0) or 0)
+            return False
+
+        direct_match = None
+        tree_match = None
+        for hwnd in _list_browser_window_handles():
+            owner_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(owner_pid))
+            owner_pid = int(owner_pid.value or 0)
+            if owner_pid == root_pid:
+                direct_match = int(hwnd)
+                break
+            if tree_match is None and _belongs_to_launch_tree(owner_pid):
+                tree_match = int(hwnd)
+        return direct_match or tree_match
+    except Exception as e:
+        log_internal_issue(f"按启动 PID/进程树捕获浏览器窗口失败: pid={pid}", e)
+    return None
+
+
 def fix_qt_plugin_path():
     venv_site_packages = os.path.join(BASE_DIR, "venv_simuops", "Lib", "site-packages")
     if not os.path.exists(venv_site_packages):
@@ -127,16 +736,40 @@ def init_drag_debug_log():
     write_drag_debug(f"BASE_DIR={BASE_DIR}")
     write_drag_debug(f"DEBUG_LOG_FILE={DRAG_DEBUG_LOG_FILE}")
 
-def is_windows_11():
-    """按系统版本号判断是否为 Win11。"""
-    if sys.platform != "win32":
-        return False
+# --- 独立 CMD 实时诊断：即使 PyQt 主界面无响应，最后节点仍写入文件并显示在 CMD ---
+LIVE_DIAG_ENABLED = True
+LIVE_DIAG_LOG_DIR = os.path.join(BASE_DIR, "logs")
+LIVE_DIAG_LOG_FILE = os.path.join(LIVE_DIAG_LOG_DIR, "live_runtime_diagnostic.log")
+LIVE_DIAG_CMD_FILE = os.path.join(LIVE_DIAG_LOG_DIR, "open_live_runtime_diagnostic.cmd")
+LIVE_DIAG_CONSOLE_STARTED = False
+LIVE_DIAG_LOCK = threading.RLock()
+
+
+def live_runtime_diagnostic(message):
+    """将关键运行节点同步写入独立诊断文件；写入完成后才返回调用方。"""
+    if not LIVE_DIAG_ENABLED:
+        return
     try:
-        ver = sys.getwindowsversion()
-        build = int(getattr(ver, "build", 0) or 0)
-        return build >= 22000
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {message}"
+        with LIVE_DIAG_LOCK:
+            os.makedirs(LIVE_DIAG_LOG_DIR, exist_ok=True)
+            with open(LIVE_DIAG_LOG_FILE, "a", encoding="utf-8", buffering=1) as f:
+                f.write(line + "\n")
+                f.flush()
+            # .pyw 通常没有父控制台；保留 print 便于命令行启动时同步可见。
+            try:
+                print(line, flush=True)
+            except Exception:
+                pass
     except Exception:
-        return False
+        pass
+
+
+def start_live_runtime_diagnostic_console():
+    """兼容旧调用；不再打开独立 CMD，诊断仍写入后台日志文件。"""
+    global LIVE_DIAG_CONSOLE_STARTED
+    LIVE_DIAG_CONSOLE_STARTED = True
+
 
 def _load_pywin32_drag_modules():
     """按需加载 Windows 原生拖拽所需模块。"""
@@ -287,48 +920,25 @@ def perform_native_file_drag(file_paths, target_x, target_y, log_func=None):
     target_y = max(5, min(screen_h - 5, int(target_y)))
 
     down_event = threading.Event()
-    release_event = threading.Event()
     worker_error = []
-    _set_cursor_pos(start_x, start_y)
-    time.sleep(0.05)
+    pyautogui.moveTo(start_x, start_y, duration=0.12)
 
     def _mouse_worker():
         try:
             time.sleep(0.08)
-            _mouse_left_down()
+            pyautogui.mouseDown(button="left")
             down_event.set()
             time.sleep(0.06)
-            _set_cursor_pos(start_x + 18, start_y)
+            pyautogui.moveRel(18, 0, duration=0.08)
+            pyautogui.moveTo(target_x, target_y, duration=0.32)
             time.sleep(0.08)
-            _set_cursor_pos(target_x, target_y)
-            time.sleep(0.12)
-            _mouse_left_up()
-            release_event.set()
+            pyautogui.mouseUp(button="left")
         except Exception as e:
             worker_error.append(e)
             down_event.set()
-            try:
-                _mouse_left_up()
-            except Exception:
-                pass
-            release_event.set()
-
-    def _release_watchdog():
-        """防止 DoDragDrop 因鼠标释放状态未被系统识别而长期挂起。"""
-        time.sleep(2.5)
-        if not release_event.is_set():
-            try:
-                _mouse_left_up()
-                _drag_log("watchdog: 已强制释放左键，避免 OLE 拖拽卡死")
-            except Exception as e:
-                log_internal_issue("watchdog 强制释放左键失败", e)
-            finally:
-                release_event.set()
 
     drag_thread = threading.Thread(target=_mouse_worker, daemon=True)
-    watchdog_thread = threading.Thread(target=_release_watchdog, daemon=True)
     drag_thread.start()
-    watchdog_thread.start()
 
     if not down_event.wait(1.2):
         raise RuntimeError("鼠标按下超时，无法启动真实拖拽")
@@ -347,7 +957,6 @@ def perform_native_file_drag(file_paths, target_x, target_y, log_func=None):
         else:
             pythoncom.CoUninitialize()
         drag_thread.join(timeout=2.0)
-        watchdog_thread.join(timeout=0.2)
 
     if worker_error:
         raise worker_error[0]
@@ -357,35 +966,17 @@ def perform_native_file_drag(file_paths, target_x, target_y, log_func=None):
     return effect
 
 def _move_window_away_from_target(hwnd, target_x, target_y):
-    """尽量把窗口移开目标区域，但保留原始尺寸，避免文件项坐标失真。"""
+    """把窗口缩到对角小窗，尽量不遮挡目标区域。"""
     if sys.platform != "win32" or not hwnd:
         return
+    screen_w, screen_h = pyautogui.size()
+    win_w = max(220, min(300, screen_w // 6))
+    win_h = max(160, min(220, screen_h // 4))
+    margin = 10
+    left = margin if target_x >= screen_w // 2 else max(margin, screen_w - win_w - margin)
+    top = margin if target_y >= screen_h // 2 else max(margin, screen_h - win_h - margin)
     try:
-        user32 = ctypes.windll.user32
-        rect = wintypes.RECT()
-        if not user32.GetWindowRect(int(hwnd), ctypes.byref(rect)):
-            raise RuntimeError("GetWindowRect 失败")
-
-        screen_w, screen_h = pyautogui.size()
-        margin = 12
-        width = max(260, int(rect.right - rect.left))
-        height = max(180, int(rect.bottom - rect.top))
-
-        candidates = [
-            (margin, margin),
-            (max(margin, screen_w - width - margin), margin),
-            (margin, max(margin, screen_h - height - margin)),
-            (max(margin, screen_w - width - margin), max(margin, screen_h - height - margin)),
-        ]
-
-        def _distance_from_target(pos):
-            left, top = pos
-            cx = left + width / 2.0
-            cy = top + height / 2.0
-            return math.hypot(cx - float(target_x), cy - float(target_y))
-
-        best_left, best_top = max(candidates, key=_distance_from_target)
-        user32.MoveWindow(int(hwnd), int(best_left), int(best_top), int(width), int(height), True)
+        ctypes.windll.user32.MoveWindow(int(hwnd), int(left), int(top), int(win_w), int(win_h), True)
     except Exception as e:
         log_internal_issue(f"移动资源管理器窗口失败: hwnd={hwnd}", e)
 
@@ -436,6 +1027,187 @@ def _close_window_silently(hwnd):
         return False
     except Exception as e:
         log_internal_issue(f"关闭窗口失败: hwnd={hwnd}", e)
+        return False
+
+
+def _close_browser_window_normally(hwnd, timeout=5.0):
+    """仅请求目标 Chrome 窗口自行正常关闭。
+
+    用于“关闭对应账号窗口”模式：只发送一次 WM_CLOSE，绝不置前、绝不模拟系统关闭、
+    绝不重复投递消息或强杀进程。若页面的正常关闭流程超过等待时间，则保留窗口并报告失败。
+    """
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        hwnd = int(hwnd)
+        user32 = ctypes.windll.user32
+        if not bool(user32.IsWindow(hwnd)):
+            return True
+        user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+        deadline = time.monotonic() + max(0.5, float(timeout or 5.0))
+        while time.monotonic() < deadline:
+            if not bool(user32.IsWindow(hwnd)):
+                return True
+            time.sleep(0.10)
+        return not bool(user32.IsWindow(hwnd))
+    except Exception as e:
+        log_internal_issue(f"正常关闭浏览器窗口失败: hwnd={hwnd}", e)
+        return False
+
+# [全局性能优化缓存] 批量进程缓存，避免高频调用 wmic 卡顿
+_PROCESS_CMD_CACHE = {"ts": 0, "data": {}}
+
+def _get_all_browser_processes_batch():
+    """使用绝对安全的 PowerShell 或安全 wmic list 格式批量获取浏览器进程信息，杜绝逗号错位。"""
+    global _PROCESS_CMD_CACHE
+    now = time.time()
+    if now - _PROCESS_CMD_CACHE["ts"] < 3.0 and _PROCESS_CMD_CACHE["data"]:
+        return _PROCESS_CMD_CACHE["data"]
+    
+    proc_map = {}
+    if sys.platform != "win32":
+        return proc_map
+    try:
+        raw_out = subprocess.check_output(
+            'wmic process where "name=\'chrome.exe\' or name=\'msedge.exe\'" get ProcessId,CommandLine /format:list',
+            shell=True
+        ).decode('gbk', errors='ignore')
+        
+        curr_pid = 0
+        curr_cmd = ""
+        for line in raw_out.splitlines():
+            line = str(line or "").strip()
+            if not line:
+                if curr_pid:
+                    proc_map[curr_pid] = curr_cmd
+                    curr_pid = 0
+                    curr_cmd = ""
+                continue
+            if line.lower().startswith("processid="):
+                try:
+                    curr_pid = int(line.split("=", 1)[1].strip())
+                except Exception:
+                    curr_pid = 0
+            elif line.lower().startswith("commandline="):
+                curr_cmd = line.split("=", 1)[1].strip()
+        if curr_pid:
+            proc_map[curr_pid] = curr_cmd
+    except Exception:
+        pass
+    
+    _PROCESS_CMD_CACHE["ts"] = now
+    _PROCESS_CMD_CACHE["data"] = proc_map
+    return proc_map
+
+
+def _get_hwnd_process_info(hwnd):
+    """按窗口句柄获取进程信息（支持极速批量缓存）。返回 {"pid": int, "name": str, "cmd": str}。"""
+    if sys.platform != "win32" or not hwnd:
+        return {"pid": 0, "name": "", "cmd": ""}
+    try:
+        hwnd = int(hwnd)
+        _pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(_pid))
+        pid = int(_pid.value or 0)
+        if not pid:
+            return {"pid": 0, "name": "", "cmd": ""}
+        
+        batch_map = _get_all_browser_processes_batch()
+        cmd = batch_map.get(pid, "")
+        if not cmd:
+            # 降级单次查询
+            try:
+                cmd = subprocess.check_output(
+                    f'wmic process where processid={pid} get commandline /format:list',
+                    shell=True
+                ).decode('gbk', errors='ignore')
+            except Exception:
+                cmd = ""
+        
+        return {"pid": pid, "name": "chrome.exe", "cmd": cmd}
+    except Exception as e:
+        log_internal_issue(f"按 hwnd 获取进程信息失败: hwnd={hwnd}", e)
+        return {"pid": 0, "name": "", "cmd": ""}
+
+def _is_browser_process_name(proc_name):
+    name = str(proc_name or "").strip().lower()
+    if not name:
+        return False
+    browser_names = {
+        "chrome.exe",
+        "chrome_proxy.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "opera.exe",
+        "opera_gx.exe",
+        "brave.exe",
+        "bravebrowser.exe",
+        "browser.exe",
+        "360chrome.exe",
+        "qqbrowser.exe",
+        "iexplore.exe",
+    }
+    return name in browser_names
+
+def _is_browser_process_info(proc_info):
+    proc_info = proc_info or {}
+    name = str(proc_info.get("name", "") or "").strip().lower()
+    cmd = str(proc_info.get("cmd", "") or "").strip().lower()
+    if _is_browser_process_name(name):
+        return True
+    browser_marks = [
+        "chrome.exe",
+        "chrome_proxy.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "opera.exe",
+        "opera_gx.exe",
+        "brave.exe",
+        "bravebrowser.exe",
+        "browser.exe",
+        "360chrome.exe",
+        "qqbrowser.exe",
+        "runninghub",
+    ]
+    return any(mark in cmd for mark in browser_marks)
+
+def _force_kill_pid_tree(pid):
+    """强制结束指定进程及其子进程。"""
+    if sys.platform != "win32" or not pid:
+        return False
+    try:
+        completed = subprocess.run(
+            f'taskkill /PID {int(pid)} /T /F',
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='gbk',
+            errors='ignore'
+        )
+        return completed.returncode == 0
+    except Exception as e:
+        log_internal_issue(f"强制结束进程树失败: pid={pid}", e)
+        return False
+
+def _force_kill_process_by_name(proc_name):
+    """按进程名强制结束全部实例。"""
+    proc_name = str(proc_name or "").strip()
+    if sys.platform != "win32" or not proc_name:
+        return False
+    try:
+        completed = subprocess.run(
+            f'taskkill /IM "{proc_name}" /T /F',
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='gbk',
+            errors='ignore'
+        )
+        return completed.returncode == 0
+    except Exception as e:
+        log_internal_issue(f"按进程名强制结束失败: name={proc_name}", e)
         return False
 
 def _set_cursor_pos(x, y):
@@ -504,15 +1276,40 @@ def _find_explorer_item_center(hwnd, file_name, timeout=5.0):
         raise RuntimeError(f"未能定位资源管理器中的文件项: {last_err}")
     raise RuntimeError("未能定位资源管理器中的文件项")
 
+def normalize_drag_file_path(raw_path):
+    """规范化表格中的拖拽文件路径，并移除复制粘贴常见的不可见字符。"""
+    raw = str(raw_path or "")
+    # Excel/网页/剪贴板常带 BOM、零宽空格、不可换行空格或首尾引号，Windows 路径会因此判定不存在。
+    invisible_chars = "\ufeff\u200b\u200c\u200d\u2060\xa0"
+    cleaned = raw.strip()
+    for char in invisible_chars:
+        cleaned = cleaned.replace(char, "")
+    if len(cleaned) >= 2 and cleaned[0] in ("'", '\"') and cleaned[-1] == cleaned[0]:
+        cleaned = cleaned[1:-1].strip()
+    cleaned = os.path.expandvars(os.path.expanduser(cleaned))
+    normalized = os.path.normpath(os.path.abspath(cleaned)) if cleaned else ""
+    return raw, normalized
+
+
 def perform_explorer_assisted_drag(file_path, target_x, target_y, log_func=None, target_hwnd=0):
-    """通过资源管理器真实选中文件后，再把它拖到目标坐标。"""
+    """单文件真实 Explorer 拖拽。
+
+    保留原有“Explorer 选中文件 → 物理鼠标拖入网页”的方式，不使用 OLE、WM_DROPFILES
+    或独立辅助脚本。诊断点使用实时日志记录，以便识别是 Explorer 启动、窗口激活还是
+    UI Automation 文件项定位发生了等待。
+    """
     if sys.platform != "win32":
         raise RuntimeError("资源管理器拖拽仅支持 Windows")
-    abs_path = os.path.normpath(os.path.abspath(file_path))
+    raw_path, abs_path = normalize_drag_file_path(file_path)
     if not os.path.isfile(abs_path):
-        raise FileNotFoundError(f"文件不存在: {abs_path}")
+        parent_dir = os.path.dirname(abs_path)
+        parent_state = "存在" if os.path.isdir(parent_dir) else "不存在"
+        raise FileNotFoundError(
+            f"拖拽文件不存在。规范化路径：{abs_path}；上级目录{parent_state}；原始值：{raw_path!r}"
+        )
 
     def _drag_log(message):
+        live_runtime_diagnostic(f"[SingleDrag] {message}")
         write_drag_debug(f"[ExplorerDrag] {message}")
         if log_func:
             try:
@@ -521,56 +1318,92 @@ def perform_explorer_assisted_drag(file_path, target_x, target_y, log_func=None,
                 pass
 
     hwnd = 0
+    mouse_down = False
     try:
-        _drag_log(f"打开资源管理器并选中文件: {abs_path}")
+        # 采用原项目中已使用的 Explorer /select 命令格式，避免 shell 参数解析差异。
+        _drag_log(f"阶段 1/7：启动 Explorer 并选中文件：{abs_path}")
         subprocess.Popen(f'explorer /select,"{abs_path}"', shell=True)
+
+        _drag_log("阶段 2/7：等待 Explorer 成为前台窗口")
         time.sleep(0.9)
         hwnd = _wait_for_foreground_explorer_window(timeout=5.0)
         if not hwnd:
-            raise RuntimeError("未等到资源管理器窗口")
+            raise RuntimeError("未等到 Explorer 前台窗口")
+        _drag_log(f"阶段 2/7 完成：Explorer hwnd={hwnd}")
 
-        if not force_activate_window(hwnd):
-            _drag_log(f"资源管理器窗口激活未确认成功: hwnd={hwnd}")
-        _move_window_away_from_target(hwnd, int(target_x), int(target_y))
-        time.sleep(0.8)
+        # 不再调用含 AttachThreadInput/pygetwindow 回退的 force_activate_window，
+        # 后者在多 Chrome 窗口已预开时可能被跨 GUI 线程焦点切换阻塞。
+        _drag_log(f"阶段 3/7：以轻量 Win32 请求激活 Explorer hwnd={hwnd}")
+        user32 = ctypes.windll.user32
+        if user32.IsIconic(int(hwnd)):
+            user32.ShowWindow(int(hwnd), 9)
+        user32.BringWindowToTop(int(hwnd))
+        user32.SetForegroundWindow(int(hwnd))
+        time.sleep(0.35)
+        if int(user32.GetForegroundWindow() or 0) != int(hwnd):
+            raise RuntimeError(f"Explorer 未能成为前台窗口：hwnd={hwnd}")
 
+        # 不再缩小或移动 Explorer：小窗会把已选文件压缩到不可可靠拖取的区域。
+        # 保持资源管理器原始可见尺寸；在鼠标真正按下后切回目标 Chrome 以完成放置。
+        _drag_log("阶段 4/7：保持 Explorer 原始尺寸，准备从完整文件区域起拖")
+        time.sleep(0.35)
+
+        _drag_log(f"阶段 5/7：通过 UIA 定位文件项：{os.path.basename(abs_path)}")
         src_x, src_y = _find_explorer_item_center(hwnd, os.path.basename(abs_path), timeout=5.0)
-        _drag_log(f"source=({src_x},{src_y}) target=({target_x},{target_y}) hwnd={hwnd}")
+        _drag_log(f"阶段 5/7 完成：source=({src_x},{src_y}) target=({target_x},{target_y})")
 
+        _drag_log("阶段 6/7：按住鼠标并执行真实拖拽轨迹")
         pyautogui.moveTo(src_x, src_y, duration=0.22)
-        time.sleep(0.2)
+        time.sleep(0.16)
         _set_cursor_pos(src_x, src_y)
         _mouse_left_down()
-        _drag_log("左键已按下，开始连续拖拽")
-        time.sleep(0.35)
-        pyautogui.moveRel(24, 0, duration=0.22)
-        time.sleep(0.12)
+        mouse_down = True
+        time.sleep(0.30)
+        # 保留明显的起拖阈值，确保 Windows 从普通点击进入拖放状态。
+        pyautogui.moveRel(24, 0, duration=0.20)
+        time.sleep(0.10)
+        # 原有“激活窗口 + 拖拽”搭配：起拖后再切回拖放目标 Chrome。
+        # 这样 Explorer 不必缩小，文件源坐标仍稳定，网页目标也会露出接收拖放。
         if target_hwnd:
             try:
-                if ctypes.windll.user32.IsWindow(int(target_hwnd)):
-                    activated = force_activate_window(int(target_hwnd))
-                    _drag_log(f"拖拽途中切回目标窗口: hwnd={int(target_hwnd)} activated={activated}")
+                target_hwnd = int(target_hwnd)
+                if ctypes.windll.user32.IsWindow(target_hwnd):
+                    activated = force_activate_window_quick(target_hwnd, timeout=0.55)
+                    _drag_log(
+                        f"阶段 6/7：拖拽途中切回目标窗口 hwnd={target_hwnd}，"
+                        f"前台确认={int(bool(activated))}"
+                    )
+                    if not activated:
+                        raise RuntimeError("拖拽目标浏览器未能切回前台，已阻止盲目释放鼠标")
                     time.sleep(0.18)
-            except Exception as e:
-                log_internal_issue(f"拖拽途中切回目标窗口失败: hwnd={target_hwnd}", e)
+            except Exception:
+                # finally 会释放左键；异常上抛给步骤错误策略，不把文件错误投放到未知窗口。
+                raise
+        else:
+            raise RuntimeError("未取得拖拽目标浏览器窗口，已阻止在 Explorer 前台盲目释放鼠标")
         mid_x = int((src_x + int(target_x)) / 2)
         mid_y = int((src_y + int(target_y)) / 2)
-        pyautogui.moveTo(mid_x, mid_y, duration=0.55)
-        time.sleep(0.08)
-        pyautogui.moveTo(int(target_x), int(target_y), duration=0.95)
-        _drag_log("已到达目标坐标，保持按住等待网页响应")
-        time.sleep(0.95)
+        pyautogui.moveTo(mid_x, mid_y, duration=0.50)
+        pyautogui.moveTo(int(target_x), int(target_y), duration=0.85)
+        time.sleep(0.80)
         _mouse_left_up()
-        _drag_log("左键已释放")
-        _drag_log("资源管理器真实拖拽手势已完成")
+        mouse_down = False
+        _drag_log("阶段 7/7：已在网页目标坐标释放鼠标，真实拖拽完成")
         return True
     finally:
+        # 即使异常发生，也必须释放左键，避免后续鼠标动作被保持在按下状态。
+        if mouse_down:
+            try:
+                _mouse_left_up()
+                _drag_log("异常清理：已释放残留鼠标左键")
+            except Exception:
+                pass
         if hwnd:
-            time.sleep(0.2)
+            time.sleep(0.15)
             if _close_window_silently(hwnd):
-                _drag_log("资源管理器窗口已关闭")
+                _drag_log("Explorer 窗口已关闭")
             else:
-                _drag_log("资源管理器窗口关闭失败")
+                _drag_log("Explorer 窗口关闭未确认")
 
 SMART_FILL_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".ico", ".tiff"}
 SMART_FILL_TEXT_EXTS = {".txt", ".log", ".md", ".csv", ".ini", ".json", ".xml", ".py", ".bat"}
@@ -686,8 +1519,50 @@ def _get_combo_text(combo):
     return str(text or "").strip()
 
 def natural_sort_key(text):
+    """终极自然排序算法：优先提取并按照字符串中的第一个核心数字进行数值升序排序。
+    无论是否带有中括号（如 [邮箱-04]、[邮箱250]）、下划线、连字符或装饰文字，
+    只要包含数字，就强制让数字大小决定排序先后，确保 4、6、10、42、250 绝对连贯。
+    """
     text = "" if text is None else str(text)
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r'([0-9]+)', text)]
+    # 1. 提取文本中所有的数字串
+    nums = re.findall(r'\d+', text)
+    primary_num = int(nums[0]) if nums else -1
+    
+    # 2. 将非数字的文本部分进行基础清理（移除中括号、标点、特殊符号和多余空白）作为次要排序键
+    cleaned_text = re.sub(r'[_.\-\s\[\]\(\)\{\}\#\@\:\/\\]+', '', text).casefold()
+    
+    # 返回复合键：首要按提取到的核心数字（数值大小）排序；若数字相同，再按清理后的文本及原文本排序
+    return (primary_num, cleaned_text, text)
+
+def profile_sort_key(profile, primary="name"):
+    """为 Chrome 账号建立确定性的排序键。默认以“账号显示名称”的自然顺序排序。"""
+    if isinstance(profile, dict):
+        path = profile.get("pid", "")
+        name = profile.get("name", "")
+        email = profile.get("email", "")
+        remark = profile.get("remark", "")
+        profile_id = profile.get("prawid", "")
+    else:
+        row = tuple(profile or ())
+        path = row[0] if len(row) > 0 else ""
+        name = row[1] if len(row) > 1 else ""
+        email = row[2] if len(row) > 2 else ""
+        remark = row[3] if len(row) > 3 else ""
+        profile_id = row[4] if len(row) > 4 else ""
+
+    profile_id = profile_id or os.path.basename(str(path or ""))
+    name_key = natural_sort_key(name)
+    profile_key = natural_sort_key(profile_id)
+    email_key = natural_sort_key(email)
+    remark_key = natural_sort_key(remark)
+    path_key = str(path or "").replace("\\", "/").casefold()
+
+    if primary == "remark":
+        return (remark_key, name_key, profile_key, email_key, path_key)
+    if primary == "profile_id":
+        return (profile_key, name_key, email_key, path_key)
+    # 默认以名称（name_key）为第一排序主键，确保用户在界面上看到的名称按纯数字自然顺序完美排列
+    return (name_key, profile_key, email_key, path_key)
 
 def sorted_scandir_entries(path):
     entries = list(os.scandir(path))
@@ -1004,11 +1879,44 @@ _extra_scan_dirs = set()
 CHROME_PROFILES_CACHE = {"data": [], "ts": 0.0, "scan_dirs": tuple()}
 WINDOW_PROFILE_INFO_CACHE = {}
 
+def _normalize_open_url_val(val, fallback_val=""):
+    """归一化 open_url 的值格式: url|profile|mode，确保第三段模式不丢失。"""
+    val_str = str(val or "").strip()
+    fallback_str = str(fallback_val or "").strip()
+    parts = [p.strip() for p in val_str.split('|')]
+    fb_parts = [p.strip() for p in fallback_str.split('|')]
+    
+    url = parts[0] if len(parts) > 0 and parts[0] else (fb_parts[0] if len(fb_parts) > 0 else "")
+    profile = parts[1] if len(parts) > 1 and parts[1] else (fb_parts[1] if len(fb_parts) > 1 else "")
+    
+    mode = ""
+    if len(parts) > 2 and parts[2]:
+        mode = parts[2]
+    elif len(fb_parts) > 2 and fb_parts[2]:
+        mode = fb_parts[2]
+    else:
+        mode = "independent"
+        
+    mode = mode.lower()
+    if mode in ("activate_from_file", "activate_file", "handle_file"):
+        mode = "read_by_profile"
+    if mode in ("close_profile", "close_account", "close_window_by_profile"):
+        mode = "close_by_profile"
+    if mode not in ("independent", "standalone", "record_handle", "read_by_profile", "close_by_profile"):
+        mode = "independent"
+        
+    return f"{url}|{profile}|{mode}"
+
 def clear_chrome_profile_cache():
     """清空 Chrome 账号扫描缓存。"""
     CHROME_PROFILES_CACHE["data"] = []
     CHROME_PROFILES_CACHE["ts"] = 0.0
     CHROME_PROFILES_CACHE["scan_dirs"] = tuple()
+    # 账号目录变更后同时清空显示名缓存，避免 UI 继续显示旧资料。
+    try:
+        get_profile_display_name.cache_clear()
+    except Exception:
+        pass
 
 def clear_window_profile_caches():
     """清空窗口相关缓存，便于刷新后立即看到最新标签/备注。"""
@@ -1016,11 +1924,212 @@ def clear_window_profile_caches():
     WINDOW_ACCOUNT_MARKER_CACHE.clear()
     WINDOW_PROFILE_INFO_CACHE.clear()
 
-def get_chrome_profiles(force_refresh=False):
+STRICT_LOGIN_COOKIE_NAMES = (
+    "SID", "HSID", "SSID", "SAPISID", "APISID",
+    "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PSIDTS", "__Secure-3PSIDTS",
+)
+
+STRICT_LOGIN_COOKIE_DOMAINS = (
+    "google.com", ".google.com",
+    "accounts.google.com", ".accounts.google.com",
+    "youtube.com", ".youtube.com",
+)
+
+def _normalize_profile_email(email):
+    email = str(email or "").strip()
+    if "@" not in email:
+        return ""
+    return email.lower()
+
+def _extract_profile_account_emails(pref):
+    emails = []
+    acc_info = pref.get("account_info", [])
+    if not isinstance(acc_info, list):
+        return emails
+    for acc in acc_info:
+        if not isinstance(acc, dict):
+            continue
+        for key in ("email", "user_name", "gaia_name"):
+            email = _normalize_profile_email(acc.get(key, ""))
+            if email and email not in emails:
+                emails.append(email)
+    return emails
+
+def _pick_strict_login_email(pref, emails):
+    if not emails:
+        return ""
+    tracker_email = _normalize_profile_email(pref.get("account_tracker_service", {}).get("last_active_dice_account", ""))
+    if tracker_email and tracker_email in emails:
+        return tracker_email
+    acc_info = pref.get("account_info", [])
+    if isinstance(acc_info, list):
+        for acc in acc_info:
+            if not isinstance(acc, dict):
+                continue
+            email = _normalize_profile_email(acc.get("email", "") or acc.get("user_name", "") or acc.get("gaia_name", ""))
+            if email and acc.get("is_primary_account"):
+                return email
+    return ""
+
+def _find_first_existing_path(path_candidates):
+    for path in path_candidates:
+        if path and os.path.exists(path):
+            return os.path.normpath(path)
+    return ""
+
+def _profile_has_google_login_cookies(profile_path):
+    profile_path = os.path.normpath(profile_path or "")
+    if not profile_path:
+        return False
+    cookie_path = _find_first_existing_path([
+        os.path.join(profile_path, "Network", "Cookies"),
+        os.path.join(profile_path, "Cookies"),
+        os.path.join(profile_path, "Default", "Network", "Cookies"),
+        os.path.join(profile_path, "Default", "Cookies"),
+    ])
+    if not cookie_path:
+        return False
+
+    temp_copy = ""
+    conn = None
+    try:
+        probe_dir = os.path.join(BASE_DIR, "runtime_data", "cookie_probe")
+        os.makedirs(probe_dir, exist_ok=True)
+        temp_copy = os.path.join(probe_dir, f"cookies_{os.getpid()}_{uuid.uuid4().hex}.db")
+        shutil.copy2(cookie_path, temp_copy)
+        db_path = temp_copy
+    except Exception:
+        db_path = cookie_path
+
+    try:
+        conn = sqlite3.connect(db_path, timeout=1.2)
+        cur = conn.cursor()
+        placeholders = ",".join("?" for _ in STRICT_LOGIN_COOKIE_NAMES)
+        rows = cur.execute(
+            f"SELECT name, host_key FROM cookies WHERE name IN ({placeholders})",
+            STRICT_LOGIN_COOKIE_NAMES
+        ).fetchall()
+        for _, host_key in rows:
+            host_key = str(host_key or "").lower()
+            if any(host_key == domain or host_key.endswith(domain) for domain in STRICT_LOGIN_COOKIE_DOMAINS):
+                return True
+    except Exception:
+        return False
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+        if temp_copy:
+            try:
+                os.remove(temp_copy)
+            except Exception:
+                pass
+    return False
+
+def _mark_chrome_profile_clean_exit(user_data_dir, profile_dir="Default"):
+    """[已禁用] 不再强行修改 Preferences 文件中的退出标记，
+    避免篡改浏览器内部状态引发 Google 账号的安全风控（“验证身份”提示）。
+    Chrome 的恢复页面提示将通过 UI 层的 _dismiss_restore_prompt_if_needed 自动处理。"""
+    return False
+
+def _dismiss_restore_prompt_if_needed():
+    """尝试先收掉浏览器的“恢复页面/是否恢复”提示，避免后续快捷键打到弹窗。"""
+    try:
+        if sys.platform != "win32":
+            return
+        pyautogui.press('esc')
+        time.sleep(0.08)
+        pyautogui.press('tab')
+        time.sleep(0.05)
+        pyautogui.press('tab')
+        time.sleep(0.05)
+        pyautogui.press('esc')
+        time.sleep(0.08)
+    except Exception as e:
+        log_internal_issue("尝试关闭恢复提示失败", e)
+
+def _read_chrome_profile_login_state(pref_path, profile_path, default_name="", default_email="", default_remark=""):
+    info = {
+        "name": str(default_name or "").strip(),
+        "email": _normalize_profile_email(default_email),
+        "remark": str(default_remark or "").strip(),
+        "is_logged_in": False,
+    }
+    if not pref_path or not os.path.exists(pref_path):
+        return info
+
+    try:
+        with open(pref_path, "r", encoding="utf-8", errors="ignore") as f:
+            pref = json.load(f)
+    except Exception:
+        return info
+
+    profile_name = str(pref.get("profile", {}).get("name", "") or "").strip()
+    if profile_name and not info["name"]:
+        info["name"] = profile_name
+
+    emails = _extract_profile_account_emails(pref)
+    if emails and not info["email"]:
+        info["email"] = emails[0]
+
+    strict_email = _pick_strict_login_email(pref, emails)
+    preferred_email = strict_email or (emails[0] if len(emails) == 1 else "")
+    has_login_cookie = _profile_has_google_login_cookies(profile_path)
+    if preferred_email and has_login_cookie:
+        info["email"] = preferred_email
+        info["is_logged_in"] = True
+
+    return info
+
+def _normalize_profile_name_for_dedup(name):
+    name = str(name or "").strip()
+    if not name:
+        return ""
+    name = re.sub(r'^\[[^\]]+\]\s*', '', name)
+    name = re.sub(r'\s+', ' ', name)
+    return name.lower()
+
+def _profile_unique_key(profile_path, profile_info):
+    email_key = _normalize_profile_email(profile_info.get("email", ""))
+    if email_key:
+        return ("email", email_key)
+    name_key = _normalize_profile_name_for_dedup(profile_info.get("name", ""))
+    if name_key:
+        return ("name", name_key)
+    return ("path", os.path.normpath(profile_path or "").lower())
+
+def _profile_unique_score(profile_path, profile_info, active_paths):
+    is_active = any(is_same_path(profile_path, ap) for ap in active_paths)
+    return (
+        1 if is_active else 0,
+        1 if profile_info.get("remark") == "当前运行中" else 0,
+        1 if profile_info.get("email") else 0,
+        1 if profile_info.get("name") else 0,
+        -len(str(profile_path or "")),
+    )
+
+def _collapse_profiles_by_unique_account(found_profiles, active_paths):
+    collapsed = {}
+    for profile_path, info in found_profiles.items():
+        key = _profile_unique_key(profile_path, info)
+        old = collapsed.get(key)
+        if old is None:
+            collapsed[key] = {"path": profile_path, "info": dict(info)}
+            continue
+        old_score = _profile_unique_score(old["path"], old["info"], active_paths)
+        new_score = _profile_unique_score(profile_path, info, active_paths)
+        if new_score > old_score:
+            collapsed[key] = {"path": profile_path, "info": dict(info)}
+    return collapsed
+
+def get_chrome_profiles(force_refresh=False, skip_cookie_check=False):
     """终极唯一标识版：返回 (path, name, email, remark, raw_id) 元组。
     [修复] 深度扫描 Local State 和 Preferences，提取更多账户元数据。"""
     scan_dirs_snapshot = tuple(sorted(os.path.normpath(p) for p in _extra_scan_dirs if p))
-    if (not force_refresh and CHROME_PROFILES_CACHE["data"] and
+    # [优化] 如果是轻量扫描(skip_cookie_check=True)，则不使用缓存，因为它和带Cookie的缓存数据结构不完全一致
+    if (not force_refresh and not skip_cookie_check and CHROME_PROFILES_CACHE["data"] and
             time.time() - CHROME_PROFILES_CACHE["ts"] < 8 and
             CHROME_PROFILES_CACHE["scan_dirs"] == scan_dirs_snapshot):
         return list(CHROME_PROFILES_CACHE["data"])
@@ -1046,19 +2155,8 @@ def get_chrome_profiles(force_refresh=False):
     for _extra in _extra_scan_dirs:
         if _extra: base_dirs.append(os.path.normpath(_extra))
     
-    # 2. 增强进程扫描
-    try:
-        cmd = 'wmic process where "commandline like \'%%--user-data-dir=%%\'" get commandline'
-        output = subprocess.check_output(cmd, shell=True).decode('gbk', errors='ignore')
-        # [修复] 同样改为逐行解析，防止路径中的 .exe 干扰
-        for line in output.splitlines():
-            line = line.strip()
-            if not line or '--user-data-dir=' not in line: continue
-            p = extract_cmd_switch_value(line, "user-data-dir")
-            if p and os.path.exists(p):
-                base_dirs.append(os.path.normpath(p))
-    except Exception as e:
-        log_internal_issue("扫描 Chrome 进程命令行失败", e)
+    # 2. 增强进程扫描 (不再扫描进程，以防止与本地磁盘扫描结果重叠导致重复)
+    pass
 
     # 3. 遍历 User Data 目录
     for u_dir in set(base_dirs):
@@ -1105,60 +2203,60 @@ def get_chrome_profiles(force_refresh=False):
                     p_path = os.path.join(p_path, "Default")
                     pref_path = os.path.join(p_path, "Preferences")
                 
-                # [核心修复] 统一规范化路径，并处理 Default 后缀，作为唯一标识进行去重
+                # 以实际 Profile 物理路径作为唯一身份；Default 绝不再折叠成 User Data 根目录。
                 canonical_profile_path = os.path.normpath(p_path).lower()
-                # 如果路径是 Profile X\Default 形式，则将其规范化为 Profile X
-                if canonical_profile_path.endswith("\\default"):
-                    canonical_profile_path = os.path.dirname(canonical_profile_path)
                 
                 if canonical_profile_path in processed_canonical_paths: continue
                 processed_canonical_paths.add(canonical_profile_path)
 
                 # 提取详细信息
                 info = state_info.get(p_id, {"name": "", "email": "", "remark": ""})
-                is_logged_in = False
-                if os.path.exists(pref_path):
+                
+                # [核心修复] 轻量化扫描逻辑
+                if skip_cookie_check:
+                    # 不读取 Cookie，只读取 Preferences 中的基本信息
                     try:
-                        with open(pref_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        with open(pref_path, "r", encoding="utf-8", errors="ignore") as f:
                             pref = json.load(f)
-                        if not info["name"]: info["name"] = pref.get("profile", {}).get("name", "")
-                        
-                        # [修复] 提取登录状态：检查是否有有效的账号邮箱
-                        acc_info = pref.get("account_info", [])
-                        if isinstance(acc_info, list) and acc_info: 
-                            info["email"] = acc_info[0].get("email", "")
-                            if info["email"]: is_logged_in = True
-                            
-                        if not is_logged_in:
-                            last_user = pref.get("google", {}).get("services", {}).get("last_username", "")
-                            if last_user:
-                                info["email"] = last_user
-                                is_logged_in = True
-                    except: pass
-                
-                # [核心修复] 极严格过滤：必须同时满足以下条件才认为是有效账户
-                # 1. 必须有 Preferences 文件
-                # 2. 必须有有效的邮箱信息（证明已登录）
-                # 3. 排除那些虽然有文件但邮箱为空的干扰目录
-                if not is_logged_in or not info["email"] or len(info["email"]) < 5: 
+                        p_name = str(pref.get("profile", {}).get("name", "") or "").strip()
+                        if p_name: info["name"] = p_name
+                        emails = _extract_profile_account_emails(pref)
+                        if emails: info["email"] = emails[0]
+                    except Exception:
+                        pass
+                    # 轻量模式下默认视为已登录，防止账号从列表消失
+                    is_logged_in = True
+                else:
+                    login_state = _read_chrome_profile_login_state(
+                        pref_path,
+                        p_path,
+                        default_name=info.get("name", ""),
+                        default_email=info.get("email", ""),
+                        default_remark=info.get("remark", "")
+                    )
+                    info["name"] = login_state.get("name", "") or info.get("name", "")
+                    info["email"] = login_state.get("email", "") or info.get("email", "")
+                    info["remark"] = login_state.get("remark", "") or info.get("remark", "")
+                    is_logged_in = login_state.get("is_logged_in")
+
+                # 1. 必须有有效邮箱；2. 常规扫描须通过 Cookie 校验。
+                if not info["email"] or len(info["email"]) < 5:
                     continue
-                
-                # [优化] 智能精简显示名，避免 L-01 (L-01) 这种重复堆叠
-                base_name = info["name"] or info["email"] or p_id
-                
-                # 如果是 Default 或 Profile X，且有更好的 info["name"]，则不显示 p_id
+                if not skip_cookie_check and not is_logged_in:
+                    continue
+
+                # 显示名优先使用您在第一个程序设置的独立备注；它不会影响 Chrome 目录或内部名称。
                 id_is_generic = p_id == "Default" or p_id.startswith("Profile ")
+                if not id_is_generic:
+                    display_name = f"[{p_id}]"
+                else:
+                    display_name = info["email"] or info["name"] or p_id
                 
-                display_name = base_name
-                # [精简逻辑] 如果 base_name 已经包含了 p_id 或 email，就不再加括号
-                if not id_is_generic and p_id.lower() not in base_name.lower():
-                    display_name = f"{base_name} ({p_id})"
-                
+                # 助手目录处理
                 if "User Data" not in u_dir:
-                    # 对于助手目录，用父目录名作为前缀区分
                     parent_name = os.path.basename(u_dir)
                     if parent_name.lower() not in display_name.lower():
-                        display_name = f"[{parent_name}] {display_name}"
+                        display_name = f"<{parent_name}> {display_name}"
 
                 found_profiles[canonical_profile_path] = {
                     "name": display_name,
@@ -1194,25 +2292,15 @@ def get_chrome_profiles(force_refresh=False):
             p_email = ""
             p_name_from_pref = ""
             if os.path.exists(pref_path):
-                try:
-                    with open(pref_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        pref = json.load(f)
-                    p_name_from_pref = pref.get("profile", {}).get("name", "")
-                    acc_info = pref.get("account_info", [])
-                    if isinstance(acc_info, list) and acc_info:
-                        p_email = acc_info[0].get("email", "")
-                    if not p_email:
-                        p_email = pref.get("google", {}).get("services", {}).get("last_username", "")
-                    if p_email:
-                        is_valid_account = True
-                except: pass
+                login_state = _read_chrome_profile_login_state(pref_path, norm_ap)
+                p_name_from_pref = login_state.get("name", "")
+                p_email = login_state.get("email", "")
+                is_valid_account = bool(login_state.get("is_logged_in") and p_email and len(p_email) > 5)
                 
-            # 只有确实有账号信息的实例才加入
-            if is_valid_account and p_email and len(p_email) > 5:
-                # [核心修复] 统一规范化路径，并处理 Default 后缀，作为唯一标识进行去重
+            # 只有通过严格登录检测的实例才加入
+            if is_valid_account:
+                # 运行中实例同样保留其真实 Profile 物理路径，Default 不再退化为 User Data 根目录。
                 canonical_active_path = os.path.normpath(norm_ap).lower()
-                if canonical_active_path.endswith("\\default"):
-                    canonical_active_path = os.path.dirname(canonical_active_path)
 
                 if canonical_active_path in processed_canonical_paths: continue
                 processed_canonical_paths.add(canonical_active_path)
@@ -1233,26 +2321,40 @@ def get_chrome_profiles(force_refresh=False):
                     "id": p_id
                 }
 
-    # 5. 格式化输出
+    # 5. 按物理 Profile 唯一化后输出。相同邮箱出现在不同目录时必须保留并显式标冲突，
+    # 不能静默折叠为一个账户，否则“打开网址”可能落到错误浏览器资料。
+    email_paths = {}
     for canonical_path, d in found_profiles.items():
-        # 最终返回时，将规范化路径作为第一个元素
+        email = _normalize_profile_email(d.get("email", ""))
+        if email:
+            email_paths.setdefault(email, []).append(canonical_path)
+    for canonical_path, d in found_profiles.items():
+        email = _normalize_profile_email(d.get("email", ""))
+        if email and len(email_paths.get(email, [])) > 1:
+            d = dict(d)
+            d["name"] = f"⚠ 同邮箱冲突 | {d.get('name', '')} | {d.get('id', '')}".strip()
+            original_remark = str(d.get("remark", "")).strip()
+            d["remark"] = (original_remark + "；" if original_remark else "") + "需要确认保留的真实 Profile"
         profiles.append((canonical_path, d["name"], d["email"], d["remark"], d["id"]))
     
-    profiles.sort(key=lambda x: x[1].lower())
+    profiles.sort(key=lambda x: profile_sort_key(x, primary="profile_id"))
     CHROME_PROFILES_CACHE["data"] = list(profiles)
     CHROME_PROFILES_CACHE["ts"] = time.time()
     CHROME_PROFILES_CACHE["scan_dirs"] = scan_dirs_snapshot
     return profiles
 
 def force_activate_window(hwnd):
-    """尽量稳定地激活目标窗口，兼容 Win10/Win11 与录屏软件干扰。"""
-    if sys.platform != 'win32' or not hwnd:
+    """将指定顶层窗口置前，并严格验证它确实成为前台窗口。"""
+    if sys.platform != "win32" or not hwnd:
         return False
     try:
         hwnd = int(hwnd)
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
+        if not user32.IsWindow(hwnd):
+            return False
 
+        # SW_SHOW=5, SW_RESTORE=9；先恢复最小化窗口，再请求置前。
         class WINDOWPLACEMENT(ctypes.Structure):
             _fields_ = [
                 ("length", wintypes.UINT),
@@ -1262,59 +2364,92 @@ def force_activate_window(hwnd):
                 ("ptMaxPosition", wintypes.POINT),
                 ("rcNormalPosition", wintypes.RECT),
             ]
-
-        if not user32.IsWindow(hwnd):
-            return False
-
         placement = WINDOWPLACEMENT()
         placement.length = ctypes.sizeof(WINDOWPLACEMENT)
         user32.GetWindowPlacement(hwnd, ctypes.byref(placement))
-        if placement.showCmd == 2:  # SW_SHOWMINIMIZED
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        else:
-            user32.ShowWindow(hwnd, 5)  # SW_SHOW
+        user32.ShowWindow(hwnd, 9 if placement.showCmd == 2 else 5)
 
-        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
-        foreground_hwnd = user32.GetForegroundWindow()
-        foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
-        current_thread = kernel32.GetCurrentThreadId()
+        def _is_foreground():
+            return int(user32.GetForegroundWindow() or 0) == hwnd
 
-        HWND_TOPMOST = -1
-        HWND_NOTOPMOST = -2
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
-        SWP_NOACTIVATE = 0x0010
+        # 常规请求：大部分情况下这里即可成功。
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.12)
+        if _is_foreground():
+            return True
 
-        attached_threads = set()
-
-        def _attach(thread_id):
-            if thread_id and thread_id != current_thread:
-                if user32.AttachThreadInput(current_thread, thread_id, True):
-                    attached_threads.add(thread_id)
-
+        # Windows 可能因前台锁定策略拒绝跨线程激活。把当前线程与当前前台线程
+        # 暂时附着后再置前；无论结果如何都在 finally 中解绑，避免影响后续输入。
+        foreground = int(user32.GetForegroundWindow() or 0)
+        current_tid = int(kernel32.GetCurrentThreadId() or 0)
+        foreground_tid = int(user32.GetWindowThreadProcessId(foreground, None) or 0) if foreground else 0
+        target_tid = int(user32.GetWindowThreadProcessId(hwnd, None) or 0)
+        attached_foreground = False
+        attached_target = False
         try:
-            _attach(target_thread)
-            _attach(foreground_thread)
-
-            for _ in range(3):
-                user32.BringWindowToTop(hwnd)
-                user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
-                user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-                user32.SetForegroundWindow(hwnd)
-                user32.SetActiveWindow(hwnd)
-                user32.SetFocus(hwnd)
-                time.sleep(0.08)
-                if user32.GetForegroundWindow() == hwnd:
-                    return True
+            if foreground_tid and current_tid and foreground_tid != current_tid:
+                attached_foreground = bool(user32.AttachThreadInput(current_tid, foreground_tid, True))
+            if target_tid and current_tid and target_tid != current_tid:
+                attached_target = bool(user32.AttachThreadInput(current_tid, target_tid, True))
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+            time.sleep(0.18)
+            if _is_foreground():
+                return True
         finally:
-            for thread_id in attached_threads:
-                try:
-                    user32.AttachThreadInput(current_thread, thread_id, False)
-                except Exception:
-                    pass
+            if attached_target:
+                user32.AttachThreadInput(current_tid, target_tid, False)
+            if attached_foreground:
+                user32.AttachThreadInput(current_tid, foreground_tid, False)
+
+        # 最后使用窗口对象补发一次激活请求，并坚持以真实前台句柄为准。
+        try:
+            gw.Window(hwnd).activate()
+        except Exception:
+            pass
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.18)
+        return _is_foreground()
+    except Exception:
+        return False
+
+def force_activate_window_quick(hwnd, timeout=0.45):
+    """分批热路径的非阻塞激活；绝不把已最大化窗口恢复为普通窗口。"""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        hwnd = int(hwnd)
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+            live_runtime_diagnostic(f"快速激活拒绝：窗口不可用 hwnd={hwnd}")
+            return False
+        # 只恢复最小化窗口。此前无条件 SW_RESTORE 会撤销已完成的最大化标准化。
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)
+        live_runtime_diagnostic(f"快速激活请求 hwnd={hwnd}")
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        user32.SetWindowPos(
+            hwnd, 0, 0, 0, 0, 0,
+            0x0001 | 0x0002 | 0x0040 | 0x4000,  # NOSIZE | NOMOVE | SHOWWINDOW | ASYNCWINDOWPOS
+        )
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        while time.monotonic() < deadline:
+            if int(user32.GetForegroundWindow() or 0) == hwnd:
+                live_runtime_diagnostic(f"快速激活确认 hwnd={hwnd}")
+                return True
+            time.sleep(0.03)
+        foreground = int(user32.GetForegroundWindow() or 0)
+        live_runtime_diagnostic(f"快速激活超时 hwnd={hwnd} foreground={foreground}")
+        return foreground == hwnd
     except Exception as e:
-        log_internal_issue(f"强制激活窗口失败: hwnd={hwnd}", e)
-    return False
+        live_runtime_diagnostic(f"快速激活异常 hwnd={hwnd}: {type(e).__name__}: {e}")
+        log_internal_issue(f"快速激活窗口失败: hwnd={hwnd}", e)
+        return False
+
 
 def get_root_window_from_point(x, y):
     """按屏幕坐标获取顶层窗口句柄。"""
@@ -1513,6 +2648,40 @@ def get_active_chrome_profiles():
         log_internal_issue("获取活动 Chrome 账号失败", e)
     return active_paths
 
+def resolve_shared_profile_reference(profile_ref):
+    """兼容旧调用名：纯路径模式不再读取任何共享登记表。"""
+    return None
+
+
+def to_shared_profile_reference(profile_path):
+    """兼容旧调用名：保存真实 Chrome Profile 路径，不生成 binding:<id>。"""
+    value = str(profile_path or "").strip()
+    if not value or value.startswith("binding:"):
+        return ""
+    if "\\" in value or "/" in value:
+        return os.path.normpath(os.path.abspath(value))
+    return value
+
+
+def get_profile_ui_label(profile_id):
+    """为自动刷新场景生成账户标签；共用绑定的备注仅来自登记表。"""
+    value = str(profile_id or "").strip()
+    if not value:
+        return "未设置账户"
+    if OPEN_URL_HANDLE_FILE_TOKEN in value:
+        return "固定句柄文件"
+    if "::hwnd=" in value:
+        return value.split("::hwnd=", 1)[0].strip() or "已打开窗口"
+    binding = resolve_shared_profile_reference(value)
+    if binding:
+        remark = str(binding.get("remark", "")).strip()
+        email = str(binding.get("primary_email", "")).strip()
+        profile_dir = str(binding.get("profile_dir", "")).strip()
+        return remark or email or profile_dir or "已绑定账户"
+    return os.path.basename(os.path.normpath(value)) or value
+
+
+@lru_cache(maxsize=512)
 def get_profile_display_name(profile_id):
     """根据路径 ID 获取账户显示名称。
     
@@ -1523,6 +2692,12 @@ def get_profile_display_name(profile_id):
       3) 最终兜底返回 '自定义路径账号 (parent/basename)' 而非纯 basename。
     """
     if not profile_id: return "未设置账户"
+    binding = resolve_shared_profile_reference(profile_id)
+    if binding:
+        remark = str(binding.get("remark", "")).strip()
+        email = str(binding.get("primary_email", "")).strip()
+        profile_dir = str(binding.get("profile_dir", "")).strip()
+        return remark or email or profile_dir or "已绑定账户"
     # [增强] 允许在 open_url 的“账号/目标”位置填入窗口句柄（用于直接激活已打开的浏览器窗口）
     # 形如：xxx::hwnd=123456 或 ::hwnd=123456
     try:
@@ -1531,6 +2706,8 @@ def get_profile_display_name(profile_id):
             return left if left else "已打开窗口"
     except Exception:
         pass
+    if isinstance(profile_id, str) and OPEN_URL_HANDLE_FILE_TOKEN in profile_id:
+        return "固定句柄文件"
     # 如果是路径，尝试从路径中提取
     if "\\" in profile_id or "/" in profile_id:
         norm_id = os.path.normpath(profile_id)
@@ -1611,7 +2788,7 @@ def get_profile_tag(profile_path, profile_meta=None):
             continue
     return ""
 
-def get_profile_brief_info(profile_id):
+def get_profile_brief_info(profile_id, cache_only=False):
     """返回 profile 的基础资料，优先走缓存，缺失时再回退到本地文件。"""
     info = {"path": "", "name": "", "email": "", "remark": "", "id": ""}
     if not profile_id:
@@ -1622,7 +2799,8 @@ def get_profile_brief_info(profile_id):
     info["id"] = os.path.basename(profile_path) if ("\\" in profile_id or "/" in profile_id) else profile_id
 
     if "\\" in profile_id or "/" in profile_id:
-        for pid, pname, pemail, premark, prawid in get_chrome_profiles():
+        cached_profiles = CHROME_PROFILES_CACHE.get("data", []) or []
+        for pid, pname, pemail, premark, prawid in cached_profiles:
             try:
                 if is_same_path(pid, profile_path):
                     return {
@@ -1634,6 +2812,20 @@ def get_profile_brief_info(profile_id):
                     }
             except Exception:
                 continue
+
+        if not cache_only:
+            for pid, pname, pemail, premark, prawid in get_chrome_profiles():
+                try:
+                    if is_same_path(pid, profile_path):
+                        return {
+                            "path": pid,
+                            "name": pname or "",
+                            "email": pemail or "",
+                            "remark": premark or "",
+                            "id": prawid or os.path.basename(pid)
+                        }
+                except Exception:
+                    continue
 
         parent_dir = os.path.dirname(profile_path)
         p_id = os.path.basename(profile_path)
@@ -1678,6 +2870,122 @@ def get_profile_brief_info(profile_id):
             "id": p_id or info["id"]
         })
     return info
+
+def merge_profile_rows(profile_rows, active_paths=None):
+    """合并多来源账号行，按邮箱/名称去重并保留更优条目。"""
+    found_profiles = {}
+    for row in profile_rows or []:
+        if not row or len(row) < 5:
+            continue
+        pid, pname, pemail, premark, prawid = row[:5]
+        pid = os.path.normpath(str(pid or "").strip()) if pid else ""
+        if not pid:
+            continue
+        found_profiles[pid] = {
+            "name": str(pname or "").strip(),
+            "email": _normalize_profile_email(pemail),
+            "remark": str(premark or "").strip(),
+            "id": str(prawid or os.path.basename(pid)).strip() or os.path.basename(pid)
+        }
+    collapsed = _collapse_profiles_by_unique_account(found_profiles, active_paths or [])
+    merged = []
+    for item in collapsed.values():
+        path = item.get("path", "")
+        info = item.get("info", {}) or {}
+        merged.append((
+            path,
+            info.get("name", "") or info.get("email", "") or os.path.basename(path),
+            info.get("email", "") or "",
+            info.get("remark", "") or "",
+            info.get("id", "") or os.path.basename(path)
+        ))
+    return merged
+
+def get_remembered_profile_rows(config):
+    """读取已记住的窗口账号资料。"""
+    if not isinstance(config, dict):
+        return []
+    store = config.get("remembered_window_profiles", {}) or {}
+    rows = []
+    for raw_key, raw_info in store.items():
+        info = raw_info if isinstance(raw_info, dict) else {}
+        pid = os.path.normpath(str(info.get("path") or raw_key or "").strip()) if (info.get("path") or raw_key) else ""
+        if not pid:
+            continue
+        name = str(info.get("name") or info.get("email") or info.get("id") or os.path.basename(pid)).strip()
+        email = _normalize_profile_email(info.get("email", ""))
+        remark = str(info.get("remark") or "").strip()
+        rawid = str(info.get("id") or os.path.basename(pid)).strip() or os.path.basename(pid)
+        rows.append((pid, name, email, remark, rawid))
+    return merge_profile_rows(rows)
+
+def remember_profile_rows(config, profile_rows, source="window"):
+    """把识别到的账号资料写入配置，供后续快速复用。"""
+    if not isinstance(config, dict):
+        return 0
+    store = config.setdefault("remembered_window_profiles", {})
+    changed = 0
+    now_text = _open_url_handle_now()
+    for row in profile_rows or []:
+        if not row or len(row) < 5:
+            continue
+        pid, pname, pemail, premark, prawid = row[:5]
+        pid = os.path.normpath(str(pid or "").strip()) if pid else ""
+        if not pid:
+            continue
+        old = store.get(pid, {}) if isinstance(store.get(pid, {}), dict) else {}
+        merged = {
+            "path": pid,
+            "name": str(pname or old.get("name", "")).strip(),
+            "email": _normalize_profile_email(pemail or old.get("email", "")),
+            "remark": str(premark or old.get("remark", "")).strip(),
+            "id": str(prawid or old.get("id", os.path.basename(pid))).strip() or os.path.basename(pid),
+            "source": str(source or old.get("source", "window")).strip() or "window",
+            "updated_at": now_text
+        }
+        if old != merged:
+            store[pid] = merged
+            changed += 1
+    return changed
+
+def get_running_window_profile_rows():
+    """从当前已打开的浏览器窗口反向识别账号资料。"""
+    rows = []
+    if sys.platform != "win32":
+        return rows
+    seen_hwnds = set()
+    seen_keys = set()
+    try:
+        import pygetwindow as pgw
+        for w in pgw.getAllWindows():
+            try:
+                hwnd = int(getattr(w, "_hWnd", 0) or getattr(w, "hWnd", 0) or 0)
+            except Exception:
+                hwnd = 0
+            if not hwnd or hwnd in seen_hwnds:
+                continue
+            seen_hwnds.add(hwnd)
+            try:
+                if not bool(getattr(w, "visible", True)):
+                    continue
+            except Exception:
+                pass
+            info = get_window_profile_descriptor(hwnd) or {}
+            pid = os.path.normpath(str(info.get("path", "") or "").strip()) if info.get("path") else ""
+            if not pid:
+                continue
+            key = pid.lower()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            name = str(info.get("name") or info.get("email") or info.get("id") or os.path.basename(pid)).strip()
+            email = _normalize_profile_email(info.get("email", ""))
+            remark = str(info.get("remark") or "").strip()
+            rawid = str(info.get("id") or os.path.basename(pid)).strip() or os.path.basename(pid)
+            rows.append((pid, name, email, remark, rawid))
+    except Exception as e:
+        log_internal_issue("从浏览器窗口反向识别账号失败", e)
+    return merge_profile_rows(rows, get_active_chrome_profiles())
 
 def get_window_class_name(hwnd):
     """按 hwnd 获取窗口类名，用于快速判断是否为 Chrome 主窗口。"""
@@ -1736,7 +3044,7 @@ def get_window_profile_descriptor(hwnd):
         p_dir = extract_cmd_switch_value(cmd_out, "profile-directory")
         if u_path:
             profile_path = os.path.normpath(os.path.join(u_path, p_dir)) if p_dir else os.path.normpath(u_path)
-            info = get_profile_brief_info(profile_path)
+            info = get_profile_brief_info(profile_path, cache_only=True)
             if not info.get("path"):
                 info["path"] = profile_path
             if not info.get("id"):
@@ -1817,6 +3125,59 @@ def build_window_display_text(raw_title, hwnd=None, prefix="", profile_meta=None
     suffix = f" 〔{' | '.join(extras)}〕" if extras else ""
     return f"{prefix}{title}{suffix}"
 
+def _browser_window_matches_profile_exact(hwnd, expected_profile):
+    """严格比较窗口所属浏览器进程的 user-data-dir 与 profile-directory。"""
+    if sys.platform != "win32" or not hwnd or not expected_profile:
+        return False
+    try:
+        proc_info = _get_hwnd_process_info(int(hwnd))
+        if not _is_browser_process_info(proc_info):
+            return False
+        cmdline = str(proc_info.get("cmd", "") or "")
+        user_data_dir = extract_cmd_switch_value(cmdline, "user-data-dir")
+        profile_dir = extract_cmd_switch_value(cmdline, "profile-directory") or "Default"
+        if not user_data_dir:
+            return False
+        actual_profile = os.path.normpath(os.path.join(user_data_dir, profile_dir))
+        return is_same_path(expected_profile, actual_profile)
+    except Exception as e:
+        log_internal_issue(f"严格校验浏览器 Profile 失败: hwnd={hwnd}", e)
+        return False
+
+
+def find_hwnd_by_pid(target_pid):
+    """根据浏览器进程 PID 精准查找其对应的主窗口句柄（hwnd），绝对物理级对齐，绝不反查迷糊匹配。"""
+    if sys.platform != "win32" or not target_pid:
+        return None
+    try:
+        target_pid = int(target_pid)
+        user32 = ctypes.windll.user32
+        for hwnd in _list_browser_window_handles():
+            try:
+                _pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(_pid))
+                if int(_pid.value) == target_pid:
+                    return int(hwnd)
+            except Exception:
+                continue
+    except Exception as e:
+        log_internal_issue(f"按 PID 查找主窗口句柄失败: {target_pid}", e)
+    return None
+
+
+def find_browser_window_hwnd_by_profile_exact(expected_profile):
+    """按浏览器进程启动参数精确获取 Profile 对应的主窗口，绝不按标题或账号名称模糊匹配。"""
+    if sys.platform != "win32" or not expected_profile:
+        return None
+    try:
+        for hwnd in _list_browser_window_handles():
+            if _browser_window_matches_profile_exact(hwnd, expected_profile):
+                return int(hwnd)
+    except Exception as e:
+        log_internal_issue(f"按浏览器启动参数精确查找窗口失败: {expected_profile}", e)
+    return None
+
+
 def find_browser_window_hwnd_by_hint(target_hint):
     """按窗口标题/账号标识/展示文案匹配已打开浏览器窗口，返回 hwnd。"""
     if sys.platform != "win32" or not target_hint:
@@ -1838,6 +3199,8 @@ def find_browser_window_hwnd_by_hint(target_hint):
                 if not hwnd or hwnd in seen_hwnds:
                     continue
                 seen_hwnds.add(hwnd)
+                if not _is_browser_window_handle(hwnd):
+                    continue
 
                 title = str(get_window_text(hwnd) or "").strip()
                 marker = str(get_window_account_marker(hwnd) or "").strip()
@@ -2266,7 +3629,7 @@ class ModernTaskManager(QDialog):
 # --- Chrome Profile Selector Dialog ---
 class ChromeProfileSelector(QDialog):
     def __init__(self, parent=None):
-        super().__init__(parent); self.setWindowTitle("👤 选择 Chrome 账户"); self.resize(550, 650)
+        super().__init__(parent); self.setWindowTitle("👤 选择 Chrome 账户（仅显示已登录）"); self.resize(550, 650)
         layout = QVBoxLayout(self)
         
         # 顶部筛选区
@@ -2302,12 +3665,16 @@ class ChromeProfileSelector(QDialog):
         layout.addWidget(self.lbl_selection_count)
         bind_item_view_selection_label(self.list_widget, self.lbl_selection_count, kind_text="个账户")
         
-        self.profiles = get_chrome_profiles(force_refresh=True)
+        # [性能修复] 移除“从窗口识别”以防止与磁盘扫描结果重叠导致重复项。
+        # 默认采用轻量化磁盘扫描：只读账号名和路径，不读取耗时的 Cookie，解决卡顿和账号消失问题。
         self.active_pids = get_active_chrome_profiles()
+        self.profiles = get_chrome_profiles(force_refresh=True, skip_cookie_check=True)
         self._filter_list("")
         
         btn_h = QHBoxLayout()
-        btn_refresh = QPushButton("🔄 刷新状态"); btn_refresh.clicked.connect(self._refresh_status)
+        btn_refresh = QPushButton("🔄 刷新账号")
+        btn_refresh.setToolTip("重新扫描本地 Chrome 账号目录。")
+        btn_refresh.clicked.connect(self._refresh_status)
         btn_h.addWidget(btn_refresh)
         btn_h.addStretch()
         self.btn_select = QPushButton("✅ 确定选择"); self.btn_select.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold; width: 120px; height: 35px;"); self.btn_select.clicked.connect(self.accept)
@@ -2329,7 +3696,7 @@ class ChromeProfileSelector(QDialog):
                         save_config(cfg)
                 
                 clear_chrome_profile_cache()
-                self.profiles = get_chrome_profiles(force_refresh=True)
+                self.profiles = get_chrome_profiles(force_refresh=True, skip_cookie_check=True)
                 self._filter_list(self.search_edit.text())
                 QMessageBox.information(self, "成功", f"已添加目录: {norm_path}\n现在可以识别该目录下的账户了。")
 
@@ -2343,13 +3710,14 @@ class ChromeProfileSelector(QDialog):
                 cfg['extra_scan_dirs'] = []
                 save_config(cfg)
             clear_chrome_profile_cache()
-            self.profiles = get_chrome_profiles(force_refresh=True)
+            self.profiles = get_chrome_profiles(force_refresh=True, skip_cookie_check=True)
             self._filter_list(self.search_edit.text())
 
     def _refresh_status(self):
         self.active_pids = get_active_chrome_profiles()
         clear_chrome_profile_cache()
-        self.profiles = get_chrome_profiles(force_refresh=True) # 刷新时重新扫描物理目录
+        # 默认采用轻量化扫描，解决卡顿和账号消失问题
+        self.profiles = get_chrome_profiles(force_refresh=True, skip_cookie_check=True)
         self._filter_list(self.search_edit.text())
 
     def _filter_list(self, text):
@@ -2357,7 +3725,10 @@ class ChromeProfileSelector(QDialog):
         search_text = text.strip().lower()
         only_active = self.chk_only_active.isChecked()
         
-        for prof_data in self.profiles:
+        # [新增] 应用自然排序逻辑，确保账号按名称中的数字大小正确排序
+        sorted_profiles = sorted(self.profiles, key=lambda x: natural_sort_key(x[1]))
+        
+        for prof_data in sorted_profiles:
             pid, pname = prof_data[0], prof_data[1]
             # [修复] 使用 is_same_path 进行路径容错比对，防止因盘符映射、大小写、反斜杠导致的漏判
             is_active = any(is_same_path(pid, ap) for ap in self.active_pids)
@@ -2372,7 +3743,8 @@ class ChromeProfileSelector(QDialog):
                     item.setText(f"⚪ {pname}")
                     item.setForeground(QColor("#757575"))
                 
-                item.setData(Qt.UserRole, pid)
+                # 新选择保存共用绑定 ID；无历史绑定时保留完整路径以兼容旧任务。
+                item.setData(Qt.UserRole, to_shared_profile_reference(pid))
                 self.list_widget.addItem(item)
         
         if self.list_widget.count() > 0: self.list_widget.setCurrentRow(0)
@@ -2403,6 +3775,7 @@ CMD_MAP = {
     "滚轮滚动": "scroll",
     "激活窗口": "win_active", 
     "🌐 打开网址": "open_url",
+    "🧹 关闭浏览器窗口": "close_browser",
     "运行程序": "run_app",
     "屏幕截图": "screenshot",
     "⏸️ 延后执行": "defer",
@@ -2497,6 +3870,93 @@ class KeyRecorder(QLineEdit):
         if final_keys:
             self._save_recorded_text(final_keys)
         event.accept()
+
+
+class ModifierButtonKeyRecorder(QWidget):
+    """组合键录制器：修饰键以按钮选择，主键由实际按键录制，避免 Win 键无法被 Qt 捕获。"""
+    key_recorded = pyqtSignal(str)
+    _modifier_specs = (
+        ("ctrl", "Ctrl"), ("alt", "Alt"), ("shift", "Shift"), ("win", "Win"),
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._buttons = {}
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(3)
+        for key, label in self._modifier_specs:
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setFixedHeight(26)
+            button.setMinimumWidth(36)
+            button.setToolTip(f"点击选择 {label} 修饰键；再在右侧按实际主键完成录制")
+            button.toggled.connect(lambda _checked, _key=key: self._on_modifier_changed(_key))
+            self._buttons[key] = button
+            self._layout.addWidget(button)
+        self.recorder = KeyRecorder(self)
+        self.recorder.setToolTip("先点左侧修饰键按钮（例如 Win），再点击这里并按主键（例如 ↑）。Esc/Backspace 可清空。")
+        self.recorder.key_recorded.connect(self._on_recorded)
+        self.recorder.customContextMenuRequested.connect(
+            lambda pos: self.customContextMenuRequested.emit(self.recorder.mapTo(self, pos))
+        )
+        self._layout.addWidget(self.recorder, 1)
+        self.setFocusProxy(self.recorder)
+        self.setToolTip("组合键录制：点击修饰键按钮，再录制一个主键。示例：点击 Win 后按 ↑，得到 Win+Up。")
+
+    def setText(self, text):
+        raw = str(text or "")
+        parts = [part.strip().lower() for part in raw.split("+") if part.strip()]
+        aliases = {"windows": "win", "super": "win", "meta": "win", "control": "ctrl", "option": "alt"}
+        selected = {aliases.get(part, part) for part in parts}
+        for key, button in self._buttons.items():
+            button.blockSignals(True)
+            button.setChecked(key in selected)
+            button.blockSignals(False)
+        self.recorder.setText(raw)
+
+    def text(self):
+        return self.recorder.text()
+
+    def setStyleSheet(self, style):
+        super().setStyleSheet(style)
+        if hasattr(self, "recorder"):
+            self.recorder.setStyleSheet(style)
+
+    def setContextMenuPolicy(self, policy):
+        super().setContextMenuPolicy(policy)
+        if hasattr(self, "recorder"):
+            self.recorder.setContextMenuPolicy(policy)
+
+    def _selected_modifiers(self):
+        return [key for key, _label in self._modifier_specs if self._buttons[key].isChecked()]
+
+    def _on_modifier_changed(self, _key):
+        modifiers = self._selected_modifiers()
+        self.recorder.setFocus(Qt.MouseFocusReason)
+        if modifiers:
+            self.recorder._set_temporary_text("+".join(modifiers) + "+")
+        else:
+            self.recorder._set_temporary_text("")
+
+    def _on_recorded(self, value):
+        if not str(value or "").strip():
+            for button in self._buttons.values():
+                button.blockSignals(True)
+                button.setChecked(False)
+                button.blockSignals(False)
+            self.key_recorded.emit("")
+            return
+        parts = [part.strip().lower() for part in str(value or "").split("+") if part.strip()]
+        aliases = {"windows": "win", "super": "win", "meta": "win", "control": "ctrl", "option": "alt"}
+        selected = self._selected_modifiers()
+        main_keys = [aliases.get(part, part) for part in parts if aliases.get(part, part) not in selected]
+        final_parts = selected + [part for part in main_keys if part not in selected]
+        final_value = "+".join(final_parts)
+        if final_value != str(value or ""):
+            self.recorder._save_recorded_text(final_value)
+        self.key_recorded.emit(final_value)
+
 
 class MultiLineTextEdit(QTextEdit):
     editingFinished = pyqtSignal()
@@ -2639,6 +4099,8 @@ class WindowSelector(QDialog):
         for w in gw.getAllWindows():
             if w.title and w.title.strip() and w.width > 0 and w.height > 0:
                 hwnd = getattr(w, '_hWnd', None)  # pygetwindow 在 Windows 上有 _hWnd
+                if hwnd and _is_compact_browser_restore_prompt(hwnd):
+                    continue
                 win_items.append((build_window_display_text(w.title, hwnd, "[窗口] ", profile_meta), w.title, hwnd))
         win_items.sort(key=lambda x: x[0])
         browser_tabs = self._get_browser_tabs()  # 返回 (display_text, raw_title, hwnd) 列表
@@ -3573,13 +5035,16 @@ class SpreadsheetPasteTable(QTableWidget):
     def __init__(self, rows=12, cols=4, parent=None):
         super().__init__(rows, cols, parent)
         self.setAlternatingRowColors(True)
-        self.setWordWrap(True)
+        # 文案表格用于暂存和复制，长文本不自动换行撑高单元格。
+        self.setWordWrap(False)
         self.setShowGrid(True)
         self.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.AnyKeyPressed)
         self.setItemDelegate(MultiLineTextDelegate(self))
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        # 行高默认紧凑且允许用户拖动垂直表头手动调整；绝不由文案长度自动改写。
+        self.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.verticalHeader().setDefaultSectionSize(42)
         self.verticalHeader().setMinimumSectionSize(28)
         self._refresh_headers()
@@ -3658,9 +5123,7 @@ class SpreadsheetPasteTable(QTableWidget):
                     self.setItem(start_row + r_off, start_col + c_off, it)
                 it.setText(val)
         self.blockSignals(False)
-        for r_off in range(len(matrix)):
-            self.resizeRowToContents(start_row + r_off)
-            self.setRowHeight(start_row + r_off, min(max(self.rowHeight(start_row + r_off), 42), 140))
+        # 不碰既有行高：新行使用默认 42px，用户手动调整过的行保持原样。
         return True
 
     def get_effective_matrix(self):
@@ -3712,6 +5175,41 @@ class SpreadsheetPasteTable(QTableWidget):
     def get_active_matrix(self):
         selected_matrix = self.get_selected_matrix()
         return selected_matrix if selected_matrix else self.get_effective_matrix()
+
+    def set_matrix(self, matrix):
+        """以给定二维矩阵完整替换表格模型、尺寸与可见单元格，供快照恢复使用。"""
+        if not isinstance(matrix, (list, tuple)):
+            return False
+        normalized = []
+        for raw_row in matrix:
+            if isinstance(raw_row, (list, tuple)):
+                normalized.append(["" if cell is None else str(cell) for cell in raw_row])
+            else:
+                normalized.append(["" if raw_row is None else str(raw_row)])
+        if not normalized:
+            return False
+        rows = len(normalized)
+        cols = max(1, max((len(row) for row in normalized), default=1))
+        self.blockSignals(True)
+        self.setUpdatesEnabled(False)
+        try:
+            # 使用全新 QTableWidgetItem 逐格替换模型，不能复用隐藏编辑器/旧 item；
+            # 这样导入后用户眼前的表格行数与内容必然和快照矩阵一致。
+            self.clearContents()
+            self.setRowCount(rows)
+            self.setColumnCount(cols)
+            self._refresh_headers()
+            for r, row in enumerate(normalized):
+                for c in range(cols):
+                    self.setItem(r, c, QTableWidgetItem(row[c] if c < len(row) else ""))
+            self.setCurrentCell(0, 0)
+            self.scrollToTop()
+        finally:
+            self.setUpdatesEnabled(True)
+            self.blockSignals(False)
+        self.viewport().update()
+        self.viewport().repaint()
+        return True
 
     def clear_all_contents(self):
         self.blockSignals(True)
@@ -3811,14 +5309,34 @@ class DataEditorTable(QTableWidget):
                     elif isinstance(w, (QLineEdit, MultiLineTextEdit)):
                         # [修复] 处理复合单元格（open_url/clear_input_plus）的拖放
                         if "|" in f_path:
-                            parts = f_path.split("|", 1)
+                            # open_url 格式为 url|profile|mode，必须拆全段，不能用 split("|",1)
+                            parts = f_path.split("|")
                             w.setText(parts[0])
-                            # [修复] 同步更新 open_url 的 profile_id 按鈕属性，防止账号脱黄
+                            # [修复] 同步更新 open_url 的 profile_id 按钮属性，防止账号错位
                             if widget:
                                 btn = widget.findChild(QPushButton)
+                                cb_mode_w = widget.findChild(QComboBox, "open_url_mode")
                                 if btn and "profile_id" in btn.dynamicPropertyNames():
-                                    btn.setProperty("profile_id", parts[1])
-                                    btn.setText(get_profile_display_name(parts[1]))
+                                    # 第二段才是 profile_id，不能把第三段 mode 混入
+                                    p_id = parts[1] if len(parts) > 1 else ""
+                                    if p_id == OPEN_URL_HANDLE_FILE_TOKEN:
+                                        p_id = ""
+                                    btn.setProperty("profile_id", p_id)
+                                    btn.setText(get_profile_ui_label(p_id))
+                                # 同步第三段 mode 到下拉框
+                                if cb_mode_w and len(parts) > 2:
+                                    _mode_val = parts[2].strip().lower()
+                                    if _mode_val in ("activate_from_file", "activate_file", "handle_file", "read_by_profile"):
+                                        _mode_data = "read_by_profile"
+                                    elif _mode_val in ("close_by_profile", "close_profile", "close_account", "close_window_by_profile"):
+                                        _mode_data = "close_by_profile"
+                                    else:
+                                        _mode_data = "independent"
+                                    _mode_idx = cb_mode_w.findData(_mode_data)
+                                    if _mode_idx >= 0:
+                                        cb_mode_w.blockSignals(True)
+                                        cb_mode_w.setCurrentIndex(_mode_idx)
+                                        cb_mode_w.blockSignals(False)
                         else:
                             w.setText(f_path)
                 else:
@@ -3883,7 +5401,21 @@ class DataEditorTable(QTableWidget):
                     if isinstance(w, QComboBox):
                         cells.append(w.currentText())
                     elif isinstance(w, (QLineEdit, MultiLineTextEdit)):
-                        cells.append(w.text())
+                        # [修复] open_url 单元格需要复制完整的 url|profile|mode 三段值
+                        # 否则粘贴时只有网址，账号和模式丢失
+                        cb_mode_w = widget.findChild(QComboBox, "open_url_mode") if widget else None
+                        btn_w = widget.findChild(QPushButton) if widget else None
+                        if cb_mode_w is not None and btn_w is not None and "profile_id" in btn_w.dynamicPropertyNames():
+                            # 这是 open_url 单元格，复制完整三段
+                            url_text = w.text()
+                            p_id = btn_w.property("profile_id") or ""
+                            if p_id == OPEN_URL_HANDLE_FILE_TOKEN:
+                                p_id = ""
+                            p_id = to_shared_profile_reference(p_id)
+                            mode_data = cb_mode_w.currentData() or "independent"
+                            cells.append(f"{url_text}|{p_id}|{mode_data}")
+                        else:
+                            cells.append(w.text())
                     else:
                         cells.append("")
                 else:
@@ -3932,15 +5464,31 @@ class DataEditorTable(QTableWidget):
                     # [修复] 智能粘贴：针对复合单元格（open_url / clear_input_plus）进行特殊处理
                     # 如果粘贴的内容包含 |，说明是完整数据格式，需要拆分更新 UI
                     if isinstance(w, (QLineEdit, MultiLineTextEdit)) and "|" in col_text and widget:
-                        parts = col_text.split("|", 1)
+                        # open_url 格式为 url|profile|mode，必须拆全段，不能用 split("|",1)
+                        parts = col_text.split("|")
                         btn = widget.findChild(QPushButton)
                         lbl = widget.findChild(QLabel)
+                        cb_mode_w = widget.findChild(QComboBox, "open_url_mode")
                         if btn and "profile_id" in btn.dynamicPropertyNames():
-                            w.setText(parts[0]) # open_url 的网址
-                            btn.setProperty("profile_id", parts[1])
-                            btn.setText(get_profile_display_name(parts[1]))
+                            w.setText(parts[0])  # open_url 的网址
+                            # 第二段才是 profile_id，不能把第三段 mode 混入
+                            p_id = parts[1] if len(parts) > 1 else ""
+                            if p_id == OPEN_URL_HANDLE_FILE_TOKEN:
+                                p_id = ""
+                            btn.setProperty("profile_id", p_id)
+                            btn.setText(get_profile_ui_label(p_id))
+                            # 同步第三段 mode 到下拉框
+                            if cb_mode_w and len(parts) > 2:
+                                _mode_val = parts[2].strip().lower()
+                                _mode_data = "read_by_profile" if _mode_val in ("activate_from_file", "activate_file", "handle_file", "read_by_profile") else "independent"
+                                _mode_idx = cb_mode_w.findData(_mode_data)
+                                if _mode_idx >= 0:
+                                    cb_mode_w.blockSignals(True)
+                                    cb_mode_w.setCurrentIndex(_mode_idx)
+                                    cb_mode_w.blockSignals(False)
                         elif lbl:
-                            w.setText(parts[1]) # clear_input_plus 的内容
+                            # clear_input_plus: 第一段是前缀，第二段是内容
+                            w.setText(parts[1] if len(parts) > 1 else "")  # clear_input_plus 的内容
                             lbl.setText(f" {parts[0]}")
                         else:
                             w.setText(col_text)
@@ -4653,6 +6201,7 @@ class FloatingProgressWindow(QWidget):
     request_skip_step  = pyqtSignal()   # 跳过当前步骤，执行下一步
     request_next_row   = pyqtSignal()   # 放弃当前行剩余步骤，跳到下一行
     request_retry_step = pyqtSignal()   # 重试当前步骤
+    request_close      = pyqtSignal()   # 仅在执行终态关闭悬浮窗
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4784,6 +6333,18 @@ class FloatingProgressWindow(QWidget):
         aux_row.addWidget(self.btn_collapse)
 
         aux_row.addStretch()
+        self.btn_close = QPushButton("✕ 关闭窗口")
+        self.btn_close.setFixedHeight(20)
+        self.btn_close.setStyleSheet(
+            "QPushButton { color: white; border-radius: 3px; font-size: 10px; font-weight: bold; "
+            "padding: 1px 8px; background-color: #616161; border: 1px solid #888; } "
+            "QPushButton:hover:enabled { background-color: #424242; } "
+            "QPushButton:disabled { color: #888; background-color: #353535; border-color: #4a4a4a; }"
+        )
+        self.btn_close.setToolTip("任务执行中不可关闭；任务完成、失败或停止后可关闭此悬浮窗")
+        self.btn_close.setEnabled(False)
+        self.btn_close.clicked.connect(self.request_close.emit)
+        aux_row.addWidget(self.btn_close)
         container_layout.addLayout(aux_row)
 
         # --- 第六行：微型滚动日志区 ---
@@ -4808,7 +6369,7 @@ class FloatingProgressWindow(QWidget):
         self._interactive_widgets = (
             self.btn_pause, self.btn_skip_step, self.btn_next_row,
             self.btn_retry, self.btn_stop, self.btn_copy_log,
-            self.btn_pin, self.btn_collapse, self.log_area
+            self.btn_pin, self.btn_collapse, self.btn_close, self.log_area
         )
         for widget in self._interactive_widgets:
             widget.installEventFilter(self)
@@ -4822,6 +6383,15 @@ class FloatingProgressWindow(QWidget):
 
         self._dragging = False
         self._drag_pos = QPoint()
+
+    def set_execution_active(self, active):
+        """执行中锁定关闭按钮；仅终态允许用户隐藏该悬浮窗。"""
+        active = bool(active)
+        self.btn_close.setEnabled(not active)
+        self.btn_close.setToolTip(
+            "任务正在执行，不能关闭悬浮窗" if active
+            else "关闭本悬浮执行窗口（不会影响已完成的任务结果）"
+        )
 
     def _move_to_top_center(self, top_margin=20):
         """把悬浮窗放到当前主屏幕的上方正中央。"""
@@ -4964,6 +6534,109 @@ class FloatingProgressWindow(QWidget):
             self.adjustSize()
         self._move_to_top_center()
 
+# --- Isolated worker protocol ---
+WORKER_PREFIX = "@@SIMUOPS_WORKER@@"
+
+class WorkerEventBridge(QObject):
+    """Thread-safe ingress for events read from a child process pipe."""
+    event_sig = pyqtSignal(object)
+
+class WorkerEngineProxy:
+    """GUI-side engine facade. It never performs automation; it only sends control JSON to the child."""
+    def __init__(self, process, actions, data_list, send_command):
+        self.process = process
+        self.actions = actions
+        self.data_list = data_list
+        self._send_command = send_command
+        self._final_status = "running"
+        self._last_error = ""
+        self._last_percent = 0
+        self._cur_l = self._cur_t = self._cur_s = 0
+        self._paused = False
+    def isRunning(self):
+        return bool(self.process and self.process.poll() is None)
+    def stop(self):
+        self._paused = False
+        self._send_command("stop")
+    def pause(self):
+        self._paused = True
+        self._send_command("pause")
+    def resume(self):
+        self._paused = False
+        self._send_command("resume")
+    def skip_step(self): self._send_command("skip_step")
+    def next_row(self): self._send_command("next_row")
+    def retry_step(self): self._send_command("retry_step")
+
+
+def _worker_write_event(kind, payload=None):
+    try:
+        msg = {"kind": str(kind), "payload": payload}
+        sys.stdout.write(WORKER_PREFIX + json.dumps(msg, ensure_ascii=False, default=str) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _simuops_worker_main(job_path):
+    """Run AutoEngine in this same .pyw process. No QWidget or QApplication is created here."""
+    try:
+        # Windows 子进程默认常随系统代码页输出；父进程管道按 UTF-8 读取，必须在 worker 端统一编码。
+        for _stream in (sys.stdout, sys.stdin, sys.stderr):
+            try:
+                if hasattr(_stream, "reconfigure"):
+                    _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+            except Exception:
+                pass
+        with open(job_path, "r", encoding="utf-8") as f:
+            job = json.load(f)
+        engine = AutoEngine(
+            job.get("actions", []), job.get("data_list", [{}]), job.get("loop_delay", 0),
+            job.get("start_t", 0), job.get("start_s", 0), job.get("loops", 1), job.get("start_l", 0),
+            retry_count=job.get("retry_count", 0), on_error=job.get("on_error", "stop"),
+            dry_run=job.get("dry_run", False), ignore_data=job.get("ignore_data", False),
+            standardize_window=job.get("standardize_window", False), batch_options=job.get("batch_options", {}),
+        )
+        engine._task_name = str(job.get("task_name", ""))
+        engine._task_id = str(job.get("task_id", engine._task_name))
+
+        def bind(signal, kind):
+            signal.connect(lambda *args, _kind=kind: _worker_write_event(_kind, list(args)), Qt.DirectConnection)
+        bind(engine.log_sig, "log")
+        bind(engine.prog_sig, "progress")
+        bind(engine.pause_sig, "pause")
+        bind(engine.row_status_sig, "row_status")
+        bind(engine.highlight_sig, "highlight")
+        bind(engine.hotkey_paused_sig, "hotkey_paused")
+        bind(engine.detail_sig, "detail")
+        bind(engine.deferred_queue_sig, "deferred")
+        bind(engine.runtime_status_sig, "runtime")
+        bind(engine.row_result_sig, "row_result")
+
+        def controls():
+            for line in sys.stdin:
+                try:
+                    command = json.loads(line).get("command", "")
+                    method = getattr(engine, command, None)
+                    if callable(method):
+                        method()
+                        _worker_write_event("control_ack", command)
+                except Exception:
+                    continue
+        threading.Thread(target=controls, name="SimuOpsWorkerControl", daemon=True).start()
+        _worker_write_event("worker_started", {"pid": os.getpid(), "task": engine._task_name})
+        # Deliberately call run() directly: this is already an independent OS process.
+        engine.run()
+        _worker_write_event("done", {
+            "status": engine._final_status, "last_error": engine._last_error,
+            "last_percent": engine._last_percent, "cur_l": engine._cur_l,
+            "cur_t": engine._cur_t, "cur_s": engine._cur_s,
+        })
+        return 0
+    except Exception as exc:
+        _worker_write_event("done", {"status": "failed", "last_error": f"Worker启动/运行异常: {type(exc).__name__}: {exc}", "last_percent": 0})
+        return 1
+
 # --- Engine ---
 # Row status constants
 ROW_STATUS_OK    = "✅"
@@ -4985,11 +6658,14 @@ class AutoEngine(QThread):
     hotkey_paused_sig = pyqtSignal(int, int, int)
     detail_sig        = pyqtSignal(str) # [新增] 详细描述信号（用于 OSD 倒计时等）
     deferred_queue_sig = pyqtSignal(object)
+    # 逐行/逐步状态：供主窗口与 OSD 在排程运行中显示当前真实执行位置。
+    runtime_status_sig = pyqtSignal(object)
     # (dict) per-row structured result, used for failure aggregation / window extraction in UI.
     row_result_sig = pyqtSignal(object)
 
     def __init__(self, actions, data_list, loop_delay, start_t=0, start_s=0, loops=1, start_l=0,
-                 retry_count=0, on_error="stop", dry_run=False, ignore_data=False, standardize_window=False):
+                 retry_count=0, on_error="stop", dry_run=False, ignore_data=False, standardize_window=False,
+                 batch_options=None):
         super().__init__()
         self.actions     = actions
         self.data_list   = data_list if data_list else [{}]
@@ -5023,6 +6699,781 @@ class AutoEngine(QThread):
         self._defer_seq = 0
         self._row_fail_ctx = None  # per-row failure context snapshot
         self._row_runtime_ctx = None  # per-row runtime context snapshot (for successful rows too)
+        # 低配分批模式：仅对带“单独打开并记录”网址步骤的批量任务生效。
+        # 每轮以“预开 → 业务执行 → 统一收尾”的顺序复用已打开窗口，避免逐账号重复冷启动。
+        raw_batch_options = batch_options if isinstance(batch_options, dict) else {}
+        # “稳定等待”只用于低配分批预开下一项的浏览器窗口，不能因历史设置为 120 秒
+        # 而在“关闭模式 → 下一独立任务”之间看起来无提示卡死。运行时统一限制为 8 秒。
+        try:
+            _requested_batch_settle_seconds = max(0.0, float(raw_batch_options.get("settle_seconds", 8.0) or 0.0))
+        except Exception:
+            _requested_batch_settle_seconds = 8.0
+        self._requested_batch_settle_seconds = _requested_batch_settle_seconds
+        self._batch_settle_seconds_capped = _requested_batch_settle_seconds > 8.0
+        self.batch_options = {
+            "enabled": bool(raw_batch_options.get("enabled", False)),
+            "batch_size": max(1, int(raw_batch_options.get("batch_size", 30) or 30)),
+            "wave_size": max(1, int(raw_batch_options.get("wave_size", 10) or 10)),
+            "wave_interval": max(0.0, float(raw_batch_options.get("wave_interval", 2.0) or 0.0)),
+            "settle_seconds": min(8.0, _requested_batch_settle_seconds),
+            "close_batch_windows": bool(raw_batch_options.get("close_batch_windows", True)),
+        }
+        self._batch_preopen_phase = False
+        self._batch_defer_close_steps = False
+        self._batch_window_detect_timeout = 8.0
+        self._batch_opened_windows = {}
+        self._batch_opened_pids = {}
+        self._batch_opened_profiles = set()
+        self._batch_handle_record_threads = []
+        self._batch_window_bind_lock = threading.Lock()
+        # (数据行索引, 步骤索引)：已在并发预开阶段实际完成的首个“打开网址”步骤。
+        self._batch_precompleted_open_steps = set()
+        # 与上述步骤键对应的账号/Profile；正式流程跳过时据此激活正确窗口。
+        self._batch_precompleted_open_profiles = {}
+        self._batch_precompleted_open_steps_lock = threading.Lock()
+        # 本批中未能严格绑定唯一新窗口的行。该行必须跳过，但不能停止其他已绑定账号。
+        self._batch_preopen_failed_rows = {}
+        # 行级窗口上下文：预开阶段把“数据行 → Profile → 浏览器句柄”固定下来。
+        # 正式业务步骤在执行前均从该上下文恢复前台窗口，禁止沿用上一行账户的焦点。
+        self._batch_row_window_targets = {}
+
+    def _record_independent_open_url_window(self, before_handles, profile, batch_preopen=False, launched_pid=0):
+        """捕获并绑定浏览器窗口；优先按本次启动 PID，不要求再靠 Profile 名称反查。"""
+        timeout = self._batch_window_detect_timeout if batch_preopen else 12.0
+        deadline = time.time() + timeout
+        hwnd = None
+        launched_pid = int(launched_pid or 0)
+
+        # 先按“刚刚启动的浏览器进程 PID”找窗口。这是本次打开动作唯一、直接的关联，
+        # 可避免多个账号并发时 WMIC/Profile 参数暂未就绪而造成的捕获失败或串号。
+        while time.time() < deadline:
+            if launched_pid:
+                hwnd = _find_browser_window_handle_by_pid(launched_pid)
+                if hwnd:
+                    break
+            elif not batch_preopen:
+                hwnd = _wait_for_new_browser_window_handle(before_handles, timeout=0.4)
+                if hwnd:
+                    break
+            else:
+                # 无 PID 的旧启动路径才退回到 Profile 精确匹配，绝不使用窗口标题猜测。
+                try:
+                    hwnd = find_browser_window_hwnd_by_profile_exact(profile)
+                except Exception:
+                    hwnd = None
+                if hwnd:
+                    break
+            time.sleep(0.15)
+
+        # PID/进程树只能提供候选，最终必须以真实 Profile 启动参数确认归属。
+        if hwnd and not _browser_window_matches_profile_exact(hwnd, profile):
+            self.log_sig.emit("⚠️ 捕获到的浏览器窗口未通过 Profile 精确校验，已拒绝该 PID 候选", "orange")
+            hwnd = None
+
+        # Chrome 启动器 PID 可能与最终窗口 owner PID 不同；此时仅从“本次新增窗口”中做严格 Profile 匹配。
+        if not hwnd:
+            strict_new_matches = [
+                int(candidate) for candidate in (_list_browser_window_handles() - set(before_handles or set()))
+                if _browser_window_matches_profile_exact(candidate, profile)
+            ]
+            if len(strict_new_matches) == 1:
+                hwnd = strict_new_matches[0]
+            elif len(strict_new_matches) > 1:
+                self.log_sig.emit("⚠️ 本次新增窗口中出现多个同 Profile 候选，已拒绝猜测绑定", "orange")
+
+        if not hwnd:
+            self.log_sig.emit("⚠️ 已发起浏览器启动但未捕获到通过 Profile 精确校验的窗口，未写入句柄记录文件", "orange")
+            return None
+        entry = _record_open_url_window_handle(hwnd, profile)
+        if not entry:
+            self.log_sig.emit("⚠️ 已捕获浏览器窗口，但写入句柄记录文件失败", "orange")
+            return None
+
+        # 分批预开阶段立即回写“Profile → PID/hwnd”及全部同 Profile 数据行。
+        # 后续执行只使用这份首步骤直接建立的关联，不再按名称/路径重新打开或反查。
+        if batch_preopen:
+            with self._batch_window_bind_lock:
+                self._batch_opened_windows[profile] = int(hwnd)
+                if launched_pid:
+                    self._batch_opened_pids[profile] = launched_pid
+                for row_target in self._batch_row_window_targets.values():
+                    if str(row_target.get("profile", "") or "").strip() == str(profile or "").strip():
+                        if launched_pid:
+                            row_target["pid"] = launched_pid
+                        row_target["hwnd"] = int(hwnd)
+        source_text = f"启动 PID {launched_pid}" if launched_pid else "Profile 反查"
+        self.log_sig.emit(
+            f"🧧 已按{source_text}直接记录窗口 #{int(hwnd)}，账号 [{get_profile_display_name(profile)}] 已绑定到该窗口",
+            "green"
+        )
+        return entry
+
+    def _is_batch_mode_usable(self):
+        """仅当流程包含“单独打开并记录”的网址步骤时启用低配分批调度。"""
+        if not self.batch_options.get("enabled") or self.dry_run or self.ignore_data:
+            return False
+        for act in self.actions:
+            if CMD_MAP.get(act.get("action"), "click") != "open_url":
+                continue
+            raw = str(act.get("value", "") or "")
+            parts = [p.strip().lower() for p in raw.split("|")]
+            if len(parts) >= 3 and parts[2] in ("independent", "standalone", "record_handle"):
+                return True
+        return False
+
+    def _resolve_batch_step_value(self, act, data, l_idx, t_idx):
+        """按普通行执行的规则解析步骤值，供预开阶段识别账号与打开模式。"""
+        name = act.get("name", "Step")
+        val_raw = data.get(name, None)
+        if val_raw is None:
+            value = str(act.get("value", "") or "")
+        else:
+            value = str(val_raw)
+        row_vars = {
+            "日期": datetime.now().strftime("%Y-%m-%d"),
+            "时间": datetime.now().strftime("%H:%M:%S"),
+            "行号": f"{t_idx + 1:03d}",
+            "循环号": str(l_idx + 1),
+        }
+        for k, v in row_vars.items():
+            value = value.replace(f"{{{{{k}}}}}", v)
+        for k, v in data.items():
+            value = value.replace(f"{{{{{k}}}}}", str(v))
+        return value
+
+    def _get_independent_open_target(self, l_idx, t_idx):
+        """返回某行首个需预开的账号与步骤；重复账号在同一批内只预开一次。"""
+        if t_idx < 0 or t_idx >= len(self.data_list):
+            return None
+        data = self.data_list[t_idx]
+        if not self.ignore_data and not data.get("_选中", True):
+            return None
+        for step_index, act in enumerate(self.actions):
+            if not bool(act.get("enabled", True)):
+                continue
+            if CMD_MAP.get(act.get("action"), "click") != "open_url":
+                continue
+            name = act.get("name", "Step")
+            if data.get(f"{name}_跳过", False):
+                continue
+            raw_step_value = data.get(name, None)
+            # 与正式流程保持一致：当前步骤数据为空或标为跳过时，本行不参与预开。
+            if raw_step_value == "[SKIP_ROW]" or raw_step_value == "":
+                return None
+            value = self._resolve_batch_step_value(act, data, l_idx, t_idx)
+            parts = [p.strip() for p in str(value).split("|")]
+            step_parts = [p.strip() for p in str(act.get("value", "") or "").split("|")]
+            profile = parts[1] if len(parts) > 1 else ""
+            mode = parts[2].lower() if len(parts) > 2 else ""
+            if not profile and len(step_parts) > 1:
+                profile = step_parts[1]
+            if not mode and len(step_parts) > 2:
+                mode = step_parts[2].lower()
+            if mode in ("independent", "standalone", "record_handle") and profile:
+                return {
+                    "act": act,
+                    "data": data,
+                    "profile": profile,
+                    "value": value,
+                    "row_index": t_idx,
+                    "step_index": step_index,
+                }
+        return None
+
+    def _preopen_batch_windows_by_new_handles(self, l_idx, row_indexes):
+        """通过每次启动前后的新增窗口差值，建立“数据行 → hwnd”绑定，不使用 PID/Profile 反查。"""
+        self._batch_opened_windows = {}
+        self._batch_opened_pids = {}
+        self._batch_opened_profiles = set()
+        self._batch_handle_record_threads = []
+        self._batch_row_window_targets = {}
+        self._batch_preopen_failed_rows = {}
+        with self._batch_precompleted_open_steps_lock:
+            self._batch_precompleted_open_steps.clear()
+            self._batch_precompleted_open_profiles.clear()
+
+        targets = []
+        seen_profiles = set()
+        for t_idx in row_indexes:
+            target = self._get_independent_open_target(l_idx, t_idx)
+            if not target:
+                continue
+            profile = str(target.get("profile", "") or "").strip()
+            if not profile:
+                continue
+            self._batch_row_window_targets[int(t_idx)] = {
+                "profile": profile,
+                "pid": 0,
+                "hwnd": 0,
+                "open_step_index": int(target["step_index"]),
+                "next_step_index": int(target["step_index"]) + 1,
+            }
+            if profile not in seen_profiles:
+                seen_profiles.add(profile)
+                self._batch_opened_profiles.add(profile)
+                targets.append(target)
+
+        if not targets:
+            self.log_sig.emit("ℹ️ 当前批次没有可预开的账号，按普通流程执行", "gray")
+            return False
+
+        # Chrome 会让同一 User Data 下不同 Profile 共用 browser PID；并发启动后，
+        # 单靠窗口进程命令行无法把多个新 HWND 分回各自 Profile。故改为逐账号独占启动：
+        # 每次启动前取窗口快照，只有在稳定期内恰好出现一个新窗口才允许建立映射。
+        wave_size = 1
+        timeout = max(2.0, float(self._batch_window_detect_timeout))
+        self.log_sig.emit(
+            f"🛡️ 安全预开：本批 {len(targets)} 个账号将逐个启动并确认唯一新增窗口，确保不串号",
+            "blue",
+        )
+
+        self._batch_preopen_phase = True
+        try:
+            for start in range(0, len(targets), wave_size):
+                wave = targets[start:start + wave_size]
+                before_wave_handles = _list_browser_window_handles()
+                self.log_sig.emit(
+                    f"⚡ 正在安全启动并确认第 {start + 1}/{len(targets)} 个账号窗口",
+                    "gray",
+                )
+
+                # 第一阶段：本波只发出一个账号的启动命令；这样“唯一新增窗口”可作为
+                # Chrome 共享 browser PID 时的安全窗口级关联证据，而不是按 hwnd 排序猜测。
+                launchable_targets = []
+                for target in wave:
+                    if self._stop:
+                        return True
+                    profile = str(target["profile"] or "").strip()
+                    try:
+                        self._execute_step(target["act"], target["value"], "open_url", target["data"])
+                        launchable_targets.append(target)
+                    except Exception as e:
+                        target["bind_error"] = (
+                            f"第 {target['row_index'] + 1} 行账号 [{get_profile_display_name(profile)}] 首步骤启动失败: {e}"
+                        )
+
+                # 第二阶段：本程序刚刚独占启动一个账号。先检测新增前台窗口，
+                # 同时在完整超时内按 user-data-dir + profile-directory 精确确认窗口。
+                # 不能把“配置为 8 秒”缩短为 2.5 秒，否则慢启动的 Profile 会被误判为不存在。
+                confirm_timeout = timeout
+                self.log_sig.emit(
+                    f"⏳ 正在确认第 {start + 1}/{len(targets)} 个账号的新前台窗口（最多 {confirm_timeout:.1f}s）",
+                    "blue",
+                )
+                observed_handles = []
+                observed_set = set()
+                # 每次独占启动仅允许用“本次新增窗口”创建软件独立唯一码；不依据 Chrome 参数反查身份。
+                isolated_new_window_by_profile = {}
+                foreground_candidate = 0
+                foreground_seen_at = 0.0
+                single_window_seen_at = 0.0
+                profile_for_wave = str(launchable_targets[0]["profile"] or "").strip() if launchable_targets else ""
+                launch_pid = int(self._batch_opened_pids.get(profile_for_wave, 0) or 0)
+                pid_probe_attempts = 0
+                # 先给 Chrome 前台窗口信号足够时间，PID 进程树查询仅作为没有前台信号时的后备。
+                next_pid_probe_at = time.time() + 0.50
+                deadline = time.time() + confirm_timeout
+                while time.time() < deadline:
+                    if self._stop:
+                        return True
+
+                    current_handles = _list_browser_window_handles() - before_wave_handles
+                    for hwnd in sorted(current_handles - observed_set):
+                        observed_set.add(int(hwnd))
+                        observed_handles.append(int(hwnd))
+                    if len(observed_handles) == 1 and not single_window_seen_at:
+                        single_window_seen_at = time.time()
+                    elif len(observed_handles) != 1:
+                        single_window_seen_at = 0.0
+
+                    foreground_hwnd = 0
+                    try:
+                        foreground_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+                    except Exception:
+                        foreground_hwnd = 0
+                    if foreground_hwnd in observed_set and _is_browser_window_handle(foreground_hwnd):
+                        if foreground_candidate != foreground_hwnd:
+                            foreground_candidate = foreground_hwnd
+                            foreground_seen_at = time.time()
+                    else:
+                        foreground_candidate = 0
+                        foreground_seen_at = 0.0
+
+                    # 启动 PID 仅作为非阻塞的直接窗口证据；不再查询整个进程树，
+                    # 因为 WMIC 在账号多时会把短确认窗口放大成十几秒。
+                    # 候选不在本次新增集合即一律拒绝，因此不会把旧账号窗口认领给当前账号。
+                    if observed_set and not foreground_candidate and launch_pid and pid_probe_attempts < 1 and time.time() >= next_pid_probe_at:
+                        pid_probe_attempts += 1
+                        try:
+                            pid_candidate = int(find_hwnd_by_pid(launch_pid) or 0)
+                        except Exception:
+                            pid_candidate = 0
+                        if pid_candidate in observed_set and _is_browser_window_handle(pid_candidate):
+                            isolated_new_window_by_profile[profile_for_wave] = pid_candidate
+                            self.log_sig.emit(
+                                "🔐 已由本次启动 PID 直接确认新增窗口，按窗口级证据安全绑定",
+                                "gray",
+                            )
+                            break
+
+                    # 安全优先级 1：本次启动新增、且持续处于前台的浏览器窗口。
+                    # 这是由 Chrome 对刚启动窗口的直接行为建立的关联，不依赖 PID/句柄排序。
+                    if foreground_candidate and time.time() - foreground_seen_at >= 0.25:
+                        profile = profile_for_wave
+                        isolated_new_window_by_profile[profile] = foreground_candidate
+                        self.log_sig.emit(
+                            "🔐 已确认本次启动产生的新前台窗口，按窗口级证据安全绑定",
+                            "gray",
+                        )
+                        break
+
+                    # 安全优先级 2：前台焦点被系统短暂夺走时，允许唯一新增窗口稳定 0.6 秒后绑定。
+                    if (
+                        len(launchable_targets) == 1
+                        and len(observed_handles) == 1
+                        and single_window_seen_at
+                        and time.time() - single_window_seen_at >= 0.60
+                    ):
+                        profile = profile_for_wave
+                        isolated_new_window_by_profile[profile] = int(observed_handles[0])
+                        self.log_sig.emit(
+                            "🔐 本次独占启动后仅出现一个稳定的新浏览器窗口，按窗口级证据安全绑定",
+                            "gray",
+                        )
+                        break
+                    self._cooperative_sleep(0.08)
+
+                # 确认期结束后再读取本次启动前后的窗口差值。只有恰好一个新增窗口时，
+                # 才可为该独占启动创建软件独立唯一码；不读取 Chrome 启动参数，也不复用旧窗口。
+                final_new_handles = _list_browser_window_handles() - before_wave_handles
+                final_new_handles = {int(hwnd) for hwnd in final_new_handles if _is_browser_window_handle(hwnd)}
+                if len(final_new_handles) == 1 and not isolated_new_window_by_profile.get(profile_for_wave):
+                    hwnd = next(iter(final_new_handles))
+                    isolated_new_window_by_profile[profile_for_wave] = hwnd
+                    self.log_sig.emit(
+                        "🔐 确认期结束后捕获到唯一新增窗口，准备创建独立窗口唯一码",
+                        "gray",
+                    )
+
+                # [严禁猜测] 窗口出现/句柄排序顺序不等于启动命令顺序。
+                # 仅绑定本次独占启动后唯一新增的窗口，并为它创建独立窗口唯一码。
+                for target in launchable_targets:
+                    profile = str(target["profile"] or "").strip()
+                    profile_label = os.path.basename(os.path.normpath(profile)) or profile
+                    # 仅逐账号独占启动时可使用唯一新增窗口；绝不用于并发预开或旧窗口复用。
+                    hwnd = int(isolated_new_window_by_profile.get(profile, 0) or 0)
+                    binding_method = "isolated_new_window"
+                    if not hwnd:
+                        detail = f"未捕获唯一新增窗口（本次新增={len(final_new_handles)}）"
+                        target["bind_error"] = (
+                            f"第 {target['row_index'] + 1} 行账号 [{get_profile_display_name(profile)}] "
+                            f"{detail}，在 {timeout:.0f} 秒内无法创建独立窗口唯一码（系统已拒绝猜测）"
+                        )
+                        continue
+                    entry = _record_open_url_profile_handle(profile, hwnd, binding_method=binding_method)
+                    if not entry:
+                        target["bind_error"] = (
+                            f"第 {target['row_index'] + 1} 行账号 [{get_profile_display_name(profile)}] "
+                            "窗口已出现但句柄记录失败"
+                        )
+                        continue
+                    with self._batch_window_bind_lock:
+                        self._batch_opened_windows[profile] = hwnd
+                        for row_target in self._batch_row_window_targets.values():
+                            if str(row_target.get("profile", "") or "").strip() == profile:
+                                row_target["hwnd"] = hwnd
+                                row_target["pid"] = int(entry.get("pid", 0) or 0)
+                                row_target["binding_method"] = binding_method
+                    method_label = "独立窗口唯一码"
+                    self.log_sig.emit(
+                        f"🧧 [{method_label}绑定] 第 {target['row_index'] + 1} 行账号 [{profile_label}] → 窗口 #{hwnd}",
+                        "green",
+                    )
+
+                # 逐账号安全确认已完成窗口稳定；并发波次缓冲在此无需再等待。
+                if wave_size > 1 and start + wave_size < len(targets) and self.batch_options["wave_interval"] > 0:
+                    self._wait_with_countdown(self.batch_options["wave_interval"], "🌊 波次间缓冲")
+        finally:
+            self._batch_preopen_phase = False
+
+        failed_targets = [t for t in targets if t.get("bind_error")]
+        if failed_targets:
+            for target in failed_targets:
+                row_index = int(target.get("row_index", -1))
+                if row_index >= 0:
+                    self._batch_preopen_failed_rows[row_index] = str(target.get("bind_error", "预开绑定失败") or "预开绑定失败")
+            self.log_sig.emit(
+                "⚠️ 分批预开有账号未能创建唯一窗口唯一码：已只标记这些行跳过，"
+                "其他成功绑定账号将继续执行。",
+                "orange"
+            )
+            for target in failed_targets:
+                self.log_sig.emit(f"⏭️ {target.get('bind_error', '预开绑定失败')}", "orange")
+
+        bound_targets = [t for t in targets if not t.get("bind_error")]
+        with self._batch_precompleted_open_steps_lock:
+            for target in bound_targets:
+                completed_key = (target["row_index"], target["step_index"])
+                self._batch_precompleted_open_steps.add(completed_key)
+                self._batch_precompleted_open_profiles[completed_key] = target["profile"]
+
+        if self._batch_settle_seconds_capped:
+            self.log_sig.emit(
+                f"⚙️ 分批稳定等待原设置为 {int(self._requested_batch_settle_seconds)} 秒，"
+                "为避免排程长时间无响应，已自动限制为 8 秒。",
+                "orange"
+            )
+        if self.batch_options["settle_seconds"] > 0 and not self._stop:
+            self.log_sig.emit("⏳ 正在为下一任务预开窗口做短暂稳定确认…", "gray")
+            self._wait_with_countdown(self.batch_options["settle_seconds"], "⏳ 等待本批窗口稳定")
+        self.log_sig.emit(
+            f"✅ 预开完成：已按严格 Profile 或独占新增窗口绑定 {len(bound_targets)}/{len(targets)} 个账号；已绑定账号将从第 2 步开始执行",
+            "green",
+        )
+        return True
+
+    def _preopen_batch_windows(self, l_idx, row_indexes):
+        """低配分批入口：使用新增窗口差值绑定，保留旧实现仅作不可达兼容代码。"""
+        return self._preopen_batch_windows_by_new_handles(l_idx, row_indexes)
+
+        self._batch_opened_windows = {}
+        self._batch_opened_pids = {}
+        self._batch_opened_profiles = set()
+        self._batch_handle_record_threads = []
+        self._batch_row_window_targets = {}
+        with self._batch_precompleted_open_steps_lock:
+            self._batch_precompleted_open_steps.clear()
+            self._batch_precompleted_open_profiles.clear()
+        targets = []
+        for t_idx in row_indexes:
+            target = self._get_independent_open_target(l_idx, t_idx)
+            if not target:
+                continue
+            profile = str(target["profile"] or "").strip()
+            if not profile:
+                continue
+            # 无论账号是否与其他行重复，都要把该行绑定到它应使用的 Profile。
+            # 只有浏览器启动命令去重，正式业务步骤仍按“行 → 账号”精确切换。
+            self._batch_row_window_targets[int(t_idx)] = {
+                "profile": profile,
+                "pid": 0,
+                "hwnd": 0,
+                "open_step_index": int(target["step_index"]),
+                "next_step_index": int(target["step_index"]) + 1,
+            }
+            if profile not in self._batch_opened_profiles:
+                self._batch_opened_profiles.add(profile)
+                targets.append(target)
+
+        if not targets:
+            self.log_sig.emit("ℹ️ 当前批次没有可预开的账号，按普通流程执行", "gray")
+            return False
+
+        wave_size = min(self.batch_options["wave_size"], max(1, len(targets)))
+        self.log_sig.emit(
+            f"🚀 并发预开阶段：本批 {len(targets)} 个账号，每波同时实际打开 {wave_size} 个网址；正式流程将从后续步骤开始",
+            "blue"
+        )
+
+        def _launch_preopen_target(target):
+            """并发提交首个打开网址命令；不在此处标记步骤完成。"""
+            if self._stop:
+                return
+            profile = target["profile"]
+            try:
+                # 第一阶段只负责启动浏览器并登记 PID；窗口捕获与“首步骤完成”
+                # 均由本批所有启动命令提交完毕后的统一绑定阶段负责。
+                self._execute_step(target["act"], target["value"], "open_url", target["data"])
+                self.log_sig.emit(
+                    f"🚀 已提交第 {target['row_index'] + 1} 行账号 [{get_profile_display_name(profile)}] 的首步骤启动命令，等待 PID 窗口绑定",
+                    "green"
+                )
+            except Exception as e:
+                target["launch_error"] = (
+                    f"第 {target['row_index'] + 1} 行账号 [{get_profile_display_name(profile)}] 的首步骤启动失败: {e}"
+                )
+                self.log_sig.emit(f"❌ {target['launch_error']}", "red")
+
+        self._batch_preopen_phase = True
+        try:
+            for start in range(0, len(targets), wave_size):
+                if self._stop:
+                    return bool(targets)
+                wave = targets[start:start + wave_size]
+                self.log_sig.emit(
+                    f"🌊 正在并发预开第 {start + 1}-{start + len(wave)} 个账号窗口（同时发起启动命令）",
+                    "gray"
+                )
+                launch_threads = []
+                for target in wave:
+                    if self._stop:
+                        return bool(targets)
+                    launch_thread = threading.Thread(
+                        target=_launch_preopen_target,
+                        args=(target,),
+                        daemon=True,
+                        name=f"BatchPreopen-{get_profile_display_name(target['profile'])}"
+                    )
+                    launch_threads.append(launch_thread)
+                    launch_thread.start()
+
+                # 等待本波所有线程完成“提交启动命令”的轻量阶段；窗口渲染与句柄探测仍在后台进行。
+                for launch_thread in launch_threads:
+                    while launch_thread.is_alive():
+                        if self._stop:
+                            return bool(targets)
+                        launch_thread.join(timeout=0.05)
+
+                # 逐账号安全确认已完成窗口稳定；并发波次缓冲在此无需再等待。
+                if wave_size > 1 and start + wave_size < len(targets) and self.batch_options["wave_interval"] > 0:
+                    self._wait_with_countdown(self.batch_options["wave_interval"], "🌊 波次间缓冲")
+        finally:
+            self._batch_preopen_phase = False
+
+        # 首步骤启动命令全部提交后，再统一按“首步骤实际启动 PID”捕获各自窗口。
+        # 此处是硬关卡：任一 PID 未绑定到窗口，就不允许进入任何一行的第 2 步，更不会重开首步骤。
+        launch_errors = [str(t.get("launch_error", "") or "") for t in targets if t.get("launch_error")]
+        if launch_errors:
+            message = "分批预开启动失败：" + "；".join(launch_errors)
+            self._last_error = message
+            self._stop_reason = "failed"
+            self._stop = True
+            self.log_sig.emit(f"❌ {message}", "red")
+            return True
+
+        bind_threads = []
+
+        def _bind_target_window(target):
+            profile = str(target.get("profile", "") or "").strip()
+            pid = 0
+            try:
+                pid = int(self._batch_opened_pids.get(profile, 0) or 0)
+            except Exception:
+                pid = 0
+            if not pid:
+                target["bind_error"] = (
+                    f"第 {target['row_index'] + 1} 行账号 [{get_profile_display_name(profile)}] 未取得首步骤启动 PID"
+                )
+                return
+            entry = self._record_independent_open_url_window(
+                set(), profile, batch_preopen=True, launched_pid=pid
+            )
+            if not entry:
+                target["bind_error"] = (
+                    f"第 {target['row_index'] + 1} 行账号 [{get_profile_display_name(profile)}] "
+                    f"的启动 PID {pid} 在 {self._batch_window_detect_timeout:.0f}s 内未产生可用浏览器窗口"
+                )
+
+        self.log_sig.emit("🔗 所有首步骤启动命令已提交，正在统一等待 PID 对应窗口就绪", "blue")
+        for target in targets:
+            thread = threading.Thread(
+                target=_bind_target_window,
+                args=(target,),
+                daemon=True,
+                name=f"BatchBindPID-{target['row_index'] + 1}",
+            )
+            bind_threads.append(thread)
+            thread.start()
+        for thread in bind_threads:
+            while thread.is_alive():
+                if self._stop:
+                    return False
+                thread.join(timeout=0.05)
+
+        bind_errors = [str(t.get("bind_error", "") or "") for t in targets if t.get("bind_error")]
+        if bind_errors:
+            message = "分批预开窗口绑定失败：" + "；".join(bind_errors)
+            self._last_error = message
+            self._stop_reason = "failed"
+            self._stop = True
+            self.log_sig.emit(f"❌ {message}", "red")
+            return True
+
+        # 仅在 PID → hwnd 已成功绑定后，才把第一步标记为已完成。
+        # _run_row 因此会从该行首步骤的下一步开始，绝不会再次执行“打开网址”。
+        with self._batch_precompleted_open_steps_lock:
+            for target in targets:
+                completed_key = (target["row_index"], target["step_index"])
+                self._batch_precompleted_open_steps.add(completed_key)
+                self._batch_precompleted_open_profiles[completed_key] = target["profile"]
+
+        if self.batch_options["settle_seconds"] > 0 and not self._stop:
+            self._wait_with_countdown(self.batch_options["settle_seconds"], "⏳ 等待本批窗口稳定")
+        ready_count = len(self._batch_opened_windows)
+        self.log_sig.emit(
+            f"✅ 预开完成：已按 PID 绑定 {ready_count}/{len(targets)} 个账号窗口；逐行将从第 2 步开始执行",
+            "green"
+        )
+        return True
+
+    def _resolve_batch_row_window(self, row_index):
+        """直接返回预开阶段按新增窗口差值绑定的 hwnd；不执行任何二次查找。"""
+        row_target = self._batch_row_window_targets.get(int(row_index))
+        if not isinstance(row_target, dict):
+            return "", 0
+        profile = str(row_target.get("profile", "") or "").strip()
+        if not profile:
+            return "", 0
+
+        candidates = []
+        try:
+            candidates.append(int(row_target.get("hwnd", 0) or 0))
+        except Exception:
+            pass
+        try:
+            candidates.append(int(self._batch_opened_windows.get(profile, 0) or 0))
+        except Exception:
+            pass
+        seen = set()
+        for hwnd in candidates:
+            if not hwnd or hwnd in seen:
+                continue
+            seen.add(hwnd)
+            if not _is_browser_window_handle(hwnd):
+                continue
+            binding_method = str(row_target.get("binding_method", "") or "")
+            if binding_method == "isolated_new_window":
+                # 热路径只复核 HWND 的 owner PID，避免共享 Chrome PID 场景反复 WMIC 查询。
+                try:
+                    owner = wintypes.DWORD()
+                    ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(owner))
+                    exact_match = int(owner.value or 0) == int(row_target.get("pid", 0) or 0)
+                except Exception:
+                    exact_match = False
+            else:
+                exact_match = _browser_window_matches_profile_exact(hwnd, profile)
+            if not exact_match:
+                # 当多个 Profile 共用一个 Chrome browser PID 时，命令行无法表达窗口级 Profile。
+                # 此时仅接受刚才预开阶段以“独占启动 + 唯一新增窗口”写入的持久化映射。
+                try:
+                    recorded_hwnd = int(_get_open_url_profile_handle(profile) or 0)
+                except Exception:
+                    recorded_hwnd = 0
+                exact_match = (recorded_hwnd == int(hwnd))
+            if exact_match:
+                row_target["hwnd"] = int(hwnd)
+                self._batch_opened_windows[profile] = int(hwnd)
+                return profile, int(hwnd)
+
+        # 已绑定窗口失效时立刻失败；绝不退回名称、PID 或 Profile 查找，避免串号或额外启动。
+        return profile, 0
+
+    def _standardize_batch_window_to_primary(self, hwnd):
+        """标准化完成并验证后才放行鼠标动作；任何未完成状态均明确失败。"""
+        if self.dry_run or not self.standardize_window or sys.platform != "win32":
+            return True
+        try:
+            hwnd = int(hwnd)
+            user32 = ctypes.windll.user32
+            if not user32.IsWindow(hwnd):
+                live_runtime_diagnostic(f"标准化拒绝：窗口已失效 hwnd={hwnd}")
+                return False
+            primary_width = max(1, int(user32.GetSystemMetrics(0) or 0))
+            primary_height = max(1, int(user32.GetSystemMetrics(1) or 0))
+            live_runtime_diagnostic(f"标准化开始 hwnd={hwnd} primary={primary_width}x{primary_height}")
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)
+            # 异步移动不会阻塞工作线程；随后持续检查最大化与前台状态，未完成就不放行。
+            user32.SetWindowPos(
+                hwnd, 0, 0, 0, primary_width, primary_height,
+                0x0004 | 0x0040 | 0x4000,  # NOZORDER | SHOWWINDOW | ASYNCWINDOWPOS
+            )
+            user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+            deadline = time.monotonic() + 1.50
+            while time.monotonic() < deadline:
+                foreground_ok = int(user32.GetForegroundWindow() or 0) == hwnd
+                maximized_ok = bool(user32.IsZoomed(hwnd))
+                if foreground_ok and maximized_ok:
+                    live_runtime_diagnostic(f"标准化确认 hwnd={hwnd} foreground=1 maximized=1")
+                    return True
+                force_activate_window_quick(hwnd, timeout=0.18)
+                time.sleep(0.05)
+            foreground = int(user32.GetForegroundWindow() or 0)
+            maximized = bool(user32.IsZoomed(hwnd))
+            live_runtime_diagnostic(
+                f"标准化超时 hwnd={hwnd} foreground={foreground} maximized={int(maximized)}；已阻止后续鼠标动作"
+            )
+            return False
+        except Exception as e:
+            live_runtime_diagnostic(f"标准化异常 hwnd={hwnd}: {type(e).__name__}: {e}")
+            log_internal_issue(f"分批窗口移至主显示器失败: hwnd={hwnd}", e)
+            return False
+
+    def _activate_batch_row_window(self, row_index, reason, required=True):
+        """在业务步骤前以非阻塞方式切回该行 Profile 窗口，并记录每个阶段。"""
+        live_runtime_diagnostic(f"行 {int(row_index) + 1}：开始解析已预开窗口")
+        self.log_sig.emit(f"🔎 [分批切换诊断] 第 {int(row_index) + 1} 行：开始解析已预开窗口", "gray")
+        profile, hwnd = self._resolve_batch_row_window(row_index)
+        if not profile:
+            return True
+        if not hwnd:
+            message = (
+                f"未找到第 {int(row_index) + 1} 行账号 "
+                f"[{get_profile_display_name(profile)}] 的可用预开窗口"
+            )
+            if required:
+                raise RuntimeError(message)
+            self.log_sig.emit(f"⚠️ {message}", "orange")
+            return False
+
+        live_runtime_diagnostic(f"行 {int(row_index) + 1}：开始快速激活窗口 hwnd={hwnd}")
+        self.log_sig.emit(f"🔎 [分批切换诊断] 第 {int(row_index) + 1} 行：快速激活窗口 #{hwnd}", "gray")
+        if not force_activate_window_quick(hwnd, timeout=0.55):
+            message = (
+                f"未能在 0.55 秒内将第 {int(row_index) + 1} 行账号 "
+                f"[{get_profile_display_name(profile)}] 的窗口 #{hwnd} 置为前台"
+            )
+            if required:
+                raise RuntimeError(message)
+            self.log_sig.emit(f"⚠️ {message}", "orange")
+            return False
+
+        live_runtime_diagnostic(f"行 {int(row_index) + 1}：开始标准化窗口 hwnd={hwnd}")
+        self.log_sig.emit(f"🔎 [分批切换诊断] 第 {int(row_index) + 1} 行：标准化窗口 #{hwnd}", "gray")
+        if not self._standardize_batch_window_to_primary(hwnd):
+            message = f"未能将第 {int(row_index) + 1} 行窗口 #{hwnd} 移至主显示器并最大化"
+            if required:
+                raise RuntimeError(message)
+            self.log_sig.emit(f"⚠️ {message}", "orange")
+            return False
+
+        self._cooperative_sleep(0.05)
+        profile_label = os.path.basename(os.path.normpath(str(profile))) or str(profile)
+        self.log_sig.emit(
+            f"🎯 [分批账号切换] 第 {int(row_index) + 1} 行 → "
+            f"{profile_label}（窗口 #{hwnd}，已移至主显示器并最大化），{reason}",
+            "green"
+        )
+        return True
+
+    def _close_batch_windows(self):
+        """只关闭本批实际预开的窗口，不影响用户原先已打开的其他浏览器。"""
+        if not self.batch_options.get("close_batch_windows", True):
+            self.log_sig.emit("ℹ️ 本批窗口保留打开（已关闭自动收尾）", "gray")
+            return
+        closed = 0
+        # 收尾前按本批首步骤记录的 PID 补查窗口，不再按 Profile 名称重新猜测。
+        for profile in list(self._batch_opened_profiles):
+            if profile not in self._batch_opened_windows:
+                try:
+                    pid = int(self._batch_opened_pids.get(profile, 0) or 0)
+                    hwnd = _find_browser_window_handle_by_pid(pid) if pid else None
+                except Exception:
+                    hwnd = None
+                if hwnd:
+                    self._batch_opened_windows[profile] = int(hwnd)
+        for profile, hwnd in list(self._batch_opened_windows.items()):
+            try:
+                if _close_window_silently(hwnd):
+                    closed += 1
+                _remove_open_url_profile_handle(profile, hwnd)
+            except Exception as e:
+                log_internal_issue(f"批次收尾关闭窗口失败: {profile}", e)
+        self._batch_opened_windows = {}
+        self._batch_opened_pids = {}
+        self._batch_opened_profiles = set()
+        self._batch_row_window_targets = {}
+        self.log_sig.emit(f"🧹 本批收尾完成：已关闭 {closed} 个预开窗口", "green")
 
     def _extract_hwnd_from_value(self, v):
         """从类似 'xxx::hwnd=123' 的字符串中解析 hwnd。"""
@@ -5095,6 +7546,7 @@ class AutoEngine(QThread):
         self._stop_reason = "stopped"
         self._stop = True
         self._paused = False  # unblock spin if paused
+        self.log_sig.emit("🛑 收到用户停止请求，正在安全结束当前预开/步骤。", "orange")
 
     def pause(self):
         self._paused = True
@@ -5125,16 +7577,28 @@ class AutoEngine(QThread):
     def _cooperative_abort(self):
         """在长步骤中主动检查人工控制信号，让步骤尽快让出控制权。"""
         if self._stop:
-            raise ExecutionInterrupted("任务已停止")
+            if self._stop_reason == "failed":
+                raise ExecutionInterrupted("任务已因前置错误终止")
+            raise ExecutionInterrupted("任务已按用户停止请求终止")
         if self._next_row or self._skip_step or self._retry_step:
             raise ExecutionInterrupted("当前步骤已被人工控制打断")
 
     def _interruptible_sleep(self, seconds):
-        """Sleep in small increments so stop/pause can break out early."""
+        """分片等待：支持暂停、停止和人工控制，绝不向 time.sleep 传入负数。"""
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return
         if seconds <= 0:
             return
-        end = time.time() + float(seconds)
-        while time.time() < end:
+
+        end = time.time() + seconds
+        while True:
+            # 不能直接把 ``end - time.time()`` 传给 sleep：条件判断和调用之间可能
+            # 恰好越过截止时间，从而产生极小负数并触发 ValueError。
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
             if self._stop:
                 return
             if self._paused:
@@ -5142,8 +7606,10 @@ class AutoEngine(QThread):
                 self._spin_while_paused()
                 if self._stop:
                     return
-                end += time.time() - pause_started
-            time.sleep(min(0.05, end - time.time()))
+                # 暂停时间不计入原等待时长；max 防御系统时钟微小回拨。
+                end += max(0.0, time.time() - pause_started)
+                continue
+            time.sleep(min(0.05, remaining))
 
     def _cooperative_sleep(self, seconds):
         self._interruptible_sleep(seconds)
@@ -5360,6 +7826,7 @@ class AutoEngine(QThread):
         try:
             active_win = gw.getActiveWindow()
             if not active_win: return
+            _dismiss_restore_prompt_if_needed()
             self.log_sig.emit("📏 正在标准化窗口位置与大小...", "blue")
             self.detail_sig.emit("📏 标准化窗口中...")
             if active_win.isMaximized:
@@ -5532,6 +7999,19 @@ class AutoEngine(QThread):
             self.row_status_sig.emit(t_idx, ROW_STATUS_SKIP)
             return {"state": "skipped", "row_ok": True}
 
+        preopen_bind_error = str(getattr(self, "_batch_preopen_failed_rows", {}).get(int(t_idx), "") or "")
+        if preopen_bind_error:
+            self.log_sig.emit(
+                f"⏭️ 第 {t_idx+1}/{total} 组未取得唯一窗口唯一码，已跳过本行并继续其他账号：{preopen_bind_error}",
+                "orange"
+            )
+            self.runtime_status_sig.emit({
+                "kind": "row_skip", "loop": int(l_idx) + 1, "row": int(t_idx) + 1,
+                "total_rows": int(total), "step": 0, "total_steps": len(self.actions),
+                "step_name": "预开绑定失败", "detail": "未取得唯一窗口唯一码，已跳过本行"
+            })
+            return {"state": "failed", "row_ok": False}
+
         if resumed and resume_entry:
             waited = max(0.0, time.time() - float(resume_entry.get("due_at", time.time())))
             waited_text = self._format_time_display(int(waited)) if waited >= 1 else "已到时"
@@ -5541,6 +8021,11 @@ class AutoEngine(QThread):
             )
         else:
             self.log_sig.emit(f"--- 执行第 {t_idx+1}/{total} 组 ---", "blue")
+        self.runtime_status_sig.emit({
+            "kind": "row_start", "loop": int(l_idx) + 1, "row": int(t_idx) + 1,
+            "total_rows": int(total), "step": 0, "total_steps": len(self.actions),
+            "step_name": "准备执行", "detail": f"正在处理第 {t_idx + 1}/{total} 行"
+        })
 
         row_vars = {
             "日期": datetime.now().strftime("%Y-%m-%d"),
@@ -5591,12 +8076,94 @@ class AutoEngine(QThread):
 
             act = self.actions[s_idx]
             name = act.get('name', 'Step')
+            # [新增] 流程编排级别的“启用”开关：未勾选的步骤直接跳过（不改变步骤序号/数据列顺序）
+            if not bool(act.get("enabled", True)):
+                self.log_sig.emit(f"⏭️ 跳过步骤: [{name}] (流程编排未启用)", "gray")
+                s_idx += 1
+                continue
             if not self.ignore_data and data.get(f"{name}_跳过", False):
                 self.log_sig.emit(f"⏭️ 跳过步骤: [{name}] (开关已关闭)", "gray")
                 s_idx += 1
                 continue
 
             act_type = CMD_MAP.get(act.get('action'), "click")
+            live_runtime_diagnostic(
+                f"行 {t_idx + 1} 步骤 {s_idx + 1}：name={name} type={act_type}，准备执行/检查预开标记"
+            )
+            self.runtime_status_sig.emit({
+                "kind": "step_start", "loop": int(l_idx) + 1, "row": int(t_idx) + 1,
+                "total_rows": int(total), "step": int(s_idx) + 1, "total_steps": len(self.actions),
+                "step_name": str(name), "action": str(act_type),
+                "detail": f"第 {t_idx + 1}/{total} 行，第 {s_idx + 1}/{len(self.actions)} 步：{name}"
+            })
+
+            # 低配分批预开已实际完成该行的首个“打开网址”步骤。正式流程先切回该账号窗口，再跳过重复开网址。
+            # 该标记只消费一次，后续跳转回同一步时仍按正常流程执行。
+            # 但“关闭对应账号窗口”永远不是预开目标：它必须直接按既有 binding_id 关闭，
+            # 不能为无关的预开标记锁等待（该锁此前可造成步骤开始后长时间无日志卡住）。
+            precompleted_key = (t_idx, s_idx)
+            _preopen_mode_raw = str(
+                act.get('value', '') if self.ignore_data else data.get(name, act.get('value', ''))
+            )
+            _preopen_mode_parts = [str(p).strip().lower() for p in _preopen_mode_raw.split('|')]
+            _is_close_by_profile_step = (
+                act_type == "open_url"
+                and len(_preopen_mode_parts) >= 3
+                and _preopen_mode_parts[2] in (
+                    "close_by_profile", "close_profile", "close_account", "close_window_by_profile"
+                )
+            )
+            precompleted_in_batch = False
+            precompleted_profile = ""
+            if _is_close_by_profile_step:
+                self.log_sig.emit(
+                    f"⚡ [{name}] 关闭账号窗口模式：跳过无关的分批预开标记检查，直接执行 binding_id 关闭。",
+                    "gray"
+                )
+            else:
+                with self._batch_precompleted_open_steps_lock:
+                    precompleted_in_batch = precompleted_key in self._batch_precompleted_open_steps
+                    precompleted_profile = self._batch_precompleted_open_profiles.pop(precompleted_key, "") if precompleted_in_batch else ""
+                    if precompleted_in_batch:
+                        self._batch_precompleted_open_steps.discard(precompleted_key)
+            if precompleted_in_batch:
+                # 预开步骤已完成时，必须先按“当前行 → Profile”重新解析并验证窗口，
+                # 不能仅沿用上一行的前台焦点或一份可能被并发更新的缓存句柄。
+                activated_preopened_window = False
+                try:
+                    activated_preopened_window = bool(
+                        self._activate_batch_row_window(
+                            t_idx,
+                            "预开完成，准备执行后续业务步骤",
+                            required=True,
+                        )
+                    )
+                except Exception as e:
+                    # 分批模式第一步已完成；这里绝不能回退重开浏览器，
+                    # 否则会破坏“行 → PID → 窗口”的固定绑定并产生额外窗口。
+                    raise RuntimeError(
+                        f"第 {t_idx + 1} 行的首步骤已按 PID 预开，但窗口激活失败；"
+                        f"已阻止重新打开浏览器：{e}"
+                    )
+
+                if activated_preopened_window:
+                    self.log_sig.emit(
+                        f"⏭️ [分批预开已完成] 跳过重复步骤：第 {t_idx + 1} 行 [{name}]，继续执行下一步",
+                        "green"
+                    )
+                    s_idx += 1
+                    _pct = int((t_idx * len(self.actions) + s_idx) / (total * len(self.actions)) * 100) if total and self.actions else 0
+                    self.prog_sig.emit(_pct)
+                    self._write_progress_status(
+                        _pct, l_idx, t_idx + 1, total, s_idx, len(self.actions),
+                        step_name=name, task_name=task_name, status="running"
+                    )
+                    continue
+
+                raise RuntimeError(
+                    f"第 {t_idx + 1} 行的首步骤已按 PID 预开，但未找到可激活窗口；"
+                    f"已阻止重新执行打开网址步骤：[{name}]"
+                )
 
             if self.ignore_data:
                 val = str(act.get('value', ''))
@@ -5615,6 +8182,11 @@ class AutoEngine(QThread):
                 row_delay = data.get(delay_key, "")
                 if val_raw is None:
                     val = str(act.get('value', ''))
+
+                # 单按键/组合键只读取流程编排中的预设值，直接执行；
+                # 不再由批量数据中同名列覆盖。例如填写 ctrl+v 就发送 Ctrl+V。
+                if act_type in ["press", "hotkey"]:
+                    val = str(act.get('value', '')).strip()
 
                 for k, v in row_vars.items():
                     val = val.replace(f"{{{{{k}}}}}", v)
@@ -5658,6 +8230,8 @@ class AutoEngine(QThread):
                 if self._stop:
                     break
                 try:
+                    # 分批模式已在本行首步骤（打开网址）完成时切到正确 hwnd。
+                    # 同一行的后续步骤不再重复激活窗口，避免每一步都引入前台切换等待。
                     result = self._execute_step(act, val, act_type, data)
                     self._set_row_runtime_ctx(
                         l_idx, t_idx, s_idx,
@@ -5696,6 +8270,29 @@ class AutoEngine(QThread):
                             name, act_type, act.get("action", ""), val,
                             error_detail
                         )
+                        # 账号窗口读取/关闭失败只影响当前数据行，绝不能因全局“停止”策略中断整个任务或排程。
+                        # 包括窗口记录未命中、Profile 表示形式不一致、窗口已被手动关闭、或网页弹窗阻止关闭。
+                        is_profile_window_error = (
+                            act_type == "open_url" and any(token in error_detail for token in (
+                                "对应的浏览器窗口记录",
+                                "按账号读取模式未选择账号",
+                                "按账号读取窗口切换失败",
+                                "按账号读取未找到",
+                                "按账号读取复用窗口失败",
+                                "关闭账号窗口未找到",
+                                "关闭对应账号窗口模式未选择账号",
+                                "未能关闭账号",
+                                "账号窗口 #",
+                            ))
+                        )
+                        if is_profile_window_error:
+                            self.log_sig.emit(
+                                f"⏭️ [账号窗口不可用] 第 {t_idx + 1} 行已标记失败，跳过本行剩余步骤并继续下一行。",
+                                "orange"
+                            )
+                            row_ok = False
+                            row_state = "failed"
+                            break
                         if self.on_error == "skip":
                             self.log_sig.emit(f"⏭️ 已跳过步骤: {name}", "orange")
                             step_ok = True
@@ -5760,6 +8357,22 @@ class AutoEngine(QThread):
                 continue
 
             s_delay = float(row_delay) if (row_delay and str(row_delay).replace('.','',1).isdigit()) else float(act.get('delay', 1))
+            # “打开网址 → 关闭对应账号窗口”完成后必须立刻交给下一步/下一任务。
+            # 旧的行级或步骤级延时（常见为此前文字填写保存的 120 秒）不能继承到关闭动作，
+            # 否则窗口已关但界面仍停在此步骤，表现为无提示卡住。
+            close_by_profile_step = False
+            if act_type == "open_url":
+                _close_parts = [str(p).strip().lower() for p in str(val or "").split("|")]
+                close_by_profile_step = len(_close_parts) >= 3 and _close_parts[2] in (
+                    "close_by_profile", "close_profile", "close_account", "close_window_by_profile"
+                )
+            if close_by_profile_step:
+                if s_delay > 0:
+                    self.log_sig.emit(
+                        f"⚡ [{name}] 为关闭账号窗口模式，已忽略继承的 {int(s_delay) if float(s_delay).is_integer() else s_delay} 秒步骤后延时。",
+                        "gray"
+                    )
+                s_delay = 0.0
             if self.dry_run:
                 self._interruptible_sleep(min(0.1, s_delay))
             elif s_delay > 0:
@@ -5902,7 +8515,7 @@ class AutoEngine(QThread):
         self._cooperative_abort()
         if self.dry_run:
             x, y = act.get('x'), act.get('y')
-            if x is not None and y is not None and act_type not in ["run_app", "wait", "screenshot", "open_url", "defer"]:
+            if x is not None and y is not None and act_type not in ["run_app", "wait", "screenshot", "open_url", "defer", "close_browser"]:
                 try:
                     pyautogui.moveTo(x, y, duration=0.5)
                     pyautogui.moveRel(10, 0, duration=0.1); pyautogui.moveRel(-20, 0, duration=0.1); pyautogui.moveRel(10, 0, duration=0.1)
@@ -5917,6 +8530,7 @@ class AutoEngine(QThread):
                     except: pass
             if act_type == "win_active": self.log_sig.emit(f"🧪 [模拟] 准备激活窗口: {val}", "purple")
             if act_type == "open_url": self.log_sig.emit(f"🧪 [模拟] 准备打开网址: {val}", "purple")
+            if act_type == "close_browser": self.log_sig.emit(f"🧪 [模拟] 准备关闭浏览器窗口: {val}", "purple")
             if act_type == "defer":
                 defer_raw = self._replace_vars(val, data)
                 defer_info = self._parse_defer_value(defer_raw, self._cur_s)
@@ -6062,149 +8676,100 @@ class AutoEngine(QThread):
             if not val: self.log_sig.emit("⚠️ 拖拽文件路径为空，跳过", "orange"); return None
             if sys.platform != 'win32': self.log_sig.emit("⚠️ 拖拽功能仅支持 Windows 系统", "orange"); return None
             
-            abs_path = os.path.normpath(os.path.abspath(val))
+            raw_drag_path, abs_path = normalize_drag_file_path(val)
             x, y = act.get('x', 0), act.get('y', 0)
+            if not os.path.isfile(abs_path):
+                parent_dir = os.path.dirname(abs_path)
+                parent_state = "存在" if os.path.isdir(parent_dir) else "不存在"
+                diagnostic = (
+                    f"拖拽文件不存在：规范化路径={abs_path}；上级目录{parent_state}；原始值={raw_drag_path!r}"
+                )
+                self.log_sig.emit(f"❌ {diagnostic}", "red")
+                self.detail_sig.emit("❌ 拖拽文件不存在，请检查当前数据行的文件路径")
+                live_runtime_diagnostic(diagnostic)
+                raise FileNotFoundError(diagnostic)
             if not x and not y:
                 self.log_sig.emit("⚠️ 拖拽指令未设置目标坐标，跳过", "orange"); return None
-            drag_target_hwnd = 0
+            # 在打开 Explorer 前锁定网页目标窗口。Explorer 保持完整尺寸以确保文件源可拖取；
+            # 真正按下鼠标后由拖拽函数切回这个 hwnd，再向网页投放坐标移动。
+            drag_target_hwnd = int(get_root_window_from_point(int(x), int(y)) or 0)
+            if not drag_target_hwnd or not _is_browser_window_handle(drag_target_hwnd):
+                # 坐标可能暂时被悬浮控制窗遮挡；退回到当前前台浏览器窗口。
+                candidate = int(ctypes.windll.user32.GetForegroundWindow() or 0) if sys.platform == "win32" else 0
+                if candidate and _is_browser_window_handle(candidate):
+                    drag_target_hwnd = candidate
+            if not drag_target_hwnd:
+                raise RuntimeError("拖拽前无法锁定网页目标浏览器窗口；请确认拖拽坐标落在浏览器投放区")
+            self.log_sig.emit(f"🖱️ 正在执行真实 Explorer 拖拽上传: {os.path.basename(abs_path)}", "gray")
+            live_runtime_diagnostic(
+                f"进入单文件拖拽步骤：file={abs_path} target=({int(x)},{int(y)}) target_hwnd={drag_target_hwnd}"
+            )
             try:
-                drag_target_hwnd = get_root_window_from_point(x, y)
-                if drag_target_hwnd:
-                    self.log_sig.emit(f"🪟 已识别目标窗口 hwnd={drag_target_hwnd}", "gray")
-            except Exception as e:
-                self.log_sig.emit(f"⚠️ 识别目标窗口失败: {str(e)}", "orange")
-            if act.get('activate_target_before_drag', False):
-                try:
-                    pyautogui.click(x, y)
-                    if drag_target_hwnd:
-                        self.log_sig.emit(f"🪟 拖拽前已点击目标坐标: ({x}, {y}) hwnd={drag_target_hwnd}", "gray")
-                    else:
-                        self.log_sig.emit(f"🪟 拖拽前已点击目标坐标: ({x}, {y})", "gray")
-                    self._interruptible_sleep(0.25)
-                except Exception as e:
-                    self.log_sig.emit(f"⚠️ 拖拽前点击目标坐标失败: {str(e)}", "orange")
-            
-            self.log_sig.emit(f"🖱️ 正在执行真实拖拽上传: {os.path.basename(abs_path)}", "gray")
-            prefer_explorer_first = bool(is_windows_11())
-            if prefer_explorer_first:
-                self.log_sig.emit("🧭 检测到 Win11，已跳过 OLE 合成拖拽，优先使用资源管理器真实拖拽", "gray")
-                try:
-                    perform_explorer_assisted_drag(
-                        abs_path,
-                        x,
-                        y,
-                        log_func=lambda msg: self.log_sig.emit(f"🧩 {msg}", "gray"),
-                        target_hwnd=drag_target_hwnd
-                    )
-                    self.log_sig.emit("✅ 资源管理器真实拖拽已完成", "green")
-                except Exception as explorer_err:
-                    self.log_sig.emit(f"⚠️ 资源管理器真实拖拽失败，回退窗口级拖放: {str(explorer_err)}", "orange")
-                    try:
-                        # 1. 获取目标坐标处的窗口句柄
-                        hwnd = get_root_window_from_point(x, y)
-                        if not hwnd: raise RuntimeError("无法定位目标窗口")
-                        
-                        # 2. 构造 DROPFILES 结构体
-                        class DROPFILES(ctypes.Structure):
-                            _fields_ = [("pFiles", wintypes.DWORD),
-                                        ("pt", wintypes.POINT),
-                                        ("fNC", wintypes.BOOL),
-                                        ("fWide", wintypes.BOOL)]
+                def _drag_progress(message):
+                    text = f"🧩 {message}"
+                    self.log_sig.emit(text, "gray")
+                    self.detail_sig.emit(text)
+                    self.runtime_status_sig.emit({
+                        "kind": "drag", "loop": int(getattr(self, "_cur_l", 0)) + 1,
+                        "row": int(getattr(self, "_cur_t", 0)) + 1,
+                        "total_rows": len(self.data_list), "step": int(getattr(self, "_cur_s", 0)) + 1,
+                        "total_steps": len(self.actions), "step_name": "拖拽文件", "detail": text
+                    })
 
-                        files = abs_path + '\0\0'
-                        files_u16 = files.encode('utf-16le')
-                        offset = ctypes.sizeof(DROPFILES)
-                        size = offset + len(files_u16)
-                        
-                        GHND = 0x0042
-                        hGlobal = ctypes.windll.kernel32.GlobalAlloc(GHND, size)
-                        if not hGlobal: raise RuntimeError("全局内存分配失败")
-                        
-                        pGlobal = ctypes.windll.kernel32.GlobalLock(hGlobal)
-                        if not pGlobal:
-                            ctypes.windll.kernel32.GlobalFree(hGlobal)
-                            raise RuntimeError("GlobalLock 失败，无法写入拖放数据")
-                        df = DROPFILES()
-                        df.pFiles = offset
-                        df.pt = wintypes.POINT(x, y)
-                        df.fNC = False
-                        df.fWide = True
-                        
-                        ctypes.memmove(pGlobal, ctypes.addressof(df), offset)
-                        ctypes.memmove(pGlobal + offset, files_u16, len(files_u16))
-                        ctypes.windll.kernel32.GlobalUnlock(hGlobal)
-                        
-                        WM_DROPFILES = 0x0233
-                        ctypes.windll.user32.PostMessageW(hwnd, WM_DROPFILES, hGlobal, 0)
-                        pyautogui.moveTo(x, y, duration=0.2)
-                        self.log_sig.emit("✅ 已发送窗口级拖放消息", "green")
-                    except Exception as legacy_err:
-                        raise RuntimeError(f"资源管理器拖拽、OLE 拖拽与窗口级拖放均失败: {legacy_err}") from legacy_err
-            else:
-                try:
-                    perform_native_file_drag(
-                        [abs_path],
-                        x,
-                        y,
-                        log_func=lambda msg: self.log_sig.emit(f"🧩 {msg}", "gray")
-                    )
-                    self.log_sig.emit("✅ OLE 合成拖拽已完成", "green")
-                except Exception as native_err:
-                    self.log_sig.emit(f"⚠️ OLE 合成拖拽失败，回退资源管理器真实拖拽: {str(native_err)}", "orange")
-                    try:
-                        perform_explorer_assisted_drag(
-                            abs_path,
-                            x,
-                            y,
-                            log_func=lambda msg: self.log_sig.emit(f"🧩 {msg}", "gray"),
-                            target_hwnd=drag_target_hwnd
+                self.detail_sig.emit("🖱️ 正在启动 Explorer 真实拖拽...")
+                perform_explorer_assisted_drag(
+                    abs_path,
+                    x,
+                    y,
+                    log_func=_drag_progress,
+                    target_hwnd=drag_target_hwnd,
+                )
+                self.log_sig.emit("✅ 资源管理器真实拖拽已完成", "green")
+            except Exception as explorer_err:
+                live_runtime_diagnostic(f"单文件拖拽失败：{type(explorer_err).__name__}: {explorer_err}")
+                raise RuntimeError(f"资源管理器真实拖拽失败: {explorer_err}") from explorer_err
+        elif act_type == "press":
+            pyautogui.press(val)
+        elif act_type == "hotkey":
+            # 兼容 Ctrl + C、Alt+Tab、Win+R、Windows+Shift+S、Super+E 等写法。
+            # pyautogui.hotkey 对 Windows 徽标键在部分环境下不会可靠地释放，因此 Win 组合
+            # 改为显式按下并按反向顺序释放，避免 Win 键残留或快捷键未触发。
+            _hotkey_aliases = {
+                "win": "winleft", "windows": "winleft", "super": "winleft", "meta": "winleft",
+                "lwin": "winleft", "rwin": "winright", "leftwin": "winleft", "rightwin": "winright",
+                "control": "ctrl", "option": "alt", "return": "enter", "escape": "esc",
+                "del": "delete", "pgup": "pageup", "pgdn": "pagedown",
+            }
+            _hotkey_keys = [
+                _hotkey_aliases.get(str(_key).strip().lower().replace(" ", ""), str(_key).strip().lower().replace(" ", ""))
+                for _key in str(val or "").split("+") if str(_key).strip()
+            ]
+            if not _hotkey_keys:
+                raise RuntimeError("组合键内容为空，请填写例如 Ctrl+C、Win+R 或 Win+Shift+S。")
+            self.log_sig.emit(f"⌨️ 执行组合键: {' + '.join(_hotkey_keys)}", "gray")
+            if any(_key in ("winleft", "winright") for _key in _hotkey_keys):
+                if sys.platform == "win32":
+                    if not _send_windows_logo_hotkey(_hotkey_keys):
+                        raise RuntimeError(
+                            "Windows 组合键包含当前系统级发送不支持的按键："
+                            + " + ".join(_hotkey_keys)
                         )
-                        self.log_sig.emit("✅ 资源管理器真实拖拽已完成", "green")
-                    except Exception as explorer_err:
-                        self.log_sig.emit(f"⚠️ 资源管理器真实拖拽失败，回退窗口级拖放: {str(explorer_err)}", "orange")
-                        try:
-                            # 1. 获取目标坐标处的窗口句柄
-                            hwnd = get_root_window_from_point(x, y)
-                            if not hwnd: raise RuntimeError("无法定位目标窗口")
-                            
-                            # 2. 构造 DROPFILES 结构体
-                            class DROPFILES(ctypes.Structure):
-                                _fields_ = [("pFiles", wintypes.DWORD),
-                                            ("pt", wintypes.POINT),
-                                            ("fNC", wintypes.BOOL),
-                                            ("fWide", wintypes.BOOL)]
-
-                            files = abs_path + '\0\0'
-                            files_u16 = files.encode('utf-16le')
-                            offset = ctypes.sizeof(DROPFILES)
-                            size = offset + len(files_u16)
-                            
-                            GHND = 0x0042
-                            hGlobal = ctypes.windll.kernel32.GlobalAlloc(GHND, size)
-                            if not hGlobal: raise RuntimeError("全局内存分配失败")
-                            
-                            pGlobal = ctypes.windll.kernel32.GlobalLock(hGlobal)
-                            if not pGlobal:
-                                ctypes.windll.kernel32.GlobalFree(hGlobal)
-                                raise RuntimeError("GlobalLock 失败，无法写入拖放数据")
-                            df = DROPFILES()
-                            df.pFiles = offset
-                            df.pt = wintypes.POINT(x, y)
-                            df.fNC = False
-                            df.fWide = True
-                            
-                            ctypes.memmove(pGlobal, ctypes.addressof(df), offset)
-                            ctypes.memmove(pGlobal + offset, files_u16, len(files_u16))
-                            ctypes.windll.kernel32.GlobalUnlock(hGlobal)
-                            
-                            WM_DROPFILES = 0x0233
-                            ctypes.windll.user32.PostMessageW(hwnd, WM_DROPFILES, hGlobal, 0)
-                            pyautogui.moveTo(x, y, duration=0.2)
-                            self.log_sig.emit("✅ 已发送窗口级拖放消息", "green")
-                        except Exception as legacy_err:
-                            raise RuntimeError(f"资源管理器拖拽、OLE 拖拽与窗口级拖放均失败: {legacy_err}") from legacy_err
-        elif act_type == "press":    pyautogui.press(val)
-        elif act_type == "hotkey":   pyautogui.hotkey(*val.split('+'))
+                else:
+                    _pressed_hotkey_keys = []
+                    try:
+                        for _key in _hotkey_keys:
+                            pyautogui.keyDown(_key)
+                            _pressed_hotkey_keys.append(_key)
+                            self._interruptible_sleep(0.03)
+                        self._interruptible_sleep(0.08)
+                    finally:
+                        for _key in reversed(_pressed_hotkey_keys):
+                            try:
+                                pyautogui.keyUp(_key)
+                            except Exception:
+                                pass
+            else:
+                pyautogui.hotkey(*_hotkey_keys)
         elif act_type == "scroll":
             # [修复] 增加坐标支持：如果设置了坐标，先移动鼠标到该位置，确保滚动作用于正确区域
             x, y = act.get('x'), act.get('y')
@@ -6308,7 +8873,10 @@ class AutoEngine(QThread):
 
                 # ── 常规标题匹配 ────────────────────────────────────────────────────
                 if not found and target_title:
-                    wins = gw.getWindowsWithTitle(target_title)
+                    wins = [
+                        w for w in gw.getWindowsWithTitle(target_title)
+                        if not (sys.platform == 'win32' and _is_compact_browser_restore_prompt(getattr(w, '_hWnd', 0)))
+                    ]
                     if wins:
                         try:
                             if sys.platform == 'win32':
@@ -6371,6 +8939,125 @@ class AutoEngine(QThread):
             if not found:
                 _hint = target_title or display_name
                 self.log_sig.emit(f"⚠️ 未能找到或激活窗口: {_hint}", "orange")
+        elif act_type == "close_browser":
+            # 低配分批模式下，关闭动作统一推迟到批次收尾，避免逐账号关窗破坏窗口复用。
+            if self._batch_defer_close_steps:
+                self.log_sig.emit("🧹 已登记关闭步骤：将在本批业务执行完成后统一收尾", "gray")
+                return None
+            # 关闭浏览器窗口（单个/全部）
+            # value 支持: "single" / "all" / "全部" / "关闭全部"
+            raw_mode = str(val or act.get("value", "") or "").strip()
+            mode = raw_mode.lower()
+
+            def _is_browser_hwnd(hwnd):
+                if not hwnd or sys.platform != "win32":
+                    return False
+                try:
+                    cls = get_window_class_name(int(hwnd)) or ""
+                    title = get_window_text(int(hwnd)) or ""
+                    if cls.strip() in ("Chrome_WidgetWin_1", "MozillaWindowClass", "OperaWindowClass"):
+                        return True
+                    proc_info = _get_hwnd_process_info(int(hwnd))
+                    if _is_browser_process_info(proc_info):
+                        return True
+                    # 兜底：部分壳浏览器/特殊标题
+                    title_lower = title.lower()
+                    if any(x in title_lower for x in ("chrome", "edge", "firefox", "opera", "brave", "runninghub")):
+                        return True
+                    return False
+                except Exception:
+                    return False
+
+            closed_count = 0
+            if mode in ("all", "全部", "关闭全部"):
+                # [修复] “关闭全部”改为真正的强制结束浏览器进程：
+                # 1) 先从所有已枚举窗口反查浏览器 PID，并用 taskkill /T /F 强杀进程树；
+                # 2) 再按常见浏览器进程名兜底补杀。
+                browser_hwnds = set()
+                browser_pids = set()
+                try:
+                    browser_hwnds.update(int(h) for h in _list_browser_window_handles() if h)
+                except Exception:
+                    browser_hwnds = set()
+
+                # 兜底补扫：兼容部分壳浏览器/标题型窗口
+                if sys.platform == "win32":
+                    try:
+                        import pygetwindow as pgw
+                        for w in pgw.getWindowsWithTitle(""):
+                            hwnd = int(getattr(w, "_hWnd", 0) or 0)
+                            if not hwnd:
+                                continue
+                            if _is_browser_hwnd(hwnd) or _is_browser_window_handle(hwnd):
+                                browser_hwnds.add(hwnd)
+                    except Exception:
+                        pass
+
+                for hwnd in sorted(browser_hwnds, reverse=True):
+                    try:
+                        proc_info = _get_hwnd_process_info(int(hwnd))
+                        if _is_browser_process_info(proc_info):
+                            pid = int(proc_info.get("pid", 0) or 0)
+                            if pid:
+                                browser_pids.add(pid)
+                    except Exception:
+                        pass
+
+                for pid in sorted(browser_pids, reverse=True):
+                    if _force_kill_pid_tree(int(pid)):
+                        closed_count += 1
+
+                for hwnd in sorted(browser_hwnds, reverse=True):
+                    ok = _close_window_silently(int(hwnd))
+                    if ok:
+                        closed_count += 1
+
+                browser_proc_names = [
+                    "chrome.exe",
+                    "chrome_proxy.exe",
+                    "msedge.exe",
+                    "firefox.exe",
+                    "opera.exe",
+                    "opera_gx.exe",
+                    "brave.exe",
+                    "bravebrowser.exe",
+                    "browser.exe",
+                    "360chrome.exe",
+                    "qqbrowser.exe",
+                    "iexplore.exe",
+                ]
+                killed_by_name = 0
+                for proc_name in browser_proc_names:
+                    if _force_kill_process_by_name(proc_name):
+                        killed_by_name += 1
+                closed_count += killed_by_name
+
+                if closed_count:
+                    self.log_sig.emit(f"🧹 已强制关闭浏览器相关窗口/进程: {closed_count} 项", "green")
+                else:
+                    self.log_sig.emit("ℹ️ 未找到可关闭的浏览器窗口或进程", "gray")
+            else:
+                # single：优先关闭当前前台浏览器窗口（智能获取句柄）
+                hwnd = None
+                if sys.platform == "win32":
+                    try:
+                        hwnd = ctypes.windll.user32.GetForegroundWindow()
+                        hwnd = int(hwnd) if hwnd else None
+                    except Exception:
+                        hwnd = None
+                if hwnd and _is_browser_hwnd(hwnd):
+                    ok = _close_window_silently(int(hwnd))
+                    if ok:
+                        self.log_sig.emit("🧹 已关闭当前前台浏览器窗口", "green")
+                    else:
+                        proc_info = _get_hwnd_process_info(int(hwnd))
+                        pid = int(proc_info.get("pid", 0) or 0)
+                        if pid and _force_kill_pid_tree(pid):
+                            self.log_sig.emit("🧹 已强制结束当前前台浏览器进程", "green")
+                        else:
+                            self.log_sig.emit("⚠️ 关闭当前前台浏览器窗口失败（可能有弹窗阻止）", "orange")
+                else:
+                    self.log_sig.emit("ℹ️ 当前前台窗口不是浏览器，已跳过关闭单个窗口", "gray")
         elif act_type == "open_url":
             # [修复 v3] val 已经由引擎 run() 按「数据表优先、步骤默认兜底」组合好：
             #   批量模式：val = data[name]（包含批量数据行的 url|profile）
@@ -6393,31 +9080,207 @@ class AutoEngine(QThread):
 
             url = self._replace_vars(url, data)
             profile = self._replace_vars(profile, data)
+            options = self._replace_vars(options, data)
             if "|" in profile:
                 parts = profile.split("|")
                 if not url or url == "AUTO_KEEP_URL": url = parts[0]
                 profile = parts[1]
-            
-            if not url.startswith(('http://', 'https://', 'file://')):
+
+            # 新格式：网址 | 账号/目标 | 模式。
+            # independent：独立打开并记录句柄；read_by_profile：按账号标识精准读取已记录的窗口句柄。
+            # 空模式保留旧任务的行为，避免改变既有流程。
+            open_mode = str(options or "").strip().lower()
+            # 兼容旧版 activate_from_file 格式（旧任务无缝升级）
+            use_handle_file = open_mode in ("activate_from_file", "activate_file", "handle_file")
+            read_by_profile_mode = open_mode == "read_by_profile"
+            close_by_profile_mode = open_mode == "close_by_profile"
+            record_new_handle = open_mode in ("independent", "standalone", "record_handle")
+            handle_claim = None
+            pre_open_browser_handles = set()
+
+            # 读取和关闭模式均不导航；只对指定账号的既有窗口执行动作。
+            if read_by_profile_mode or close_by_profile_mode:
+                url = ""
+
+            if close_by_profile_mode:
+                if not str(profile or "").strip():
+                    raise RuntimeError(
+                        "关闭对应账号窗口模式未选择账号，无法确定应关闭哪个浏览器窗口。"
+                        "请在该步骤选择需要关闭的账号。"
+                    )
+                # 仅接受此账号 binding_id 直查并验证过的窗口；不扫描 Profile、不按标题/PID猜测。
+                # 句柄记录由独立打开/预开线程写入。关闭步骤不可无上限等待该文件锁，
+                # 否则会在“执行”日志后长时间无输出。
+                self.log_sig.emit("🔎 正在读取 binding_id 窗口记录…", "gray")
+                if not OPEN_URL_HANDLE_STORE_LOCK.acquire(timeout=0.35):
+                    raise RuntimeError("关闭账号窗口时 binding_id 记录正被其他操作占用超过 0.35 秒，已中止本次关闭以避免卡住。")
+                try:
+                    _close_hwnd = _get_open_url_profile_handle(profile)
+                finally:
+                    OPEN_URL_HANDLE_STORE_LOCK.release()
+                if not _close_hwnd:
+                    raise RuntimeError(
+                        f"关闭账号窗口未找到与账号 [{get_profile_display_name(profile)}] 精确匹配的已打开窗口。"
+                        "为避免误关，系统未执行任何关闭操作。"
+                    )
+                self.log_sig.emit(f"🔎 已定位 binding_id 窗口 #{int(_close_hwnd)}，正在验证窗口状态…", "gray")
+                if not _is_browser_window_handle(int(_close_hwnd)):
+                    raise RuntimeError(f"账号窗口 #{int(_close_hwnd)} 已失效或不是浏览器窗口，未执行关闭操作。")
+                # 关闭对应账号窗口必须走保守的正常关闭：只投递一次 WM_CLOSE，不执行
+                # 置前、重复关闭消息或任何强杀补救，避免干扰 Chrome 的正常会话保存流程。
+                self.log_sig.emit(f"🧹 正在向窗口 #{int(_close_hwnd)} 发送正常关闭请求（最长确认 5 秒）…", "gray")
+                if not _close_browser_window_normally(int(_close_hwnd), timeout=5.0):
+                    raise RuntimeError(
+                        f"未能关闭账号 [{get_profile_display_name(profile)}] 的窗口 #{int(_close_hwnd)}。"
+                        "可能有网页弹窗阻止关闭；系统未强杀共享浏览器进程。"
+                    )
+                self.log_sig.emit("🗂️ 窗口已关闭，正在清理 binding_id 记录…", "gray")
+                if OPEN_URL_HANDLE_STORE_LOCK.acquire(timeout=0.35):
+                    try:
+                        _remove_open_url_profile_handle(profile, expected_hwnd=int(_close_hwnd))
+                    finally:
+                        OPEN_URL_HANDLE_STORE_LOCK.release()
+                else:
+                    # 窗口已关闭；记录保留不会影响账号登录状态，后续独立打开会覆盖旧 binding_id。
+                    self.log_sig.emit("⚠️ binding_id 记录清理忙，已跳过本次清理；下次独立打开会自动覆盖旧记录。", "orange")
+                try:
+                    if int(getattr(self, "_batch_opened_windows", {}).get(profile, 0) or 0) == int(_close_hwnd):
+                        self._batch_opened_windows.pop(profile, None)
+                    for _target in getattr(self, "_batch_row_window_targets", {}).values():
+                        if str(_target.get("profile", "") or "") == str(profile):
+                            _target["hwnd"] = 0
+                            _target["pid"] = 0
+                except Exception:
+                    pass
+                self.log_sig.emit(
+                    f"🧹 已精准关闭账号 [{get_profile_display_name(profile)}] 的浏览器窗口 #{int(_close_hwnd)}；其他账号窗口未受影响",
+                    "green"
+                )
+                # Chrome 收到 WM_CLOSE 后窗口会先消失，但仍可能在后台提交 Cookie、Preferences 和
+                # 会话恢复状态。排程紧接着用同一 Profile 启动新窗口时，必须给 Chrome 完成正常退出的时间；
+                # 否则可能将未落盘会话误呈现为掉线。这里不杀进程、不修改任何 Chrome 文件。
+                # 窗口已确认正常关闭；仅保留极短缓冲让消息循环收尾，避免固定长等待拖慢排程。
+                self.log_sig.emit("⏳ Chrome 窗口已关闭，短暂收尾（1 秒）…", "gray")
+                self._wait_with_countdown(1.0, "⏳ Chrome 会话收尾")
+                self.log_sig.emit("✅ Chrome 会话收尾完成，继续后续任务", "green")
+                return None
+
+            if url and not url.startswith(('http://', 'https://', 'file://')):
                 url = "https://" + url
 
-            # [增强] 支持把“账号(profile)”位置填成已打开窗口（::hwnd=xxx）。
-            # 当检测到 hwnd 时，优先激活该窗口并在其地址栏打开 url（不依赖账号识别）。
-            target_hwnd = None
-            try:
-                target_hwnd = self._extract_hwnd_from_value(profile) or self._extract_hwnd_from_value(options)
-            except Exception:
-                target_hwnd = None
-            if not target_hwnd and profile and sys.platform == "win32":
+            if read_by_profile_mode:
+                if not str(profile or "").strip():
+                    raise RuntimeError(
+                        "按账号读取模式未选择账号，无法确定应激活哪个浏览器窗口。"
+                        "请在该步骤选择与独立打开步骤完全相同的账号。"
+                    )
+                
+                # [硬规则] “按账号读取”只按规范 Profile Key → binding_id → 已验证 HWND。
+                # 不按 PID 反查、不扫描 Chrome 命令行、不使用标题或账号显示名猜测。
+                _profile_hwnd = _get_open_url_profile_handle(profile)
                 try:
-                    target_hwnd = find_browser_window_hwnd_by_hint(profile)
+                    batch_hwnd = int(getattr(self, "_batch_opened_windows", {}).get(profile, 0) or 0)
+                except Exception:
+                    batch_hwnd = 0
+                # 批次内缓存只作一致性检查，不能越过 binding_id 窗口身份证验证。
+                if batch_hwnd and _profile_hwnd and batch_hwnd != int(_profile_hwnd):
+                    _profile_hwnd = None
+
+                # 找不到或校验失败必须立即报错；读取模式绝不降级为独立打开。
+                if not _profile_hwnd:
+                    raise RuntimeError(
+                        f"按账号读取未找到账号 [{get_profile_display_name(profile)}] 的有效 binding_id 窗口。"
+                        "为避免误操作，系统未扫描或猜测窗口；请先用“独立打开”重新绑定该账号。"
+                    )
+                else:
+                    try:
+                        profile_label = os.path.basename(os.path.normpath(str(profile))) or str(profile)
+                        self.log_sig.emit(
+                            f"♻️ 成功基于 binding_id 直取账号窗口 #{_profile_hwnd}：{profile_label}",
+                            "green"
+                        )
+                        if not force_activate_window(int(_profile_hwnd)):
+                            raise RuntimeError(f"系统未能将窗口 #{int(_profile_hwnd)} 置为前台")
+                        
+                        self._cooperative_sleep(0.1)
+                        _dismiss_restore_prompt_if_needed()
+                        
+                        # [重要优化] 按账号读取模式下，仅负责激活并置顶窗口，绝不自动填入网址或导航，以保留用户原始页面
+                        self.log_sig.emit(f"✨ 已成功将账号窗口 #{_profile_hwnd} 激活至前台", "gray")
+
+                        if should_std:
+                            self._cooperative_sleep(0.2)
+                            self._standardize_browser_window()
+                        return None
+                    except Exception as e:
+                        raise RuntimeError(f"按账号读取复用窗口失败: {e}")
+
+            if use_handle_file:
+                handle_claim = _claim_next_open_url_window_handle()
+                if not handle_claim:
+                    raise RuntimeError(
+                        f"固定句柄文件中没有可用浏览器窗口：{OPEN_URL_HANDLE_STORE_PATH}。"
+                        "请先执行'单独打开并记录窗口'模式，或检查已记录的窗口是否仍打开。"
+                    )
+                profile = OPEN_URL_HANDLE_FILE_TOKEN
+
+            if record_new_handle:
+                pre_open_browser_handles = _list_browser_window_handles()
+
+            # [低配分批复用] 本批预开成功后，后续同账号的独立打开步骤必须优先复用该窗口。
+            # 这样会先激活预开的窗口并在其地址栏导航，而不是再次通过 Profile 启动新的浏览器窗口。
+            target_hwnd = None
+            if (not handle_claim and self._batch_defer_close_steps and record_new_handle and profile):
+                try:
+                    batch_hwnd = int(self._batch_opened_windows.get(profile, 0) or 0)
+                except Exception:
+                    batch_hwnd = 0
+                if batch_hwnd and _is_browser_window_handle(batch_hwnd):
+                    target_hwnd = batch_hwnd
+                    self.log_sig.emit(
+                        f"♻️ 复用本批预开窗口 #{batch_hwnd}：{get_profile_display_name(profile)}",
+                        "green"
+                    )
+                elif batch_hwnd:
+                    self.log_sig.emit(
+                        f"⚠️ 本批预开窗口 #{batch_hwnd} 已失效，将按账号重新查找：{get_profile_display_name(profile)}",
+                        "orange"
+                    )
+
+            # 首步骤预开必须强制新启动并记录 PID，绝不能走“已打开窗口/标题提示”查找路径；
+            # 否则该行没有本次启动 PID，后续无法按用户要求精确激活对应窗口。
+            is_batch_first_open = bool(self._batch_preopen_phase and record_new_handle)
+            if handle_claim:
+                target_hwnd = int(handle_claim.get("hwnd", 0) or 0)
+            elif not target_hwnd and not is_batch_first_open:
+                try:
+                    target_hwnd = self._extract_hwnd_from_value(profile) or self._extract_hwnd_from_value(options)
                 except Exception:
                     target_hwnd = None
+                if not target_hwnd and profile and sys.platform == "win32" and self._batch_defer_close_steps and record_new_handle:
+                    try:
+                        # 仅已验证的批次复用允许精确 Profile 查找；独立打开模式绝不使用标题/提示词猜窗口。
+                        target_hwnd = find_browser_window_hwnd_by_profile_exact(profile)
+                    except Exception:
+                        target_hwnd = None
             if target_hwnd and sys.platform == "win32":
                 try:
-                    self.log_sig.emit(f"🌐 使用已打开窗口打开网址: {get_profile_display_name(profile)}", "gray")
-                    force_activate_window(int(target_hwnd))
-                    self._cooperative_sleep(0.2)
+                    if handle_claim:
+                        self.log_sig.emit(
+                            f"🌐 按顺序领取窗口 #{int(target_hwnd)}，正在激活并打开网址",
+                            "gray"
+                        )
+                    else:
+                        self.log_sig.emit(f"🌐 使用已打开窗口打开网址: {get_profile_display_name(profile)}", "gray")
+                    if not force_activate_window(int(target_hwnd)):
+                        raise RuntimeError(f"未能激活目标浏览器窗口 #{int(target_hwnd)}")
+                    self._cooperative_sleep(0.25)
+                    _dismiss_restore_prompt_if_needed()
+                    self._cooperative_sleep(0.15)
+                    if should_std:
+                        # 先标准化已打开窗口，再在稳定状态下导航，避免地址提交后窗口再次抖动影响首屏渲染
+                        self._standardize_browser_window()
+                        self._cooperative_sleep(0.35)
                     try:
                         pyperclip.copy(url)
                     except Exception:
@@ -6429,50 +9292,74 @@ class AutoEngine(QThread):
                         pyautogui.hotkey('ctrl', 'v')
                     except Exception:
                         pyautogui.typewrite(url, interval=0.01)
-                    self._cooperative_sleep(0.05)
+                    self._cooperative_sleep(0.08)
                     pyautogui.press('enter')
-                    if should_std:
-                        # 这里原先会提前 return，导致“打开网址”分支跳过统一的标准化逻辑
-                        self._cooperative_sleep(1)
-                        self._standardize_browser_window()
+                    self._wait_with_countdown(2.5, "🌐 等待页面初始渲染")
+                    if handle_claim:
+                        _finish_open_url_window_claim(handle_claim["id"], handle_claim["claim_token"], True)
                     return None
                 except Exception as e:
+                    if handle_claim:
+                        _finish_open_url_window_claim(handle_claim["id"], handle_claim["claim_token"], False, str(e))
                     raise RuntimeError(f"使用已打开窗口打开网址失败: {e}")
+            if handle_claim:
+                _finish_open_url_window_claim(
+                    handle_claim["id"], handle_claim["claim_token"], False,
+                    "领取的窗口无法激活或已关闭"
+                )
+                raise RuntimeError("从固定句柄文件领取的浏览器窗口已关闭，无法激活")
 
-            # [终极修复版] 解决多账户切换、映射路径识别与书签栏坐标统一。
+            # 浏览器启动路径。快速预开时禁止进行账户显示名全量扫描，
+            # 仅使用输入的 Profile 字符串写日志，确保整批启动命令连续发出。
             if profile and sys.platform == 'win32':
-                display_name = get_profile_display_name(profile)
+                if is_batch_first_open:
+                    display_name = os.path.basename(os.path.normpath(str(profile))) or str(profile)
+                else:
+                    display_name = get_profile_display_name(profile)
                 self.log_sig.emit(f"🌐 正在请求打开账号: {display_name}", "gray")
                 
-                # 1. 路径解析 (回归 Chrome 原生 Profile 目录结构)
-                # Chrome 的多账号本质上是：一个总的数据目录 (User Data) 下有多个 Profile 文件夹
-                # 我们的目标是准确拆分出这两部分。
-                norm_p = os.path.normpath(profile)
-                u_dir, p_dir = "", "Default"
+                # 1. 路径解析 (智能识别 Chrome Profile 目录结构 - [已增强稳定性])
+                # 确保账号名或相对路径统一转换为绝对路径，防止工作目录变化导致新建空白 Profile 丢失登录态
+                raw_profile_str = str(profile).strip()
+                if raw_profile_str.startswith("binding:"):
+                    raise RuntimeError(
+                        "该任务仍保存旧共享绑定标识，无法在纯路径模式下打开。"
+                        "请在账户选择器中重新选择对应的真实 Chrome Profile 路径。"
+                    )
+                if not os.path.isabs(raw_profile_str) and not os.sep in raw_profile_str and "/" not in raw_profile_str:
+                    # 不再把未知纯文本（常见为备注或标签）自动当作新 Profile 目录。
+                    raise RuntimeError(
+                        f"账号标识 [{raw_profile_str}] 不是真实 Chrome Profile 路径。"
+                        "请在账户选择器中选择已登录账号的实际目录。"
+                    )
+                norm_p = os.path.abspath(raw_profile_str)
+                u_dir, p_dir = "", ""
                 
-                # 查找 "User Data" 在路径中的位置
-                # 比如：C:\Users\Admin\AppData\Local\Google\Chrome\User Data\Profile 1
-                ud_marker = "user data"
-                lower_p = norm_p.lower()
-                if ud_marker in lower_p:
-                    idx = lower_p.find(ud_marker)
-                    # u_dir 必须包含 "User Data" 这一级
-                    u_dir = norm_p[:idx + len(ud_marker)]
-                    # p_dir 是 "User Data" 之后的那一级文件夹名
-                    rest = norm_p[idx + len(ud_marker):].lstrip(os.sep)
-                    if rest:
-                        p_dir = rest.split(os.sep)[0]
-                    else:
-                        p_dir = "Default"
-                else:
-                    # 如果路径里根本没有 "User Data"（比如自定义的隔离路径）
-                    # 则将父目录作为数据目录，当前目录名作为 Profile 名
+                # A. 检查是否直接是 Profile 文件夹 (内含 Preferences)
+                if not u_dir and os.path.exists(os.path.join(norm_p, "Preferences")):
                     u_dir = os.path.dirname(norm_p)
                     p_dir = os.path.basename(norm_p)
-                
-                # 特殊情况：如果用户选的是 User Data 目录本身，Profile 应为 Default
-                if p_dir.lower() == "user data": p_dir = "Default"
-                
+                # B. 检查是否是 User Data 根目录 (内含 Default\Preferences)
+                elif not u_dir and os.path.exists(os.path.join(norm_p, "Default", "Preferences")):
+                    u_dir = norm_p
+                    p_dir = "Default"
+                # C. 纯路径模式下，无法验证为真实 Chrome Profile 时绝不回退为
+                # “把该目录当 User Data + Default”。该回退会创建空白/未登录会话，
+                # 表面表现为要求重新登录，且极易被误判为前一项关闭窗口导致。
+                elif not u_dir:
+                    raise RuntimeError(
+                        f"账号 Profile 路径无效或不完整：{raw_profile_str}\n"
+                        "该目录未找到 Preferences，不能安全确认它是已登录的 Chrome Profile。"
+                        "请在账户选择器中重新选择实际的 Profile 文件夹（例如包含 Preferences 的 Default 或 Profile N）。"
+                    )
+
+                # 二次验证：只允许启动真正存在 Preferences 的目标 Profile，绝不猜测 Default。
+                profile_preferences = os.path.join(u_dir, p_dir, "Preferences")
+                if not os.path.isfile(profile_preferences):
+                    raise RuntimeError(
+                        f"账号 Profile 未验证：{profile_preferences}\n"
+                        "为保护现有登录状态，系统拒绝以未知目录启动 Chrome；请重新选择已登录账号的实际 Profile 文件夹。"
+                    )
                 # 2. 寻找浏览器路径
                 chrome_path = None
                 for p in [r"C:\Program Files\Google\Chrome\Application\chrome.exe", 
@@ -6510,7 +9397,12 @@ class AutoEngine(QThread):
                     try:
                         import pygetwindow as pgw
                         from pywinauto import Application
-                        all_chromes = [w for w in pgw.getWindowsWithTitle("") if "Chrome" in w.title or "RunningHub" in w.title]
+                        # 快速预开时不逐账户扫描现有窗口和 WMIC 命令行；
+                        # 该扫描会在账户较多时造成每个启动命令数秒级阻塞。
+                        all_chromes = [] if is_batch_first_open else [
+                            w for w in pgw.getWindowsWithTitle("")
+                            if "Chrome" in w.title or "RunningHub" in w.title
+                        ]
                         for cw in all_chromes:
                             try:
                                 _hwnd = cw._hWnd
@@ -6530,20 +9422,41 @@ class AutoEngine(QThread):
                     except Exception as e:
                         log_internal_issue(f"扫描已有账号窗口失败: {p_dir}", e)
 
-                    # 4. 命令行启动：加入 --start-maximized 参数，让 Chrome 启动时自带最大化属性
+                    # 4. 直接启动 chrome.exe，取得真实 PID 后按 PID 捕获窗口。
+                    # 不经 shell 中转，避免拿到 cmd.exe PID 而只能再按 Profile 名称猜窗口。
+                    if not is_batch_first_open:
+                        _mark_chrome_profile_clean_exit(u_dir, p_dir)
+                    # 普通 Windows Chrome 启动：仅保留账号、窗口和首次启动相关参数。
+                    # 不传入 --no-sandbox / --disable-setuid-sandbox 等 Linux/调试标记，
+                    # 避免 Chrome 显示“不受支持的命令行标记”黑色提示条。
                     cmd_args = [
-                        f'"{chrome_path}"', 
-                        f'--user-data-dir="{u_dir}"', 
-                        f'--profile-directory="{p_dir}"', 
+                        chrome_path,
+                        f"--user-data-dir={u_dir}",
+                        f"--profile-directory={p_dir}",
                         "--new-window",
-                        "--start-maximized" # [新增] 浏览器原生参数，最稳的最大化方式
+                        "--start-maximized",
+                        "--no-first-run",
+                        "--no-default-browser-check",
                     ]
-                    if "AUTO_KEEP_URL" not in url: cmd_args.append(f'"{url}"')
-                    
-                    full_cmd = " ".join(cmd_args)
+                    if "AUTO_KEEP_URL" not in url:
+                        cmd_args.append(url)
+
+                    full_cmd = subprocess.list2cmdline(cmd_args)
                     self.log_sig.emit(f"🚀 执行启动命令: {full_cmd}", "gray")
-                    subprocess.Popen(full_cmd, shell=True)
-                    
+                    launch_process = subprocess.Popen(cmd_args, shell=False)
+                    launch_pid = int(launch_process.pid or 0)
+                    self.log_sig.emit(f"🔗 已取得本次浏览器启动 PID: {launch_pid}", "gray")
+                    if record_new_handle and self._batch_preopen_phase:
+                        # 第一阶段只登记本行所属 Profile 的真实启动 PID；不在这里开后台记录线程。
+                        # 由批次调度器在所有启动命令都发出后，统一等待每个 PID 的窗口出现并绑定。
+                        with self._batch_window_bind_lock:
+                            self._batch_opened_pids[profile] = launch_pid
+                            for row_target in self._batch_row_window_targets.values():
+                                if str(row_target.get("profile", "") or "").strip() == str(profile or "").strip():
+                                    row_target["pid"] = launch_pid
+                        # 快速预开不逐账号输出“等待 PID”日志；所有启动命令发出后
+                        # 由批次调度器统一提示并收集新增窗口，避免造成正在逐个等待的误解。
+
                     # 5. [极速诊断版] 窗口状态监控与对齐逻辑
                     def _async_force_standardize():
                         try:
@@ -6592,8 +9505,7 @@ class AutoEngine(QThread):
                                                 user32.ShowWindow(_hwnd, 3) # Maximize
                                                 # 补一个快捷键 Win+Up 确保万无一失
                                                 pyautogui.hotkey('win', 'up')
-                                                time.sleep(0.5)
-                                                pyautogui.hotkey('ctrl', 'shift', 'b')
+                                                time.sleep(0.35)
                                                 self.log_sig.emit(f"✅ 账号 [{p_dir}] 窗口已强行铺满全屏", "green")
                                             else:
                                                 user32.SetForegroundWindow(_hwnd)
@@ -6607,12 +9519,47 @@ class AutoEngine(QThread):
                         except Exception as e:
                             self.log_sig.emit(f"❌ 监控异常: {str(e)}", "red")
                     
-                    import threading
-                    threading.Thread(target=_async_force_standardize, daemon=True).start()
+                    # [安全审计修复] 禁用旧的异步窗口监控：该路径曾按命令行子串匹配窗口，
+                    # 多账号场景可能后台抢错焦点。窗口标准化仅在严格绑定成功后由正式流程执行。
+                    if record_new_handle:
+                        if self._batch_preopen_phase:
+                            # 分批调度器会在本波全部 PID 发出后统一捕获并绑定窗口，
+                            # 此处绝不启动异步记录线程，避免正式流程抢在记录完成前执行。
+                            self.log_sig.emit("⏳ [分批预开] 等待本批 PID 窗口统一就绪后再开始业务步骤", "gray")
+                        else:
+                            self._record_independent_open_url_window(
+                                pre_open_browser_handles, profile, launched_pid=launch_pid
+                            )
+                    if not self._batch_preopen_phase:
+                        self._wait_with_countdown(3.0, "🌐 等待浏览器启动与首屏稳定")
                 else:
-                    import webbrowser; webbrowser.open(url)
+                    import webbrowser; webbrowser.open(url, new=1)
+                    if record_new_handle:
+                        if self._batch_preopen_phase:
+                            record_thread = threading.Thread(
+                                target=self._record_independent_open_url_window,
+                                args=(pre_open_browser_handles, profile, True), daemon=True
+                            )
+                            record_thread.start()
+                            self._batch_handle_record_threads.append(record_thread)
+                        else:
+                            self._record_independent_open_url_window(pre_open_browser_handles, profile)
+                    if not self._batch_preopen_phase:
+                        self._wait_with_countdown(2.5, "🌐 等待浏览器启动与首屏稳定")
             else:
-                import webbrowser; webbrowser.open(url)
+                import webbrowser; webbrowser.open(url, new=1)
+                if record_new_handle:
+                    if self._batch_preopen_phase:
+                        record_thread = threading.Thread(
+                            target=self._record_independent_open_url_window,
+                            args=(pre_open_browser_handles, profile, True), daemon=True
+                        )
+                        record_thread.start()
+                        self._batch_handle_record_threads.append(record_thread)
+                    else:
+                        self._record_independent_open_url_window(pre_open_browser_handles, profile)
+                if not self._batch_preopen_phase:
+                    self._wait_with_countdown(2.5, "🌐 等待浏览器启动与首屏稳定")
         elif act_type == "run_app":  os.startfile(val) if sys.platform == 'win32' else os.system(val)
         elif act_type == "screenshot":
             shot_dir = os.path.join(BASE_DIR, "screenshots")
@@ -6623,8 +9570,8 @@ class AutoEngine(QThread):
             return ("defer", self._parse_defer_value(defer_raw, self._cur_s))
         elif act_type == "wait": self._wait_with_countdown(float(val) if val else 1, "⏳ 等待中")
         
-        # 如果标记了需要标准化，在动作执行完、窗口出现后执行
-        if should_std:
+        # 预开阶段只负责冷启动；不逐窗口标准化，避免重复最大化、抢前台与渲染抖动。
+        if should_std and not self._batch_preopen_phase:
             # 额外等待 1 秒确保窗口已渲染
             self._cooperative_sleep(1)
             self._standardize_browser_window()
@@ -6632,7 +9579,108 @@ class AutoEngine(QThread):
         return None
 
 
+    def _run_batched(self, total, task_name=""):
+        """低配设备的批次调度主循环：预开一批、统一执行业务、统一关闭。"""
+        batch_size = max(1, int(self.batch_options.get("batch_size", 30) or 30))
+        l_idx = self.start_l
+        while not self._stop:
+            has_pending_deferred = bool(self._deferred_queue)
+            is_normal_round = l_idx < self.loops
+            if not is_normal_round and not has_pending_deferred:
+                break
+
+            self._cur_l = l_idx
+            if is_normal_round:
+                if self.loops > 1 or l_idx > 0:
+                    self.log_sig.emit(f"🔄 === 第 {l_idx + 1}/{self.loops} 轮循环（低配分批模式）===", "purple")
+                t_start = self.start_t if l_idx == self.start_l else 0
+                for batch_start in range(t_start, total, batch_size):
+                    if self._stop:
+                        break
+                    row_indexes = list(range(batch_start, min(batch_start + batch_size, total)))
+                    self.log_sig.emit(
+                        f"📦 === 批次 {batch_start + 1}-{row_indexes[-1] + 1}/{total}：预开 → 业务执行 → 收尾 ===",
+                        "purple"
+                    )
+                    prepared = self._preopen_batch_windows(l_idx, row_indexes)
+                    self._batch_defer_close_steps = bool(prepared)
+                    try:
+                        for t_idx in row_indexes:
+                            if self._stop:
+                                break
+                            self._drain_deferred_queue(l_idx, total, task_name=task_name, priority_only=True, wait_for_due=False)
+                            if self._stop:
+                                break
+                            s_start = self.start_s if (l_idx == self.start_l and t_idx == self.start_t) else 0
+                            result = self._run_row(l_idx, t_idx, s_start, total, task_name=task_name, resumed=False)
+                            if self._stop:
+                                break
+                            self._drain_deferred_queue(l_idx, total, task_name=task_name, priority_only=True, wait_for_due=False)
+                            if self._stop:
+                                break
+                            if result.get("state") not in ("skipped", "failed") and t_idx < total - 1:
+                                self._wait_with_countdown(self.loop_delay, "⏳ 组间等待")
+
+                        # 当前批次产生的延后任务必须在窗口关闭前恢复，确保仍可复用本批账号窗口。
+                        if prepared and not self._stop:
+                            self._drain_deferred_queue(l_idx, total, task_name=task_name)
+                    finally:
+                        self._batch_defer_close_steps = False
+                        if prepared:
+                            self._close_batch_windows()
+
+                    if self._stop:
+                        break
+            else:
+                # 正常轮次完成后遗留的挂起项没有对应的预开批次，按原有恢复机制处理。
+                self._drain_deferred_queue(l_idx, total, task_name=task_name)
+
+            if self._stop:
+                break
+            l_idx += 1
+
+    def _run_standard(self, total, task_name=""):
+        """保留原有逐行执行路径，作为不适用分批模式时的兼容回退。"""
+        l_idx = self.start_l
+        while not self._stop:
+            has_pending_deferred = bool(self._deferred_queue)
+            is_normal_round = l_idx < self.loops
+            if not is_normal_round and not has_pending_deferred:
+                break
+
+            self._cur_l = l_idx
+            if is_normal_round:
+                if self.loops > 1 or l_idx > 0:
+                    self.log_sig.emit(f"🔄 === 第 {l_idx+1}/{self.loops} 轮循环 ===", "purple")
+            else:
+                self.log_sig.emit(f"🔄 === 延后恢复轮 {l_idx+1} ===", "purple")
+
+            if is_normal_round:
+                t_start = self.start_t if l_idx == self.start_l else 0
+                for t_idx in range(t_start, total):
+                    if self._stop:
+                        break
+                    self._drain_deferred_queue(l_idx, total, task_name=task_name, priority_only=True, wait_for_due=False)
+                    if self._stop:
+                        break
+                    s_start = self.start_s if (l_idx == self.start_l and t_idx == self.start_t) else 0
+                    result = self._run_row(l_idx, t_idx, s_start, total, task_name=task_name, resumed=False)
+                    if self._stop:
+                        break
+                    self._drain_deferred_queue(l_idx, total, task_name=task_name, priority_only=True, wait_for_due=False)
+                    if self._stop:
+                        break
+                    if result.get("state") not in ("skipped", "failed") and t_idx < total - 1 and not self.dry_run:
+                        self._wait_with_countdown(self.loop_delay, "⏳ 组间等待")
+
+            if self._stop:
+                break
+            self._drain_deferred_queue(l_idx, total, task_name=task_name)
+            l_idx += 1
+
     def run(self):
+        # CMD 诊断窗口已由 GUI 运行入口在任务校验通过后启动；工作线程仅写诊断节点。
+        live_runtime_diagnostic(f"AutoEngine 启动 task={getattr(self, '_task_name', '')}")
         self._start_time = datetime.now()  # 记录任务开始时间，用于计算已耗时间和预估剩余时间
         self._final_status = "running"
         self._stop_reason = ""
@@ -6647,46 +9695,26 @@ class AutoEngine(QThread):
         self._write_progress_status(0, self.start_l, self.start_t, total, self.start_s, len(self.actions),
                                     task_name=_task_name, status="running")  # 初始化进度状态
 
-        l_idx = self.start_l
-        while not self._stop:
-            has_pending_deferred = bool(self._deferred_queue)
-            is_normal_round = l_idx < self.loops
-            if not is_normal_round and not has_pending_deferred:
-                break
-
-            if self._stop:
-                break
-            self._cur_l = l_idx
-            if is_normal_round:
-                if self.loops > 1 or l_idx > 0:
-                    self.log_sig.emit(f"🔄 === 第 {l_idx+1}/{self.loops} 轮循环 ===", "purple")
+        try:
+            if self._is_batch_mode_usable():
+                self.log_sig.emit(
+                    f"⚡ 已启用低配分批模式：每批 {self.batch_options['batch_size']} 个，"
+                    f"每波预开 {self.batch_options['wave_size']} 个",
+                    "green"
+                )
+                self._run_batched(total, task_name=_task_name)
             else:
-                self.log_sig.emit(f"🔄 === 延后恢复轮 {l_idx+1} ===", "purple")
-
-            if is_normal_round:
-                t_start = self.start_t if l_idx == self.start_l else 0
-                for t_idx in range(t_start, total):
-                    if self._stop:
-                        break
-                    self._drain_deferred_queue(l_idx, total, task_name=_task_name, priority_only=True, wait_for_due=False)
-                    if self._stop:
-                        break
-                    s_start = self.start_s if (l_idx == self.start_l and t_idx == self.start_t) else 0
-                    result = self._run_row(l_idx, t_idx, s_start, total, task_name=_task_name, resumed=False)
-                    if self._stop:
-                        break
-                    self._drain_deferred_queue(l_idx, total, task_name=_task_name, priority_only=True, wait_for_due=False)
-                    if self._stop:
-                        break
-                    if result.get("state") != "skipped" and t_idx < total - 1 and not self.dry_run:
-                        self._wait_with_countdown(self.loop_delay, "⏳ 组间等待")
-
-            if self._stop:
-                break
-
-            self._drain_deferred_queue(l_idx, total, task_name=_task_name)
-
-            l_idx += 1
+                self._run_standard(total, task_name=_task_name)
+        except ExecutionInterrupted as interrupted:
+            # 停止/跳步信号可能恰好在预开等待里触发；它是受控结束，绝不能打印线程 Traceback。
+            if not self._stop_reason:
+                self._stop_reason = "stopped" if self._stop else "failed"
+            self.log_sig.emit(f"ℹ️ 执行在可中断等待中结束：{interrupted}", "orange")
+        except Exception as exc:
+            self._last_error = str(exc) or type(exc).__name__
+            self._stop_reason = "failed"
+            self._stop = True
+            self.log_sig.emit(f"❌ 执行引擎异常已捕获：{self._last_error}", "red")
 
         if self.dry_run:
             self.log_sig.emit("🧪 ===== 试运行完成 =====", "purple")
@@ -7473,6 +10501,12 @@ class AutoManager(QMainWindow):
                 self.setWindowIcon(resolved_icon)
                 break
         self.config = load_config(); self.current_task = ""  # will be set correctly when task_combo is built
+        # current_task 在排程期间可临时指向正在运行的后台任务；此字段只记录当前可见流程编辑器
+        # 实际渲染的是哪个任务，防止旧控件反向覆盖后台任务的步骤默认模式。
+        self._visible_action_editor_task = ""
+        # 批量数据表与流程编辑器一样可能在排程期间保留旧任务控件；单独记录其归属。
+        self._visible_data_editor_task = ""
+        self._schedule_editor_task_before_run = ""
         self._config_load_error = CONFIG_LOAD_ERROR
         self._config_load_backup_path = CONFIG_LOAD_BACKUP_PATH
         self.recording_idx = -1; self.resume_point = (0, 0, 0); self._timer_config = None
@@ -7484,6 +10518,9 @@ class AutoManager(QMainWindow):
         self._last_run_failures = []     # filtered failure list for quick navigation
         self._hotkey_hooks = []  # keyboard hook handles
         self._task_queue = []  # pending tasks for sequential run
+        # 仅在本次排程运行期使用：记录“低配分批预开”失败过的任务。
+        # 后续纯“按账号读取”任务会据此被跳过，互不依赖的任务继续执行。
+        self._schedule_failed_preopen_tasks = set()
         self._is_initializing = True # [新增] 初始化标志位，防止提前触发 UI 逻辑导致崩溃
         self.osd = FloatingProgressWindow() # [新增] 置顶悬浮进度窗
         if resolved_icon is not None:
@@ -7493,6 +10530,11 @@ class AutoManager(QMainWindow):
         self.osd.request_skip_step.connect(self._osd_skip_step)   # [v3] 跳步
         self.osd.request_next_row.connect(self._osd_next_row)     # [v3] 下一行
         self.osd.request_retry_step.connect(self._osd_retry_step) # [v3] 重试
+        self.osd.request_close.connect(self._close_osd_window)
+        # keyboard 库的全局热键回调运行在非 GUI 线程；必须经 Qt 排队信号进入主线程，
+        # 不能在回调线程调用 QTimer.singleShot（该线程没有 Qt 事件循环）。
+        self._hotkey_event_bridge = WorkerEventBridge(self)
+        self._hotkey_event_bridge.event_sig.connect(self._on_hotkey_event, Qt.QueuedConnection)
         
         # Restore layout from config
         layout_cfg = self.config.get("layout", {})
@@ -7742,7 +10784,8 @@ class AutoManager(QMainWindow):
         
         act_ly.addLayout(act_ctrl)
         
-        self.action_table = DragSortActionTable(0, 5); self.action_table.setObjectName("ActionTable"); self.action_table.setHorizontalHeaderLabels(["步骤说明", "指令类型", "坐标/窗口", "默认参数/变量", "延时"])
+        # [新增] 步骤启用开关：在“流程编排”表格最左侧增加复选框列，用于临时禁用某些步骤
+        self.action_table = DragSortActionTable(0, 6); self.action_table.setObjectName("ActionTable"); self.action_table.setHorizontalHeaderLabels(["启用", "步骤说明", "指令类型", "坐标/窗口", "默认参数/变量", "延时"])
         self.action_table.setHorizontalHeader(ManualWidthHeader(Qt.Horizontal, self.action_table))
         self.action_table.setAlternatingRowColors(True)
         self.action_table.setShowGrid(False)
@@ -7752,15 +10795,17 @@ class AutoManager(QMainWindow):
         self.action_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.action_table.verticalHeader().setMinimumSectionSize(34)
         self.action_table.verticalHeader().setDefaultSectionSize(38)
-        self.action_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
-        self.action_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
-        self.action_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
-        self.action_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.action_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)
+        self.action_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.action_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.action_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.action_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Interactive)
+        self.action_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.action_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Fixed)
         self.action_table.horizontalHeader().setStretchLastSection(False)
         self.action_table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
-        self.action_table.setColumnWidth(1, 132)
-        self.action_table.setColumnWidth(4, 92)
+        self.action_table.setColumnWidth(0, 54)
+        self.action_table.setColumnWidth(2, 132)
+        self.action_table.setColumnWidth(5, 92)
         self.action_table.horizontalHeader().sectionResized.connect(self._on_action_column_resized)
         self.action_table.verticalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.action_table.verticalHeader().customContextMenuRequested.connect(self._show_action_header_menu)
@@ -7845,7 +10890,7 @@ class AutoManager(QMainWindow):
         data_ctrl = QHBoxLayout()
         data_ctrl.setContentsMargins(0, 0, 0, 0)
         data_ctrl.setSpacing(6)
-        btn_sync = QPushButton("🔄 同步表头"); btn_sync.setToolTip("根据流程编排同步批量数据的列结构：新增缺失列、移除无效列，不覆盖已填写内容。")
+        btn_sync = QPushButton("🔄 同步表头"); btn_sync.setToolTip("根据流程编排同步批量数据列结构。打开网址列仅同步独立/读取/关闭模式，保留每行的网址、账号及其他已填写内容。")
         btn_sync.clicked.connect(self._sync_data_headers); data_ctrl.addWidget(btn_sync)
         btn_reset = QPushButton("🧹 重置预设"); btn_reset.setStyleSheet("background-color: #ffebee; border: 1px solid #ef9a9a;")
         btn_reset.setToolTip("将当前任务的所有批量数据（可编辑步骤列）强制重置为流程编排里的默认参数/变量。不会影响“选择”勾选。")
@@ -7896,7 +10941,8 @@ class AutoManager(QMainWindow):
         self.data_col_width_slider.setValue(int(layout_cfg.get("data_row_height", 28)))
         self.data_col_width_slider.setToolTip("统一调整批量数据区所有行的高度。")
         self.data_col_width_slider.valueChanged.connect(self._set_data_row_height)
-        self.chk_only_current = QCheckBox("仅执行当前任务"); self.chk_only_current.setChecked(True)
+        # 默认执行任务链；如只想运行当前任务，用户可手动勾选“仅执行当前任务”。
+        self.chk_only_current = QCheckBox("仅执行当前任务"); self.chk_only_current.setChecked(False)
         self.chk_continue_on_fail = QCheckBox("❌ 失败也继续"); self.chk_continue_on_fail.setToolTip("当某个任务因“停止策略”失败时，是否继续执行后续任务；失败项会在最后汇总。"); self.chk_continue_on_fail.setChecked(True)
         self.chk_auto_shutdown = QCheckBox("🏁 任务完关机")
         self.chk_show_osd = QCheckBox("🖥️ 显示置顶进度条"); self.chk_show_osd.setChecked(True)
@@ -8019,7 +11065,42 @@ class AutoManager(QMainWindow):
         self.btn_stop = QPushButton("🛑 停止执行"); self.btn_stop.setFixedHeight(45); self.btn_stop.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;"); self.btn_stop.setEnabled(False); self.btn_stop.clicked.connect(self._stop_execution); h_ctrl.addWidget(self.btn_stop, 1)
         console_layout.addLayout(h_ctrl)
 
+        # 低配电脑专用：将昂贵的浏览器冷启动集中到预开阶段，业务阶段只复用窗口。
+        batch_cfg = layout_cfg.get("low_spec_batch", {}) if isinstance(layout_cfg.get("low_spec_batch", {}), dict) else {}
+        batch_ctrl = QHBoxLayout()
+        self.chk_low_spec_batch = QCheckBox("⚡ 低配分批运行")
+        self.chk_low_spec_batch.setChecked(bool(batch_cfg.get("enabled", False)))
+        self.chk_low_spec_batch.setToolTip("启用后：每批先按波次并发预开账号窗口，窗口稳定后统一执行业务步骤，最后统一关闭本批窗口。仅对“打开网址 → 单独打开并记录”步骤生效。")
+        batch_ctrl.addWidget(self.chk_low_spec_batch)
+        batch_ctrl.addWidget(QLabel("每批:"))
+        self.batch_size_spin = QSpinBox(); self.batch_size_spin.setRange(1, 200); self.batch_size_spin.setSuffix(" 个")
+        self.batch_size_spin.setValue(int(batch_cfg.get("batch_size", 30) or 30)); self.batch_size_spin.setToolTip("每个完整批次包含的最大数据行数。建议先试 20、30、40，再决定是否使用 50。")
+        batch_ctrl.addWidget(self.batch_size_spin)
+        batch_ctrl.addWidget(QLabel("每波预开:"))
+        self.batch_wave_spin = QSpinBox(); self.batch_wave_spin.setRange(1, 50); self.batch_wave_spin.setSuffix(" 个")
+        self.batch_wave_spin.setValue(int(batch_cfg.get("wave_size", 10) or 10)); self.batch_wave_spin.setToolTip("每波同时发起启动命令的窗口数；低配电脑建议 5-10，避免瞬时内存和磁盘压力。")
+        batch_ctrl.addWidget(self.batch_wave_spin)
+        batch_ctrl.addWidget(QLabel("波次缓冲:"))
+        self.batch_wave_interval_spin = QSpinBox(); self.batch_wave_interval_spin.setRange(0, 60); self.batch_wave_interval_spin.setSuffix(" 秒")
+        self.batch_wave_interval_spin.setValue(int(batch_cfg.get("wave_interval", 2) or 0)); self.batch_wave_interval_spin.setToolTip("两波预开之间的等待时间。")
+        batch_ctrl.addWidget(self.batch_wave_interval_spin)
+        batch_ctrl.addWidget(QLabel("稳定等待:"))
+        self.batch_settle_spin = QSpinBox(); self.batch_settle_spin.setRange(0, 8); self.batch_settle_spin.setSuffix(" 秒")
+        self.batch_settle_spin.setValue(min(8, int(batch_cfg.get("settle_seconds", 8) or 0))); self.batch_settle_spin.setToolTip("最后一波启动后统一等待窗口、账号 profile 与首屏稳定的时间（最多 8 秒，避免排程长时间卡住）。")
+        batch_ctrl.addWidget(self.batch_settle_spin)
+        self.chk_batch_auto_close = QCheckBox("🏁 批完自动关窗")
+        self.chk_batch_auto_close.setChecked(bool(batch_cfg.get("close_batch_windows", True)))
+        self.chk_batch_auto_close.setToolTip("【开关】开启：每批任务做完自动关闭该批窗口；关闭：保留所有窗口供人工检查。")
+        batch_ctrl.addWidget(self.chk_batch_auto_close)
+        batch_ctrl.addStretch()
+        for control in (self.chk_low_spec_batch, self.batch_size_spin, self.batch_wave_spin,
+                        self.batch_wave_interval_spin, self.batch_settle_spin, self.chk_batch_auto_close):
+            signal = getattr(control, "stateChanged", None) or getattr(control, "valueChanged", None)
+            signal.connect(self._save_low_spec_batch_settings)
+        console_layout.addLayout(batch_ctrl)
+
         # Hotkey status bar
+
         hk_row_widget = QWidget()
         hk_row_widget.setMinimumHeight(45) # 显式设置热键栏最小高度，防止遮挡
         hk_row = QHBoxLayout(hk_row_widget)
@@ -8091,7 +11172,8 @@ class AutoManager(QMainWindow):
         # Guard: ignore changes triggered during _refresh_actions (blockSignals covers table-level signals
         # but setCellWidget/setItem on col 0 can still fire in edge cases; double-check signals state)
         if self.action_table.signalsBlocked(): return
-        if item.column() == 0 and self.current_task:
+        # [新增] 表格第 1 列才是“步骤说明”；第 0 列为“启用”复选框
+        if item.column() == 1 and self.current_task:
             idx = item.row()
             if idx < len(self.config['tasks'][self.current_task]):
                 old_name = self.config['tasks'][self.current_task][idx]['name']
@@ -8220,24 +11302,33 @@ class AutoManager(QMainWindow):
     def _restore_action_column_widths(self):
         if not hasattr(self, "action_table"):
             return
-        widths = self.config.get("layout", {}).get("action_col_widths", [190, 132, 150, 340, 92])
+        widths = self.config.get("layout", {}).get("action_col_widths", [54, 190, 132, 150, 340, 92])
         hdr = self.action_table.horizontalHeader()
+        # 兼容旧版本（5 列）布局：自动插入“启用”列宽度
+        try:
+            if isinstance(widths, list) and len(widths) == 5 and hdr.count() == 6:
+                widths = [54, *widths]
+        except Exception:
+            pass
         self._syncing_action_column_width = True
         try:
             for i in range(min(hdr.count(), len(widths))):
                 width = int(widths[i])
-                if i == 1:
+                if i == 0:
+                    width = min(max(42, width), 84)
+                elif i == 2:
                     width = min(max(120, width), 170)
-                elif i == 3:
-                    width = min(max(240, width), 640)
                 elif i == 4:
+                    width = min(max(240, width), 640)
+                elif i == 5:
                     width = min(max(88, width), 108)
                 else:
                     width = min(max(96, width), 520)
                 self.action_table.setColumnWidth(i, width)
         finally:
             self._syncing_action_column_width = False
-        hdr.setMinimumSectionSize(88)
+        # [调整] 启用列较窄，降低最小列宽限制
+        hdr.setMinimumSectionSize(42)
 
     def _on_action_column_resized(self, logical_index, old_size, new_size):
         if getattr(self, "_syncing_action_column_width", False):
@@ -9350,23 +12441,60 @@ class AutoManager(QMainWindow):
             self._log(f"🗑️ 已批量删除 {len(tasks_to_del)} 个任务", "orange")
 
     def _clone_task(self):
-        old_name = self._get_primary_selected_task_path()
-        if not old_name: return
-        pure_name = self._get_task_name_only(old_name)
-        cat_prefix = self._get_task_folder(old_name)
+        old_names = self._get_selected_task_paths()
+        if not old_names:
+            return
         
-        name, ok = QInputDialog.getText(self, "克隆任务", f"请输入新任务名称 (基于 '{pure_name}' 克隆):", text=f"{pure_name}_副本")
-        if ok and name:
+        import copy
+        target_names = []
+        if len(old_names) == 1:
+            old_name = old_names[0]
+            pure_name = self._get_task_name_only(old_name)
+            cat_prefix = self._get_task_folder(old_name)
+            default_new_name = self._make_unique_task_name(f"{pure_name}_副本", folder=cat_prefix)
+            
+            name, ok = QInputDialog.getText(self, "克隆任务", f"请输入新任务名称 (基于 '{pure_name}' 克隆):", text=default_new_name)
+            if not ok or not name.strip():
+                return
+            target_names.append((old_name, name.strip(), cat_prefix))
+        else:
+            reply = QMessageBox.question(
+                self, '确认批量克隆',
+                f"确定要批量克隆选中的 {len(old_names)} 个任务吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply != QMessageBox.Yes:
+                return
+            for old_name in old_names:
+                pure_name = self._get_task_name_only(old_name)
+                cat_prefix = self._get_task_folder(old_name)
+                new_name = self._make_unique_task_name(f"{pure_name}_副本", folder=cat_prefix)
+                target_names.append((old_name, new_name, cat_prefix))
+
+        last_new_id = None
+        for old_name, new_name, cat_prefix in target_names:
             new_task_id = _new_task_id(set(self.config.get("tasks", {}).keys()))
-            import copy
+            unique_name = self._make_unique_task_name(new_name, folder=cat_prefix, exclude_task_id=new_task_id)
             self.config['tasks'][new_task_id] = copy.deepcopy(self.config['tasks'][old_name])
             self.config['task_data'][new_task_id] = copy.deepcopy(self.config['task_data'].get(old_name, []))
-            self._set_task_location(new_task_id, folder=cat_prefix, name=name.strip())
+            self._set_task_location(new_task_id, folder=cat_prefix, name=unique_name)
             
-            save_config(self.config)
-            self._reload_task_combo_after_config_change(new_task_id)
-            self._refresh_schedule_task_options()
+            # 同时复制任务元数据（如 layout 等）
+            if 'tasks_layout' in self.config and old_name in self.config['tasks_layout']:
+                self.config['tasks_layout'][new_task_id] = copy.deepcopy(self.config['tasks_layout'][old_name])
+            if 'task_meta' in self.config and old_name in self.config['task_meta']:
+                meta = copy.deepcopy(self.config['task_meta'][old_name])
+                meta['name'] = unique_name
+                meta['folder'] = cat_prefix
+                self.config['task_meta'][new_task_id] = meta
+
+            last_new_id = new_task_id
             self._log(f"📋 已克隆任务 '{self._get_task_path(old_name)}' 为 '{self._get_task_path(new_task_id)}'", "blue")
+
+        save_config(self.config)
+        self._reload_task_combo_after_config_change(last_new_id)
+        self._refresh_schedule_task_options()
+        self._log(f"📋 已成功批量克隆 {len(target_names)} 个任务", "green")
 
     def _show_task_list_menu(self, pos):
         item = self.task_tree.itemAt(pos)
@@ -9462,35 +12590,148 @@ class AutoManager(QMainWindow):
                 self._set_sched_status(i, "已禁用")
                 continue
             task_name = self._get_sched_task_name(i)
-            if not task_name: continue
-            tasks_to_run.append({'row': i, 'task': task_name})
+            if not task_name:
+                continue
+            # 启动排程时冻结每一项的流程和数据。运行中切换任务树、刷新编辑器或
+            # 任何延迟界面信号都不得改写后续任务的“独立/读取/关闭”打开网址模式。
+            tasks_to_run.append({
+                'row': i,
+                'task': task_name,
+                'actions_snapshot': copy.deepcopy(self.config.get("tasks", {}).get(task_name, [])),
+                'data_snapshot': copy.deepcopy(self.config.get("task_data", {}).get(task_name, [{}])),
+            })
             self._set_sched_status(i, "等待中")
 
         if not tasks_to_run: return
+        # 记住排程启动前实际显示在流程编辑器中的任务；排程的轻量后台切换不会重绘编辑器，
+        # 因而结束时必须恢复它，不能让 current_task 停在最后一个后台任务。
+        self._schedule_editor_task_before_run = str(
+            getattr(self, "_visible_action_editor_task", "") or self.current_task or ""
+        )
+        # 每次启动新的排程包时重置依赖失败记录，绝不把上一次运行的结果带入本次。
+        self._schedule_failed_preopen_tasks = set()
         self._log("🚀 启动序列化排程运行...", "purple")
         self._run_next_scheduled_task(tasks_to_run, 0)
 
-    def _run_next_scheduled_task(self, task_list, index):
+    def _task_window_mode_summary(self, task_id, actions_snapshot=None):
+        """返回任务是否会独立预开窗口、是否只读取已绑定窗口。
+
+        判定只读取已保存的步骤定义，而不会扫描浏览器或修改任务配置。任务包含
+        ``independent/standalone/record_handle`` 时可自行建立窗口，不会因为前项预开失败被跳过；
+        任务只包含 ``read_by_profile`` 时才是依赖前项窗口绑定的候选任务。
+        """
+        actions = actions_snapshot if isinstance(actions_snapshot, list) else self.config.get("tasks", {}).get(task_id, [])
+        has_independent = False
+        has_read_by_profile = False
+        if not isinstance(actions, list):
+            return {"independent": False, "read_by_profile": False}
+        for act in actions:
+            if not isinstance(act, dict):
+                continue
+            if CMD_MAP.get(act.get("action"), "click") != "open_url":
+                continue
+            parts = [str(p).strip().lower() for p in str(act.get("value", "") or "").split("|")]
+            mode = parts[2] if len(parts) > 2 else ""
+            if mode in ("independent", "standalone", "record_handle"):
+                has_independent = True
+            elif mode == "read_by_profile":
+                has_read_by_profile = True
+        return {"independent": has_independent, "read_by_profile": has_read_by_profile}
+
+    def _should_skip_for_failed_preopen(self, task_id, actions_snapshot=None):
+        """仅跳过纯按账号读取的排程项；独立预开或普通任务一律继续执行。"""
+        if not getattr(self, "_schedule_failed_preopen_tasks", set()):
+            return False
+        modes = self._task_window_mode_summary(task_id, actions_snapshot=actions_snapshot)
+        return bool(modes["read_by_profile"] and not modes["independent"])
+
+    def _run_next_scheduled_task(self, task_list, index, previous_status="done"):
+        """顺序消费排程队列；失败项与依赖预开失败项均跳过，但绝不终止整个排程。"""
+        previous_info = previous_status if isinstance(previous_status, dict) else {"status": previous_status}
+        previous_state = str(previous_info.get("status", "done") or "done").lower()
         if index > 0:
             prev_row = task_list[index - 1]['row']
-            self._set_sched_status(prev_row, "已完成")
+            if previous_state == "failed":
+                self._set_sched_status(prev_row, "失败已跳过")
+                self._log(f"⚠️ 排程第 {index} 项失败已跳过，继续下一项。", "orange")
+            elif previous_state == "skipped_dependency":
+                self._set_sched_status(prev_row, "因预开失败跳过")
+            else:
+                self._set_sched_status(prev_row, "已完成")
 
         if index >= len(task_list):
+            # 所有排程已结束，允许用户通过悬浮窗的“关闭窗口”按钮自行收起最终状态。
+            self.osd.set_execution_active(False)
+            # 排程真正结束时必须覆盖最后一行的中间进度，避免 OSD 停留在 94% 等旧值。
+            self.progress.setValue(100)
+            if self.chk_show_osd.isChecked():
+                self.osd.bar.setValue(100)
+                self.osd.lbl_pct.setText("100%")
+                self.osd.lbl_info.setText("✅ 所有排程任务已完成")
+                self.osd.lbl_detail.setText("全部排程已处理完毕")
+                self.osd.show()
+                self._keep_osd_front_and_clear()
             self._log("✅ 所有排程任务已完成", "green")
+            self._restore_editor_after_schedule()
             if self.chk_sched_shutdown.isChecked():
                 self._log("🏁 所有排程任务已完成，即将按设置进入自动关机倒计时", "green")
                 ShutdownDialog(self).exec_()
             return
 
-        task_name = task_list[index]['task']
-        row = task_list[index]['row']
-        # 切换侧边栏选中项
-        self._activate_task_by_id(task_name)
+        task_entry = task_list[index]
+        task_name = task_entry['task']
+        row = task_entry['row']
+        actions_snapshot = task_entry.get('actions_snapshot')
+        data_snapshot = task_entry.get('data_snapshot')
+
+        # 前项低配分批预开失败时，纯“按账号读取”任务没有可验证的窗口绑定。
+        # 此处仅跳过这类依赖项；含独立预开步骤或不涉及账号窗口的任务仍照常运行。
+        if self._should_skip_for_failed_preopen(task_name, actions_snapshot=actions_snapshot):
+            self._set_sched_status(row, "因预开失败跳过")
+            self._log(
+                f"⏭️ 排程第 {index + 1} 项 [{self._get_task_display_text(task_name, with_folder=True)}] "
+                "依赖前项预开的账号窗口，已跳过；其他后续任务继续执行。",
+                "orange"
+            )
+            QTimer.singleShot(
+                0,
+                lambda: self._run_next_scheduled_task(
+                    task_list, index + 1, {"status": "skipped_dependency"}
+                )
+            )
+            return
+        
+        # 排程只按已保存配置执行，不需要重绘流程编辑器和整张批量数据表。
+        # 旧逻辑 open_editor=True 会触发 _on_task_changed → _refresh_actions/_refresh_data_table，
+        # 大任务下这会长期占用 GUI 主线程，使 OSD、主日志和排程页看似卡死。
+        self.current_task = task_name
+        self._select_task_in_tree(task_name)
+        if self.current_task != task_name:
+            raise RuntimeError(f"排程无法激活目标任务：{task_name}")
+        self._log(f"📅 排程轻量切换任务：[{self._get_task_display_text(task_name, with_folder=True)}]（不重绘编辑表格）", "gray")
+        # 排程随后以 config 中已保存的任务定义为唯一来源，禁止残留 UI 反向写入。
+        
         self._set_sched_status(row, "正在执行...")
         self.sched_table.setCurrentCell(row, 1)
 
-        # 启动执行，执行完后回调执行下一个
-        self._run_all(on_finished=lambda: self._run_next_scheduled_task(task_list, index + 1))
+        # 启动执行；无论成功还是失败，回调都会携带状态并继续消费下一条排程。
+        self._run_all(
+            on_finished=lambda outcome="done": self._run_next_scheduled_task(task_list, index + 1, outcome),
+            scheduled_actions_snapshot=actions_snapshot,
+            scheduled_data_snapshot=data_snapshot,
+        )
+
+    def _restore_editor_after_schedule(self):
+        """排程结束后恢复运行前的可见编辑器，避免后台 current_task 与控件内容错位。"""
+        target = str(getattr(self, "_schedule_editor_task_before_run", "") or "").strip()
+        self._schedule_editor_task_before_run = ""
+        if not target or target not in self.config.get("tasks", {}):
+            return
+        # 即使最后一个排程项恰好与 target 相同，也强制刷新一次，确保编辑器标签与 current_task 一致。
+        self.current_task = ""
+        self._select_task_in_tree(target)
+        self._on_task_changed(target)
+        self._log(f"📌 排程结束：已恢复流程编辑器到 [{self._get_task_display_text(target, with_folder=True)}]", "gray")
 
     def _move_task_up(self):
         """将当前任务在列表中上移一位。"""
@@ -9695,12 +12936,36 @@ class AutoManager(QMainWindow):
             "4. 数据表变量: {{列名}} (从 CSV/Excel 中读取)"
         )
 
-        acts = self.config['tasks'].get(self.current_task, []); self.action_table.blockSignals(True); self.action_table.setRowCount(len(acts))
+        acts = self.config['tasks'].get(self.current_task, [])
+        # [新增] 迁移：旧配置没有 enabled 字段时，默认补 True，避免首次打开时复选框状态不一致
+        _need_save = False
+        for _a in acts:
+            if isinstance(_a, dict) and "enabled" not in _a:
+                _a["enabled"] = True
+                _need_save = True
+        if _need_save:
+            save_config(self.config)
+
+        # 重建多行控件时暂停重绘，结束后一次性刷新，避免每插入一个控件都触发界面布局计算。
+        self.action_table.setUpdatesEnabled(False)
+        self.action_table.blockSignals(True); self.action_table.setRowCount(len(acts))
         for i, a in enumerate(acts):
+            # 0) 启用复选框
+            w_enable = QWidget()
+            l_enable = QHBoxLayout(w_enable)
+            l_enable.setContentsMargins(0, 0, 0, 0)
+            l_enable.setAlignment(Qt.AlignCenter)
+            chk_enable = QCheckBox()
+            chk_enable.setChecked(bool(a.get("enabled", True)))
+            chk_enable.setToolTip("取消勾选：临时禁用该步骤（执行时会自动跳过，不会删除步骤/不改列结构）")
+            chk_enable.stateChanged.connect(lambda state, idx=i: self._update_config(idx, "enabled", state == Qt.Checked))
+            l_enable.addWidget(chk_enable)
+            self.action_table.setCellWidget(i, 0, w_enable)
+
             item_name = QTableWidgetItem(a.get('name', f'步骤{i+1}'))
             item_name.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-            self.action_table.setItem(i, 0, item_name)
-            cb = QComboBox(); cb.addItems(list(CMD_MAP.keys())); cb.blockSignals(True); cb.setCurrentText(a.get('action', '左键点击')); cb.blockSignals(False); cb.currentTextChanged.connect(lambda v, idx=i: self._update_config(idx, 'action', v)); self.action_table.setCellWidget(i, 1, cb)
+            self.action_table.setItem(i, 1, item_name)
+            cb = QComboBox(); cb.addItems(list(CMD_MAP.keys())); cb.blockSignals(True); cb.setCurrentText(a.get('action', '左键点击')); cb.blockSignals(False); cb.currentTextChanged.connect(lambda v, idx=i: self._update_config(idx, 'action', v)); self.action_table.setCellWidget(i, 2, cb)
             ds = QSpinBox(); ds.setRange(0, 99999); ds.blockSignals(True); ds.setValue(int(a.get('delay', 1))); ds.blockSignals(False); ds.setSuffix(" 秒")
             ds.setToolTip(self._format_seconds(ds.value()))
             def _apply_delay_style(s, v, default=1):
@@ -9712,7 +12977,7 @@ class AutoManager(QMainWindow):
                     s.setToolTip(self._format_seconds(v))
             _apply_delay_style(ds, ds.value())
             ds.valueChanged.connect(lambda v, idx=i, s=ds: [self._update_config(idx, 'delay', v), _apply_delay_style(s, v)])
-            self.action_table.setCellWidget(i, 4, ds)
+            self.action_table.setCellWidget(i, 5, ds)
 
             act_name = a.get('action')
             if act_name == "激活窗口":
@@ -9722,7 +12987,7 @@ class AutoManager(QMainWindow):
                 btn = QPushButton(_btn_label if _btn_label else "选择窗口")
                 btn.setToolTip(_raw_val)  # 悬浮显示完整标识信息
                 btn.clicked.connect(lambda chk, idx=i: self._select_window(idx))
-                self.action_table.setCellWidget(i, 2, btn)
+                self.action_table.setCellWidget(i, 3, btn)
             elif "图像识别点击" in act_name:
                 w_cap = QWidget(); l_cap = QHBoxLayout(w_cap); l_cap.setContentsMargins(0,0,0,0)
                 btn_region = QPushButton("✂️ 框选"); btn_region.setFixedWidth(52)
@@ -9731,10 +12996,10 @@ class AutoManager(QMainWindow):
                 btn_file   = QPushButton("📁 选图"); btn_file.setFixedWidth(52)
                 btn_file.clicked.connect(lambda chk, idx=i: self._capture_image(idx))
                 l_cap.addWidget(btn_region); l_cap.addWidget(btn_file)
-                self.action_table.setCellWidget(i, 2, w_cap)
-            elif any(x in act_name for x in ["运行程序", "屏幕截图", "等待", "延后执行", "单按键", "组合键", "如果找图成功", "如果窗口存在", "打开网址"]):
+                self.action_table.setCellWidget(i, 3, w_cap)
+            elif any(x in act_name for x in ["运行程序", "屏幕截图", "等待", "延后执行", "单按键", "组合键", "如果找图成功", "如果窗口存在", "打开网址", "关闭浏览器窗口"]):
                 btn = QPushButton("- 无需坐标 -"); btn.setEnabled(False)
-                self.action_table.setCellWidget(i, 2, btn)
+                self.action_table.setCellWidget(i, 3, btn)
             else:
                 w_pos = QWidget()
                 l_pos = QHBoxLayout(w_pos)
@@ -9749,12 +13014,12 @@ class AutoManager(QMainWindow):
                 btn.clicked.connect(lambda chk, idx=i: self._start_record(idx))
                 l_pos.addWidget(chk_guard)
                 l_pos.addWidget(btn, 1)
-                self.action_table.setCellWidget(i, 2, w_pos)
+                self.action_table.setCellWidget(i, 3, w_pos)
             if a.get('action') == "上传文件":
                 w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0)
-                le = QLineEdit(str(a.get('value', ''))); le.editingFinished.connect(lambda idx=i, target=None: self._update_config(idx, 'value', self.action_table.cellWidget(idx, 3).findChild(QLineEdit).text()))
+                le = QLineEdit(str(a.get('value', ''))); le.editingFinished.connect(lambda idx=i: self._update_config(idx, 'value', self.action_table.cellWidget(idx, 4).findChild(QLineEdit).text()))
                 btn = QPushButton("📁"); btn.setFixedWidth(30); btn.clicked.connect(lambda chk, idx=i, target=le: self._pick_default_file(idx, target))
-                l.addWidget(le); l.addWidget(btn); self.action_table.setCellWidget(i, 3, w)
+                l.addWidget(le); l.addWidget(btn); self.action_table.setCellWidget(i, 4, w)
             elif a.get('action') == "🖱️ 拖拽文件":
                 w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0); l.setSpacing(6)
                 le = QLineEdit(str(a.get('value', ''))); le.setPlaceholderText("选择要拖拽的文件...")
@@ -9766,22 +13031,73 @@ class AutoManager(QMainWindow):
                 chk.setToolTip("开启后，拖拽开始前会先点击一次目标坐标，便于你自己提前处理窗口激活。")
                 chk.stateChanged.connect(lambda _state, idx=i: self._update_drag_file_config(idx))
                 l.addWidget(le, 1); l.addWidget(btn); l.addWidget(chk)
-                self.action_table.setCellWidget(i, 3, w)
+                self.action_table.setCellWidget(i, 4, w)
             elif a.get('action') in ["单按键", "组合键"]:
-                le = KeyRecorder(); le.setText(str(a.get('value', ''))); le.key_recorded.connect(lambda v, idx=i: self._update_config(idx, 'value', v)); self.action_table.setCellWidget(i, 3, le)
+                le = ModifierButtonKeyRecorder() if a.get('action') == "组合键" else KeyRecorder()
+                le.setText(str(a.get('value', '')))
+                le.key_recorded.connect(lambda v, idx=i: self._update_config(idx, 'value', v))
+                self.action_table.setCellWidget(i, 4, le)
             elif a.get('action') == "🌐 打开网址":
-                w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0)
+                w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0); l.setSpacing(4)
                 val_parts = str(a.get('value', '')).split('|')
-                url_val = val_parts[0] if val_parts else ""; prof_val = val_parts[1] if len(val_parts) > 1 else ""
+                url_val = val_parts[0] if val_parts else ""
+                prof_val = val_parts[1] if len(val_parts) > 1 else ""
+                mode_val = val_parts[2].strip().lower() if len(val_parts) > 2 else "independent"
+                cb_mode = QComboBox(); cb_mode.setObjectName("open_url_mode")
+                cb_mode.addItem("单独打开并记录", "independent")
+                cb_mode.addItem("按账号读取", "read_by_profile")
+                cb_mode.addItem("关闭对应账号窗口", "close_by_profile")
+                # 兼容旧版 activate_from_file；关闭模式也兼容早期草案别名。
+                if mode_val in ("activate_from_file", "activate_file", "handle_file", "read_by_profile"):
+                    _mode_data = "read_by_profile"
+                elif mode_val in ("close_by_profile", "close_profile", "close_account", "close_window_by_profile"):
+                    _mode_data = "close_by_profile"
+                else:
+                    _mode_data = "independent"
+                mode_index = cb_mode.findData(_mode_data)
+                cb_mode.setCurrentIndex(max(0, mode_index))
+                cb_mode.setToolTip(
+                    "单独打开并记录：新建浏览器窗口，并把窗口句柄与当前账号绑定写入记录文件。\n"
+                    "按账号读取：从记录文件中按所选账号精准找到对应窗口，不受行数影响。\n"
+                    "关闭对应账号窗口：只关闭所选账号已绑定的窗口，绝不关闭其他账号或全部浏览器。"
+                )
                 le = QLineEdit(url_val); le.setPlaceholderText("输入网址..."); le.editingFinished.connect(lambda idx=i: self._update_url_config(idx))
-                btn_prof = QPushButton(get_profile_display_name(prof_val)); btn_prof.setToolTip("点击选择账号或已打开窗口")
-                btn_prof.setProperty("profile_id", prof_val)  # Fix: must store the raw profile ID so _update_url_config can read it
+                # 刷新流程表时不扫描本地全部 Chrome Profile；只显示轻量标签。
+                # 完整账户资料仅在用户主动点击“选择账号”时才加载。
+                if not prof_val:
+                    prof_label = "未设置账户"
+                elif "::hwnd=" in str(prof_val):
+                    prof_label = str(prof_val).split("::hwnd=", 1)[0].strip() or "已打开窗口"
+                else:
+                    prof_label = os.path.basename(os.path.normpath(str(prof_val))) or str(prof_val)
+                btn_prof = QPushButton(prof_label); btn_prof.setToolTip("单独打开时点击选择账号；按账号读取时同样需要选择对应账号")
+                btn_prof.setProperty("profile_id", prof_val)
                 btn_prof.clicked.connect(lambda chk, idx=i, b=btn_prof: self._pick_profile_for_action(idx, b))
-                l.addWidget(le, 2); l.addWidget(btn_prof, 1); self.action_table.setCellWidget(i, 3, w)
+                cb_mode.currentIndexChanged.connect(lambda _v, idx=i: self._on_open_url_mode_changed(idx))
+                l.addWidget(cb_mode, 1); l.addWidget(le, 2); l.addWidget(btn_prof, 1); self.action_table.setCellWidget(i, 4, w)
+                self._sync_open_url_mode_widget(i)
+            elif a.get('action') == "🧹 关闭浏览器窗口":
+                # value: "single" / "all"
+                w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0, 0, 0, 0); l.setSpacing(8)
+                cb = QComboBox()
+                cb.addItem("关闭单个(智能获取句柄)", "single")
+                cb.addItem("关闭全部(强制结束全部浏览器进程)", "all")
+                raw_mode = str(a.get("value", "") or "").strip().lower()
+                if raw_mode in ("all", "全部", "关闭全部"):
+                    cb.setCurrentIndex(1)
+                else:
+                    cb.setCurrentIndex(0)
+                cb.setToolTip(
+                    "关闭单个：优先关闭当前前台浏览器窗口；必要时强制结束该窗口对应进程\n"
+                    "关闭全部：强制结束全部常见浏览器进程（会影响你手动打开的浏览器）"
+                )
+                cb.currentIndexChanged.connect(lambda _v, idx=i: self._update_close_browser_config(idx))
+                l.addWidget(cb, 1)
+                self.action_table.setCellWidget(i, 4, w)
             elif a.get('action') == "⏸️ 延后执行":
                 self._build_defer_action_widget(i, a)
-            elif a.get('action') == "屏幕截图": le = QLineEdit("- 自动保存到 screenshots 目录 -"); le.setEnabled(False); self.action_table.setCellWidget(i, 3, le)
-            elif a.get('action') == "移动鼠标": le = QLineEdit("- 仅移动，不点击 -"); le.setEnabled(False); self.action_table.setCellWidget(i, 3, le)
+            elif a.get('action') == "屏幕截图": le = QLineEdit("- 自动保存到 screenshots 目录 -"); le.setEnabled(False); self.action_table.setCellWidget(i, 4, le)
+            elif a.get('action') == "移动鼠标": le = QLineEdit("- 仅移动，不点击 -"); le.setEnabled(False); self.action_table.setCellWidget(i, 4, le)
             elif a.get('action') == "运行程序" or a.get('action') == "💻 CMD 指令":
                 w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0)
                 le = QLineEdit(str(a.get('value', '')))
@@ -9791,8 +13107,8 @@ class AutoManager(QMainWindow):
                 le.editingFinished.connect(lambda idx=i, edit=le: self._update_config(idx, 'value', edit.text()))
                 btn_pre = QPushButton("📋"); btn_pre.setFixedWidth(30); btn_pre.setToolTip("CMD 预设中心")
                 btn_pre.clicked.connect(lambda chk, idx=i, target=le: self._show_cmd_presets(idx, target))
-                l.addWidget(le); l.addWidget(btn_pre); self.action_table.setCellWidget(i, 3, w)
-            elif a.get('action') == "滚轮滚动": le = QLineEdit(str(a.get('value', ''))); le.setPlaceholderText("正数向上，负数向下 (如 -500)"); le.editingFinished.connect(lambda idx=i, edit=le: self._update_config(idx, 'value', edit.text())); self.action_table.setCellWidget(i, 3, le)
+                l.addWidget(le); l.addWidget(btn_pre); self.action_table.setCellWidget(i, 4, w)
+            elif a.get('action') == "滚轮滚动": le = QLineEdit(str(a.get('value', ''))); le.setPlaceholderText("正数向上，负数向下 (如 -500)"); le.editingFinished.connect(lambda idx=i, edit=le: self._update_config(idx, 'value', edit.text())); self.action_table.setCellWidget(i, 4, le)
             elif a.get('action') in ["输入文本", "清空输入"]:
                 ed = MultiLineTextEdit()
                 ed.setText(str(a.get('value', '')))
@@ -9800,7 +13116,7 @@ class AutoManager(QMainWindow):
                 ed.setToolTip(var_tooltip)
                 ed.setMinimumHeight(76)
                 ed.editingFinished.connect(lambda idx=i, edit=ed: self._update_config(idx, 'value', edit.text()))
-                self.action_table.setCellWidget(i, 3, ed)
+                self.action_table.setCellWidget(i, 4, ed)
                 self.action_table.setRowHeight(i, max(self.action_table.rowHeight(i), 82))
             elif a.get('action') == "✨ 清空并输入(增强版)":
                 w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0); l.setSpacing(2)
@@ -9815,9 +13131,9 @@ class AutoManager(QMainWindow):
                 le_prefix.editingFinished.connect(_save_plus); le_content.editingFinished.connect(_save_plus)
                 btn_prefix.clicked.connect(lambda chk, idx=i, target=le_prefix, saver=_save_plus: self._show_clear_input_prefix_presets(idx, target, saver))
                 l.addWidget(le_prefix); l.addWidget(btn_prefix); l.addWidget(QLabel("+")); l.addWidget(le_content)
-                self.action_table.setCellWidget(i, 3, w)
+                self.action_table.setCellWidget(i, 4, w)
                 self.action_table.setRowHeight(i, max(self.action_table.rowHeight(i), 82))
-            elif "图像识别点击" in act_name: le = QLineEdit(str(a.get('value', ''))); le.setPlaceholderText("图片路径..."); le.editingFinished.connect(lambda idx=i, edit=le: self._update_config(idx, 'value', edit.text())); self.action_table.setCellWidget(i, 3, le)
+            elif "图像识别点击" in act_name: le = QLineEdit(str(a.get('value', ''))); le.setPlaceholderText("图片路径..."); le.editingFinished.connect(lambda idx=i, edit=le: self._update_config(idx, 'value', edit.text())); self.action_table.setCellWidget(i, 4, le)
             elif any(x in act_name for x in ["如果找图成功", "如果窗口存在"]):
                 w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0); l.setSpacing(2)
                 val_parts = [p.strip() for p in str(a.get('value', '')).split('|')]
@@ -9847,11 +13163,15 @@ class AutoManager(QMainWindow):
                 cb_fail.currentTextChanged.connect(lambda v, idx=i: self._update_if_config(idx))
                 
                 l.addWidget(le_target, 2); l.addWidget(btn_pick); l.addWidget(cb_ok, 1); l.addWidget(cb_fail, 1)
-                self.action_table.setCellWidget(i, 3, w)
+                self.action_table.setCellWidget(i, 4, w)
             else:
-                le = QLineEdit(str(a.get('value', ''))); le.setPlaceholderText("输入内容..."); le.setToolTip(var_tooltip); le.editingFinished.connect(lambda idx=i, edit=le: self._update_config(idx, 'value', edit.text())); self.action_table.setCellWidget(i, 3, le)
+                le = QLineEdit(str(a.get('value', ''))); le.setPlaceholderText("输入内容..."); le.setToolTip(var_tooltip); le.editingFinished.connect(lambda idx=i, edit=le: self._update_config(idx, 'value', edit.text())); self.action_table.setCellWidget(i, 4, le)
         self.action_table.blockSignals(False)
         self._restore_action_column_widths()
+        self.action_table.setUpdatesEnabled(True)
+        self.action_table.viewport().update()
+        # 只有完整渲染成功后，流程编辑器才可被允许写回 current_task。
+        self._visible_action_editor_task = str(self.current_task or "")
 
     def _normalize_defer_policy_label(self, text):
         return "到时优先恢复" if str(text).strip() in ("到时优先恢复", "到时间优先恢复", "优先恢复") else "整轮后再恢复"
@@ -9940,7 +13260,7 @@ class AutoManager(QMainWindow):
 
             if not hasattr(self, "action_table"):
                 continue
-            w = self.action_table.cellWidget(idx, 3)
+            w = self.action_table.cellWidget(idx, 4)
             if not w:
                 continue
             cb_resume = w.findChild(QComboBox, "defer_resume_mode")
@@ -10038,7 +13358,7 @@ class AutoManager(QMainWindow):
         return f"{seconds} | {resume_mode} | {target} | {policy}"
 
     def _update_defer_target_visibility(self, idx):
-        w = self.action_table.cellWidget(idx, 3)
+        w = self.action_table.cellWidget(idx, 4)
         if not w:
             return
         cb_resume = w.findChild(QComboBox, "defer_resume_mode")
@@ -10050,7 +13370,7 @@ class AutoManager(QMainWindow):
         cb_target.setEnabled(is_target_mode and cb_target.count() > 0)
 
     def _update_defer_config(self, idx):
-        w = self.action_table.cellWidget(idx, 3)
+        w = self.action_table.cellWidget(idx, 4)
         acts = self.config['tasks'].get(self.current_task, [])
         if not w or idx >= len(acts):
             return
@@ -10112,7 +13432,7 @@ class AutoManager(QMainWindow):
         l.addWidget(cb_policy, 0)
         l.addWidget(cb_resume, 0)
         l.addWidget(cb_target, 1)
-        self.action_table.setCellWidget(idx, 3, w)
+        self.action_table.setCellWidget(idx, 4, w)
         self._update_defer_target_visibility(idx)
         return w
 
@@ -10179,22 +13499,95 @@ class AutoManager(QMainWindow):
 
         self.lbl_deferred_summary.setText(f"当前挂起 {len(items)} 项，其中 {ready_count} 项已到时")
 
+    def _sync_open_url_mode_widget(self, idx):
+        """根据打开模式切换目标控件。两种模式均可选择账号。"""
+        w = self.action_table.cellWidget(idx, 4)
+        if not w:
+            return
+        cb_mode = w.findChild(QComboBox, "open_url_mode")
+        le = w.findChild(QLineEdit)
+        btn = w.findChild(QPushButton)
+        if not cb_mode or not btn:
+            return
+        mode = cb_mode.currentData() or "independent"
+        # 清除旧版 token（如果之前是旧版 activate_from_file 模式残留的 token）
+        if btn.property("profile_id") == OPEN_URL_HANDLE_FILE_TOKEN:
+            btn.setProperty("profile_id", btn.property("independent_profile_id") or "")
+        prof_id = btn.property("profile_id") or ""
+        btn.setText(get_profile_ui_label(prof_id))
+        btn.setEnabled(True)
+        if mode in ("read_by_profile", "close_by_profile"):
+            if mode == "close_by_profile":
+                btn.setToolTip("关闭对应账号窗口：点击选择要关闭的账号；只会关闭该账号的已绑定窗口")
+                placeholder = "此模式无需输入网址，仅关闭所选账号窗口"
+                tooltip = "执行时只定位并关闭所选账号的已绑定浏览器窗口"
+            else:
+                btn.setToolTip("按账号读取模式：点击选择要激活的账号，程序将从记录文件中精准找到该账号对应的浏览器窗口")
+                placeholder = "此模式无需输入网址，执行时仅切换账号窗口"
+                tooltip = "按账号读取模式下不会打开网址，只会切换到所选账号对应的浏览器窗口"
+            if le:
+                if le.isEnabled() and le.text().strip():
+                    le.setProperty("independent_url_cache", le.text())
+                le.setText("")
+                le.setEnabled(False)
+                le.setPlaceholderText(placeholder)
+                le.setToolTip(tooltip)
+        else:
+            btn.setToolTip("单独打开模式：点击选择要打开的账号")
+            if le:
+                if not le.isEnabled():
+                    le.setText(str(le.property("independent_url_cache") or ""))
+                le.setEnabled(True)
+                le.setPlaceholderText("输入网址...")
+                le.setToolTip(le.text() or "输入要打开的网址")
+
+    def _on_open_url_mode_changed(self, idx):
+        self._sync_open_url_mode_widget(idx)
+        self._update_url_config(idx)
+
     def _update_url_config(self, idx, btn=None):
-        w = self.action_table.cellWidget(idx, 3)
+        w = self.action_table.cellWidget(idx, 4)
         if not w: return
         le = w.findChild(QLineEdit)
+        cb_mode = w.findChild(QComboBox, "open_url_mode")
         if btn is None:
             btn = w.findChild(QPushButton)
-        prof_id = btn.property("profile_id") if btn else ""
-        prof_id = prof_id or ""
-        url_text = le.text() if le else ""
-        val = f"{url_text}|{prof_id}"
+        mode = cb_mode.currentData() if cb_mode else "independent"
+        # 两种模式均直接保存真实 profile_id，不再写入 token
+        prof_id = (btn.property("profile_id") if btn else "") or ""
+        # 如果还残留旧版 token，清除成空字符串
+        if prof_id == OPEN_URL_HANDLE_FILE_TOKEN:
+            prof_id = ""
+        prof_id = to_shared_profile_reference(prof_id)
+        # 切到读取/关闭模式时输入框会暂时禁用；仍保留原网址，避免模式切换破坏用户数据。
+        url_text = ""
+        if le:
+            url_text = le.text() if le.isEnabled() else str(le.property("independent_url_cache") or "")
+        val = f"{url_text}|{prof_id}|{mode}"
         self.config['tasks'][self.current_task][idx]['value'] = val
         save_config(self.config)
-        self._log(f"💾 打开网址步骤已保存账户: [{get_profile_display_name(prof_id)}] ({prof_id})", "blue")
+        mode_label = {"read_by_profile": "按账号读取", "close_by_profile": "关闭对应账号窗口"}.get(mode, "单独打开")
+        self._log(f"💾 打开网址步骤已保存目标: [{get_profile_display_name(prof_id)}]，模式: {mode_label}", "blue")
+
+    def _update_close_browser_config(self, idx):
+        """保存‘关闭浏览器窗口’步骤的模式选择（single/all）。"""
+        if not self.current_task:
+            return
+        w = self.action_table.cellWidget(idx, 4)
+        if not w:
+            return
+        cb = w.findChild(QComboBox)
+        if not cb:
+            return
+        mode = cb.currentData() or "single"
+        acts = self.config.get("tasks", {}).get(self.current_task, [])
+        if idx >= len(acts):
+            return
+        acts[idx]["value"] = str(mode)
+        save_config(self.config)
 
     def _update_drag_file_config(self, idx):
-        w = self.action_table.cellWidget(idx, 3)
+        w = self.action_table.cellWidget(idx, 4)
         if not w: return
         le = w.findChild(QLineEdit)
         chk = w.findChild(QCheckBox)
@@ -10205,7 +13598,7 @@ class AutoManager(QMainWindow):
         save_config(self.config)
 
     def _update_if_config(self, idx):
-        w = self.action_table.cellWidget(idx, 3)
+        w = self.action_table.cellWidget(idx, 4)
         if not w: return
         le = w.findChild(QLineEdit)
         cbs = w.findChildren(QComboBox)
@@ -10257,7 +13650,7 @@ class AutoManager(QMainWindow):
                 if callable(save_cb):
                     save_cb()
                 else:
-                    w = self.action_table.cellWidget(row, 3)
+                    w = self.action_table.cellWidget(row, 4)
                     edits = w.findChildren(QLineEdit) if w else []
                     prefix_text = edits[0].text() if len(edits) > 0 else prefix
                     content_text = edits[1].text() if len(edits) > 1 else ""
@@ -10271,12 +13664,20 @@ class AutoManager(QMainWindow):
         if not self.current_task: return
         if key == 'row_value_update':
             self.config['tasks'][self.current_task][idx]['value'] = val
-            save_config(self.config)
+            if hasattr(self, "_config_flush_timer"):
+                self._config_flush_timer.start()
+            else:
+                save_config(self.config)
             return
         acts = self.config['tasks'].get(self.current_task, [])
         if idx >= len(acts): return
         acts[idx][key] = val
-        save_config(self.config)
+        # 表格编辑、复选框、延时微调等高频操作不再同步写入完整配置文件。
+        # 由统一的防抖计时器合并保存，避免界面持续卡顿。
+        if hasattr(self, "_config_flush_timer"):
+            self._config_flush_timer.start()
+        else:
+            save_config(self.config)
         # 修复2：保存成功反馈 —— 当用户修改指令内容并离开输入框时，日志区闪烁确认
         if key == 'value':
             step_name = acts[idx].get('name', f'步骤{idx+1}')
@@ -10289,7 +13690,7 @@ class AutoManager(QMainWindow):
         # Only refresh UI when action TYPE changes (need to rebuild widgets for that row)
         # For value/delay changes the widget already reflects the new value — no refresh needed
         if key == 'action': 
-            self._refresh_defer_target_options(persist_changes=True)
+            self._refresh_defer_target_options(persist_changes=False)
             self._refresh_actions()
             self._refresh_data_table()
 
@@ -10301,7 +13702,8 @@ class AutoManager(QMainWindow):
             "同步表头将根据当前流程更新批量数据列结构：\n"
             "1) 新增你流程里新加的步骤列（用该步骤默认值初始化）\n"
             "2) 移除已不存在的步骤列\n"
-            "不会覆盖你已经填写过的内容。\n\n是否继续？",
+            "3) 对“打开网址”列：仅恢复流程编排的独立/读取/关闭模式；保留每行网址和账号\n"
+            "4) 保留拖拽文件、清空并输入的正文及其他已填写内容。\n\n是否继续？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -10311,6 +13713,11 @@ class AutoManager(QMainWindow):
             self._save_data_table(flush=True)
             self._apply_task_data_schema(overwrite=False)
             self._refresh_data_table(force_sync=False)
+            QMessageBox.information(
+                self,
+                "同步完成",
+                "已按流程编排同步表头。\n\n“打开网址”列已恢复流程默认模式；每行的网址、账号及其他已填写内容均已保留。"
+            )
 
     def _reset_data_to_presets(self):
         """将批量数据强制重置为流程编排的默认预设值（不只是同步表头）。"""
@@ -10364,10 +13771,55 @@ class AutoManager(QMainWindow):
                     continue
                 default_val = str(act.get('value', ''))
 
+                # 智能同步预设值逻辑 [V2 - 结构化深度合并]：
+                # A (结构预设): 模式、前缀、跳转目标等结构化参数，通常由流程编排定义。
+                # B (用户数据): 网址、账号、输入内容、识别目标等行变量，通常在批量数据中填写。
+                
+                customized_cols = row_dict.get("_customized", [])
+                is_customized = name in customized_cols
+                
                 if overwrite or name not in row_dict:
+                    # 强制重置或新增列：直接使用新预设
                     out[name] = default_val
                 else:
-                    out[name] = row_dict.get(name, default_val)
+                    existing_val = str(row_dict.get(name, default_val))
+                    if act_type == "open_url":
+                        # A: 模式(Mode); B: 网址(URL), 账号(Profile)
+                        # 模式(A) 始终随流程同步更新，数据(B) 始终保留用户填写的具体内容
+                        d_p = [p.strip() for p in default_val.split('|')]
+                        e_p = [p.strip() for p in existing_val.split('|')]
+                        u_def, p_def, m_def = (d_p[0] if len(d_p)>0 else ""), (d_p[1] if len(d_p)>1 else ""), (d_p[2] if len(d_p)>2 else "independent")
+                        u_ext, p_ext = (e_p[0] if len(e_p)>0 else ""), (e_p[1] if len(e_p)>1 else "")
+                        
+                        final_u = u_ext if u_ext else u_def
+                        final_p = p_ext if p_ext else p_def
+                        out[name] = f"{final_u}|{final_p}|{m_def}"
+                    elif act_type == "clear_input_plus":
+                        # A: 前缀(Prefix); B: 内容(Content)
+                        d_p = default_val.split('|', 1)
+                        e_p = existing_val.split('|', 1)
+                        pre_def, con_def = (d_p[0] if len(d_p)>0 else ""), (d_p[1] if len(d_p)>1 else "")
+                        con_ext = e_p[1] if len(e_p)>1 else ""
+                        
+                        final_con = con_ext if con_ext else con_def
+                        out[name] = f"{pre_def}|{final_con}"
+                    elif any(x in act_type for x in ["if_image", "if_win"]):
+                        # A: 跳转目标(Jumps); B: 识别目标(Target)
+                        d_p = [p.strip() for p in default_val.split('|')]
+                        e_p = [p.strip() for p in existing_val.split('|')]
+                        t_def, ok_def, fail_def = (d_p[0] if len(d_p)>0 else ""), (d_p[1] if len(d_p)>1 else ""), (d_p[2] if len(d_p)>2 else "")
+                        t_ext = e_p[0] if len(e_p)>0 else ""
+                        
+                        out[name] = f"{t_ext if t_ext else t_def} | {ok_def} | {fail_def}"
+                    else:
+                        # 简单字段：如果用户手动改过则保留，没改过则随流程同步新预设
+                        if is_customized:
+                            out[name] = existing_val
+                        else:
+                            out[name] = default_val
+                
+                if "_customized" in row_dict and "_customized" not in out:
+                    out["_customized"] = row_dict["_customized"]
 
                 # 延时：同步表头时保留已有；强制重置时清空（表示使用步骤默认延时）
                 delay_key = f"{name}_延时"
@@ -11091,7 +14543,7 @@ class AutoManager(QMainWindow):
             subtask_name = self._get_task_display_text(self._subtask_task_id, with_folder=True) if getattr(self, "_subtask_task_id", "") else "前置步骤"
             self._engine._task_name = f"[子任务] {subtask_name}"
             self._engine._task_id = self._subtask_task_id or src_task_id
-            self._engine.log_sig.connect(self._log)
+            self._engine.log_sig.connect(self._queue_engine_log_ui, Qt.QueuedConnection)
             self._engine.prog_sig.connect(self._update_subtask_progress)
             self._engine.done_sig.connect(self._on_subtask_done)
             self._engine.row_status_sig.connect(lambda _row_idx, status, current_entry=entry: self._on_subtask_row_status(status, entry=current_entry))
@@ -11180,6 +14632,7 @@ class AutoManager(QMainWindow):
         self.osd.bar.setValue(0)
         self.osd.lbl_pct.setText("0%")
         self.osd.lbl_detail.setText("准备就绪")
+        self.osd.set_execution_active(True)
         self.osd.show()
         self._keep_osd_front_and_clear(recenter=True)
 
@@ -11190,7 +14643,7 @@ class AutoManager(QMainWindow):
             self.osd.hide()
             return
 
-        if hasattr(self, '_engine') and self._engine.isRunning():
+        if hasattr(self, '_engine') and self._engine.isRunning() and not isinstance(self._engine, WorkerEngineProxy):
             e = self._engine
             cur_act = e.actions[e._cur_s] if e._cur_s < len(e.actions) else {}
             current_entry = getattr(self, "_current_subtask_entry", None) or {}
@@ -11234,7 +14687,7 @@ class AutoManager(QMainWindow):
         save_config(self.config)
 
     def _is_compact_data_action(self, act_type):
-        return act_type in ["click", "double_click", "right_click", "move", "hover_click", "scroll", "wait", "screenshot"]
+        return act_type in ["click", "double_click", "right_click", "move", "hover_click", "scroll", "wait", "screenshot", "close_browser"]
 
     def _format_compact_data_value(self, action, row_dict=None, force_sync=False):
         """批量数据中的只读紧凑展示，既保留流程信息，又避免表格过宽。"""
@@ -11256,6 +14709,12 @@ class AutoManager(QMainWindow):
         if act_type == "screenshot":
             save_to = row_dict.get(action.get('name', 'Step'), action.get('value', '')) if not force_sync else action.get('value', '')
             return f"截图 {os.path.basename(str(save_to))}" if str(save_to).strip() else "截图"
+        if act_type == "close_browser":
+            mode = (row_dict.get(action.get('name', 'Step'), action.get('value', '')) if not force_sync else action.get('value', '')) or action.get('value', '')
+            mode = str(mode or "").strip().lower()
+            if mode in ("all", "全部", "关闭全部"):
+                return "关闭浏览器：全部强制"
+            return "关闭浏览器：单个"
         return str(row_dict.get(action.get('name', 'Step'), action.get('value', '')))
 
     def _get_data_column_width(self, action=None, is_delay=False):
@@ -11297,6 +14756,10 @@ class AutoManager(QMainWindow):
     def _refresh_data_table(self, force_sync=False):
         """[深度优化] 采用分时渲染策略，先快速渲染文本框架，再通过定时器异步加载重量级控件。"""
         if not self.current_task: return
+        # 记录当前可见批量数据表的唯一归属。排程可轻量切换后台 current_task，
+        # 但若未重绘表格，该表仍只能读写本任务的数据。
+        render_task_id = str(self.current_task)
+        self._visible_data_editor_task = render_task_id
         
         # 取消之前的渲染任务，防止重叠
         if hasattr(self, '_render_timer') and self._render_timer.isActive():
@@ -11341,7 +14804,12 @@ class AutoManager(QMainWindow):
             chk_item = QTableWidgetItem()
             chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
             row_has_data = self._row_has_meaningful_data(row_dict, acts)
-            is_checked = bool(row_dict.get("_选中", True)) if row_has_data else False
+            # 用户手工勾选必须优先于“是否已有业务数据”的默认推断。
+            # 否则空白/仅坐标行被手工勾选后，一次刷新会视觉取消勾选，随后保存为 False。
+            if "_选中" in row_dict:
+                is_checked = bool(row_dict.get("_选中"))
+            else:
+                is_checked = bool(row_has_data)
             chk_item.setCheckState(Qt.Checked if is_checked else Qt.Unchecked)
             self.data_table.setItem(r, self._data_select_col(), chk_item)
 
@@ -11393,11 +14861,18 @@ class AutoManager(QMainWindow):
         # 第二阶段：启动异步渲染定时器，分批生成重量级控件
         self._render_row_idx = 0
         self._render_timer = QTimer(self)
-        self._render_timer.timeout.connect(lambda: self._async_render_step(acts, old_data, show_delay, force_sync))
+        self._render_timer.timeout.connect(
+            lambda task_id=render_task_id: self._async_render_step(acts, old_data, show_delay, force_sync, task_id)
+        )
         self._render_timer.start(5) # 5ms 间隔，利用主线程空闲时间渲染
 
-    def _async_render_step(self, acts, old_data, show_delay, force_sync=False):
+    def _async_render_step(self, acts, old_data, show_delay, force_sync=False, render_task_id=""):
         """异步渲染每一行的复杂控件。"""
+        # 老任务的异步渲染回调到达时，不能继续往已切换的批量表添加控件。
+        if render_task_id and render_task_id != str(getattr(self, "_visible_data_editor_task", "") or ""):
+            if hasattr(self, "_render_timer"):
+                self._render_timer.stop()
+            return
         if self._render_row_idx >= self.data_table.rowCount():
             self._render_timer.stop()
             self._apply_data_table_column_widths(acts, show_delay)
@@ -11425,20 +14900,36 @@ class AutoManager(QMainWindow):
                 if show_delay:
                     col_idx += 1
             elif act_type == "open_url":
-                w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0)
-                u_p = str(val).split('|')[0]; p_p = str(val).split('|')[1] if '|' in str(val) else ""
+                w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0); l.setSpacing(3)
+                normalized_val = _normalize_open_url_val(val, a.get('value', ''))
+                value_parts = normalized_val.split('|')
+                u_p = value_parts[0] if value_parts else ""
+                p_p = value_parts[1] if len(value_parts) > 1 else ""
+                mode_p = value_parts[2].strip().lower() if len(value_parts) > 2 else "independent"
+                cb_mode = QComboBox(); cb_mode.setObjectName("open_url_mode")
+                cb_mode.addItem("独立", "independent")
+                cb_mode.addItem("按账号读取", "read_by_profile")
+                cb_mode.addItem("关闭账号窗口", "close_by_profile")
+                # 兼容旧版 activate_from_file 和关闭模式别名
+                if mode_p in ("activate_from_file", "activate_file", "handle_file", "read_by_profile"):
+                    _data_mode = "read_by_profile"
+                elif mode_p in ("close_by_profile", "close_profile", "close_account", "close_window_by_profile"):
+                    _data_mode = "close_by_profile"
+                else:
+                    _data_mode = "independent"
+                _data_idx = cb_mode.findData(_data_mode)
+                cb_mode.setCurrentIndex(max(0, _data_idx))
+                cb_mode.setFixedWidth(80)
                 le = QLineEdit(u_p); le.setStyleSheet("background-color: #e3f2fd; border: none;")
                 le.editingFinished.connect(lambda r=r, c=col_idx: self._on_url_cell_changed(r, c))
-                btn = QPushButton(get_profile_display_name(p_p)); btn.setProperty("profile_id", p_p)
+                btn = QPushButton(get_profile_ui_label(p_p)); btn.setProperty("profile_id", p_p)
                 btn.setFixedWidth(92)
                 btn.setStyleSheet("border: none; background: #d1e9ff; text-align: left; padding-left: 5px;")
                 le.setToolTip(str(val))
-                if isinstance(p_p, str) and "::hwnd=" in p_p:
-                    btn.setToolTip(f"当前目标: 已打开窗口\n{p_p}\n\n点击可切换账号或选择已打开窗口")
-                else:
-                    btn.setToolTip(f"当前目标: {get_profile_display_name(p_p)}\n\n点击可切换账号或选择已打开窗口")
+                cb_mode.currentIndexChanged.connect(lambda _v, r=r, c=col_idx: self._on_url_cell_changed(r, c))
                 btn.clicked.connect(lambda chk, r=r, c=col_idx, b=btn: self._pick_profile_for_data_cell(r, c, b))
-                l.addWidget(le, 2); l.addWidget(btn, 1); self.data_table.setCellWidget(r, col_idx, w)
+                l.addWidget(cb_mode); l.addWidget(le, 2); l.addWidget(btn, 1); self.data_table.setCellWidget(r, col_idx, w)
+                self._sync_open_url_data_cell_mode(r, col_idx)
                 col_idx += 1
                 if show_delay:
                     col_idx += 1
@@ -11461,7 +14952,8 @@ class AutoManager(QMainWindow):
                 if show_delay:
                     col_idx += 1
             elif act_type in ["press", "hotkey"]:
-                kr = KeyRecorder(); kr.setText(str(val))
+                kr = ModifierButtonKeyRecorder() if act_type == "hotkey" else KeyRecorder()
+                kr.setText(str(val))
                 kr.setStyleSheet("background-color: #fffde7; border: none; color: #f57f17; font-weight: bold;")
                 kr.setToolTip(str(val))
                 kr.key_recorded.connect(lambda v, row=r, col=col_idx: self._on_cell_widget_changed(row, col, v))
@@ -11492,12 +14984,24 @@ class AutoManager(QMainWindow):
                     col_idx += 1
         
         self.data_table.blockSignals(False)
-        if force_sync: self._save_data_table(); self._log("✅ 已根据流程同步表头和默认数据", "green")
+        # UI 渲染必须是纯读操作；严禁在异步逐行渲染时反向保存配置。
+        # “同步表头”已由 _apply_task_data_schema 明确写入配置，无需在这里再次覆盖。
         
         self._render_row_idx += 1
 
     def _save_data_table(self, flush=False):
-        if not self.current_task or self.data_table.signalsBlocked(): return
+        if not self.current_task or self.data_table.signalsBlocked():
+            return
+        visible_task = str(getattr(self, "_visible_data_editor_task", "") or "")
+        # 排程轻量切换时 current_task 可能已是任务 2，而屏幕上仍是任务 1 的批量表。
+        # 此时绝不可将可见单元格（包括“独立/读取/关闭”模式）写到任何后台任务。
+        if visible_task != str(self.current_task):
+            self._log(
+                f"🔒 已跳过批量数据反向保存：可见数据表=[{visible_task or '无'}]，"
+                f"后台当前任务=[{self.current_task}]，原批量数据保持不变。",
+                "gray"
+            )
+            return
 
         rs = self.data_table.rowCount(); cs = self.data_table.columnCount()
         if rs == 0: return
@@ -11522,20 +15026,27 @@ class AutoManager(QMainWindow):
                 is_coord_only = act_type in ["click", "double_click", "right_click", "move", "hover_click", "scroll"]
                 widget = self.data_table.cellWidget(r, col_idx)
                 w = self.data_table._resolve_widget(widget)
-                if isinstance(w, QComboBox):
-                    val = w.currentText()
-                elif isinstance(w, KeyRecorder):
-                    val = w.text()
-                elif act_type == "open_url" and widget is not None:
-                    # 核心修复：直接从 UI 控件抓取最新值，不依赖可能过时的 backing_item
+                if act_type == "open_url" and widget is not None:
+                    # 直接从 UI 控件抓取最新值，并保留第三段“打开模式”。
                     le = _find_text_input(widget)
                     btn = widget.findChild(QPushButton)
-                    url_text = le.text() if le else ""
-                    prof_id = btn.property("profile_id") or "" if btn else ""
+                    cb_mode = widget.findChild(QComboBox, "open_url_mode")
+                    url_text = (le.text() if le and le.isEnabled() else str(le.property("independent_url_cache") or "")) if le else ""
+                    # 控件未完整渲染时必须继承原行 mode，绝不私自回退成 independent。
+                    old_raw = str(old_row_dict.get(a.get('name', ''), a.get('value', '')) or '')
+                    old_parts = [p.strip() for p in old_raw.split('|')]
+                    old_mode = old_parts[2] if len(old_parts) > 2 else "independent"
+                    ui_mode = cb_mode.currentData() if cb_mode else ""
+                    mode = ui_mode if ui_mode else old_mode
+                    # 两种模式均直接保存真实 profile_id
+                    prof_id = (btn.property("profile_id") or "" if btn else "")
+                    if prof_id == OPEN_URL_HANDLE_FILE_TOKEN:
+                        prof_id = ""
+                    prof_id = to_shared_profile_reference(prof_id)
                     if str(url_text).strip() == "[SKIP_ROW]" or str(prof_id).strip() == "[SKIP_ROW]":
                         val = "[SKIP_ROW]"
                     else:
-                        val = f"{url_text}|{prof_id}"
+                        val = f"{url_text}|{prof_id}|{mode}"
                     # 同时更新一下 backing_item 保持一致
                     bk = self.data_table.item(r, col_idx)
                     if bk: bk.setText(val)
@@ -11551,6 +15062,10 @@ class AutoManager(QMainWindow):
                         val = f"{prefix}|{content}"
                     bk = self.data_table.item(r, col_idx)
                     if bk: bk.setText(val)
+                elif isinstance(w, QComboBox):
+                    val = w.currentText()
+                elif isinstance(w, (KeyRecorder, ModifierButtonKeyRecorder)):
+                    val = w.text()
                 else:
                     item = self.data_table.item(r, col_idx)
                     val = item.text() if item else ""
@@ -11574,7 +15089,7 @@ class AutoManager(QMainWindow):
             return False
         for action in actions:
             act_type = CMD_MAP.get(action.get('action'), "click")
-            if act_type in ["click", "double_click", "right_click", "move", "hover_click", "scroll", "wait", "screenshot"]:
+            if act_type in ["click", "double_click", "right_click", "move", "hover_click", "scroll", "wait", "screenshot", "close_browser"]:
                 continue
             step_name = action.get('name', '')
             raw_val = row_dict.get(step_name, "")
@@ -11604,12 +15119,13 @@ class AutoManager(QMainWindow):
             elif act_type == "open_url":
                 if s == "[SKIP_ROW]":
                     return True
-                parts = s.split("|", 1)
-                url_part = parts[0].strip() if len(parts) > 0 else ""
-                profile_part = parts[1].strip() if len(parts) > 1 else ""
-                def_parts = default_s.split("|", 1)
-                def_url_part = def_parts[0].strip() if len(def_parts) > 0 else ""
-                def_profile_part = def_parts[1].strip() if len(def_parts) > 1 else ""
+                # 模式是流程结构，不应影响“这一行是否填了业务数据”的判断。
+                parts = [p.strip() for p in s.split("|")]
+                url_part = parts[0] if len(parts) > 0 else ""
+                profile_part = parts[1] if len(parts) > 1 else ""
+                def_parts = [p.strip() for p in default_s.split("|")]
+                def_url_part = def_parts[0] if len(def_parts) > 0 else ""
+                def_profile_part = def_parts[1] if len(def_parts) > 1 else ""
                 if (url_part or profile_part) and (url_part != def_url_part or profile_part != def_profile_part):
                     return True
             else:
@@ -11618,16 +15134,20 @@ class AutoManager(QMainWindow):
         return False
 
     def _is_data_row_selectable(self, row_index, actions=None, data_rows=None):
+        """判断批量数据中的实际行是否可被勾选执行。
+
+        每一条已保存的批量数据行都是一个独立执行单元；它可以只包含
+        点击、移动、滚动等坐标步骤，因此数据字典为空并不代表该行无效。
+        “是否有业务文本数据”只用于首次显示时推断默认勾选状态，不能再
+        作为手动勾选、Shift 连续勾选或执行筛选的限制条件。
+        """
         if not self.current_task:
             return False
-        if actions is None:
-            actions = self.config.get('tasks', {}).get(self.current_task, [])
         if data_rows is None:
             data_rows = self.config.get('task_data', {}).get(self.current_task, [])
-        if row_index < 0 or row_index >= len(data_rows):
-            return False
-        row_dict = data_rows[row_index] if isinstance(data_rows[row_index], dict) else {}
-        return self._row_has_meaningful_data(row_dict, actions)
+        # 仅允许操作真实存在的批量数据行；界面在尚未添加数据时显示的
+        # 临时占位行仍不可执行，避免被误当成一条任务。
+        return 0 <= row_index < len(data_rows)
 
     def _auto_check_blank_rows(self, rows=None):
         if not self.current_task:
@@ -11679,14 +15199,97 @@ class AutoManager(QMainWindow):
             self._save_data_table(flush=True)
 
     def _on_cell_widget_changed(self, row, col, val):
+        visible_task = str(getattr(self, "_visible_data_editor_task", "") or "")
+        if visible_task != str(getattr(self, "current_task", "") or ""):
+            self._log(
+                f"🔒 已忽略旧批量表控件事件：可见数据表=[{visible_task or '无'}]，"
+                f"后台当前任务=[{getattr(self, 'current_task', '') or '无'}]。",
+                "gray"
+            )
+            return
         item = self.data_table.item(row, col)
         if item:
             item.setText(val)
+            # [重要] 记录用户个性化修改，用于“同步表头”时的智能合并判断
+            try:
+                h_item = self.data_table.horizontalHeaderItem(col)
+                col_name = h_item.text() if h_item else ""
+                if col_name and self.current_task:
+                    task_data = self.config.get('task_data', {}).get(self.current_task, [])
+                    if 0 <= row < len(task_data):
+                        row_dict = task_data[row]
+                        if isinstance(row_dict, dict):
+                            customized = row_dict.setdefault("_customized", [])
+                            if col_name not in customized:
+                                customized.append(col_name)
+            except Exception:
+                pass
             self._save_data_table()
 
+    def _sync_open_url_data_cell_mode(self, row, col):
+        w = self.data_table.cellWidget(row, col)
+        if not w:
+            return
+        cb_mode = w.findChild(QComboBox, "open_url_mode")
+        le = w.findChild(QLineEdit)
+        btn = w.findChild(QPushButton)
+        if not cb_mode or not btn:
+            return
+        mode = cb_mode.currentData() or "independent"
+        # 清除旧版 token
+        if btn.property("profile_id") == OPEN_URL_HANDLE_FILE_TOKEN:
+            btn.setProperty("profile_id", btn.property("independent_profile_id") or "")
+        profile_id = btn.property("profile_id") or ""
+        btn.setText(get_profile_ui_label(profile_id))
+        btn.setEnabled(True)
+        if mode in ("read_by_profile", "close_by_profile"):
+            if mode == "close_by_profile":
+                btn.setToolTip("关闭账号窗口模式：点击选择要关闭的账号")
+                placeholder = "此模式不导航，仅关闭所选账号窗口"
+                tooltip = "关闭账号窗口模式仅关闭所选账号的已绑定浏览器窗口"
+            else:
+                btn.setToolTip("按账号读取模式：点击选择要激活的账号")
+                placeholder = "此模式不导航，仅激活账号窗口"
+                tooltip = "按账号读取模式不会打开或修改网址，只会切换到所选账号窗口"
+            if le:
+                # 保留已填写网址作为数据，不导航也不删除；仅禁止在读取/关闭模式下继续编辑。
+                if le.isEnabled() and le.text().strip():
+                    le.setProperty("independent_url_cache", le.text())
+                le.setEnabled(False)
+                le.setPlaceholderText(placeholder)
+                le.setToolTip(tooltip)
+        else:
+            btn.setToolTip("单独打开模式：点击选择账号或已打开窗口")
+            if le:
+                if not le.isEnabled():
+                    le.setText(str(le.property("independent_url_cache") or ""))
+                le.setEnabled(True)
+                le.setPlaceholderText("输入网址...")
+                le.setToolTip(le.text() or "输入要打开的网址")
+
     def _on_url_cell_changed(self, row, col):
-        w = self.data_table.cellWidget(row, col); le = w.findChild(QLineEdit); btn = w.findChild(QPushButton)
-        val = f"{le.text()}|{btn.property('profile_id') or ''}"; self._on_cell_widget_changed(row, col, val)
+        visible_task = str(getattr(self, "_visible_data_editor_task", "") or "")
+        if visible_task != str(getattr(self, "current_task", "") or ""):
+            self._log(
+                f"🔒 已忽略旧批量表网址模式事件：可见数据表=[{visible_task or '无'}]，"
+                f"后台当前任务=[{getattr(self, 'current_task', '') or '无'}]。",
+                "gray"
+            )
+            return
+        self._sync_open_url_data_cell_mode(row, col)
+        w = self.data_table.cellWidget(row, col)
+        if not w:
+            return
+        le = w.findChild(QLineEdit); btn = w.findChild(QPushButton); cb_mode = w.findChild(QComboBox, "open_url_mode")
+        mode = cb_mode.currentData() if cb_mode else "independent"
+        # 两种模式均直接保存真实 profile_id
+        profile_id = btn.property('profile_id') or '' if btn else ''
+        if profile_id == OPEN_URL_HANDLE_FILE_TOKEN:
+            profile_id = ''
+        # 无论输入框是否因“按账号读取”而被禁用，都保留其已有网址数据；模式切换不得清空用户输入。
+        url_text = le.text() if le else ""
+        val = f"{url_text}|{profile_id}|{mode}"
+        self._on_cell_widget_changed(row, col, val)
 
     def _pick_profile_for_data_cell(self, row, col, btn):
         menu = QMenu(self)
@@ -11716,7 +15319,7 @@ class AutoManager(QMainWindow):
         for s_idx, a in enumerate(acts):
             raw_act = a.get('action')
             act_type = CMD_MAP.get(raw_act, '')
-            if act_type not in ["click", "double_click", "right_click", "move", "hover_click", "screenshot", "wait"]:
+            if act_type not in ["click", "double_click", "right_click", "move", "hover_click", "screenshot", "wait", "close_browser"]:
                 edit_cols.append((col_i, s_idx, a.get('name', f'步骤{s_idx+1}'), act_type))
             col_i += 1
             if show_delay: col_i += 1
@@ -11753,6 +15356,9 @@ class AutoManager(QMainWindow):
             selected_rows = list(range(self.data_table.rowCount()))
         if not selected_rows: return
 
+        # 左侧全局快照库与右侧文字工具位于不同的构建闭包；用显式桥接避免直接捕获 text_grid。
+        right_text_bridge = {"import_matrix": None}
+        
         # 4. 弹出通用批量处理对话框
         dlg = QDialog(self)
         title_suffix = targets[0][2] if len(targets) == 1 else f"{len(targets)} 个步骤"
@@ -11830,7 +15436,9 @@ class AutoManager(QMainWindow):
                     state[key] = {
                         "text": it.text(),
                         "bg": it.background().color().name() if it.background().style() != Qt.NoBrush else None,
-                        "role10": it.data(Qt.UserRole + 10)
+                        "role10": it.data(Qt.UserRole + 10),
+                        "role11": it.data(Qt.UserRole + 11),
+                        "role12": it.data(Qt.UserRole + 12)
                     }
             return state
         
@@ -11876,6 +15484,20 @@ class AutoManager(QMainWindow):
             QPushButton:hover { background-color: #1976d2; }
         """)
         tools_h.addWidget(btn_paste_clipboard_dlg)
+        btn_snapshot_save_dlg = QPushButton("📸 拍摄快照")
+        btn_snapshot_save_dlg.setToolTip("将当前任务的所有数据行拍成全局快照存入临时库，可在其他任务中随时一键恢复。")
+        btn_snapshot_save_dlg.setMinimumWidth(96)
+        btn_snapshot_save_dlg.setFixedHeight(30)
+        btn_snapshot_save_dlg.setStyleSheet("background-color: #e8f5e9; border: 1px solid #a5d6a7;")
+        tools_h.addWidget(btn_snapshot_save_dlg)
+
+        btn_snapshot_load_dlg = QPushButton("📁 快照库")
+        btn_snapshot_load_dlg.setToolTip("查看并管理全局表格快照库，一键将任意快照数据恢复到当前任务中。")
+        btn_snapshot_load_dlg.setMinimumWidth(96)
+        btn_snapshot_load_dlg.setFixedHeight(30)
+        btn_snapshot_load_dlg.setStyleSheet("background-color: #e8f5e9; border: 1px solid #a5d6a7;")
+        tools_h.addWidget(btn_snapshot_load_dlg)
+
         btn_sync_headers_dlg = QPushButton("🔄 同步表头")
         btn_sync_headers_dlg.setToolTip("在批量填充中心内直接同步批量数据列结构，并刷新左侧预览。")
         btn_sync_headers_dlg.setMinimumWidth(96)
@@ -11939,6 +15561,7 @@ class AutoManager(QMainWindow):
         class DragDropTable(QTableWidget):
             def __init__(self, r, c, parent_dlg):
                 super().__init__(r, c, parent_dlg)
+                self.parent_dlg = parent_dlg
                 self.setAcceptDrops(True)
             def dragEnterEvent(self, event):
                 if event.mimeData().hasUrls() or event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
@@ -11959,13 +15582,15 @@ class AutoManager(QMainWindow):
                         if local_path: paths.append(os.path.normpath(local_path))
                 # 处理内部拖拽 (例如从 file_tree 或 profile_list 拖过来)
                 elif event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
+                    file_tree = getattr(self.parent_dlg, "_smart_fill_file_tree", None)
+                    profile_list = getattr(self.parent_dlg, "_smart_fill_prof_list", None)
                     # 如果是文件树拖拽
-                    if file_tree.selectedItems():
+                    if file_tree and file_tree.selectedItems():
                         for it in file_tree.selectedItems():
                             p = it.data(0, Qt.UserRole)
                             if p and not os.path.isdir(p): paths.append(p)
                     # 如果是账号列表拖拽
-                    elif profile_list.selectedItems():
+                    elif profile_list and profile_list.selectedItems():
                         for it in profile_list.selectedItems():
                             pid = it.data(Qt.UserRole)
                             name = it.text().replace("🟢 ","").replace("⚪ ","")
@@ -12114,11 +15739,16 @@ class AutoManager(QMainWindow):
                             if raw_val.strip() == skip_token:
                                 val = skip_token if sub == "url" else ""
                             else:
-                                parts = raw_val.split('|', 1)
+                                # 正确拆分三段：url|profile|mode
+                                parts = raw_val.split('|')
                                 if sub == "url":
                                     val = parts[0] if len(parts) > 0 else ""
                                 else:
+                                    # 第二段才是 profile，不要把 mode 混入
                                     p_id = parts[1] if len(parts) > 1 else ""
+                                    # 如果是旧版 token 则显示为空
+                                    if p_id == OPEN_URL_HANDLE_FILE_TOKEN:
+                                        p_id = ""
                                     val = get_profile_display_name(p_id) if p_id else ""
                         else:
                             val = raw_val
@@ -12135,8 +15765,15 @@ class AutoManager(QMainWindow):
                         if item_backing:
                             raw_val = item_backing.text()
                             if raw_val.strip() != "[SKIP_ROW]":
-                                parts = raw_val.split('|', 1)
+                                # 正确拆分三段，只取第二段 profile
+                                parts = raw_val.split('|')
                                 p_id = parts[1] if len(parts) > 1 else ""
+                                if p_id == OPEN_URL_HANDLE_FILE_TOKEN:
+                                    p_id = ""
+                        # 角色10是当前真实 Profile ID；角色11/12固定保存打开预览时的原始身份，
+                        # 用于区分“未改账号”与“用户粘贴了无 ID 的显示文字”。
+                        it.setData(Qt.UserRole + 11, p_id)
+                        it.setData(Qt.UserRole + 12, val)
                         if p_id:
                             it.setData(Qt.UserRole + 10, f"|{p_id}")
                             it.setToolTip(p_id)
@@ -12163,6 +15800,8 @@ class AutoManager(QMainWindow):
                         it.setText(cell_state.get("text", ""))
                         it.setToolTip(cell_state.get("text", ""))
                         it.setData(Qt.UserRole + 10, cell_state.get("role10"))
+                        it.setData(Qt.UserRole + 11, cell_state.get("role11"))
+                        it.setData(Qt.UserRole + 12, cell_state.get("role12"))
                         bg = cell_state.get("bg")
                         if bg:
                             it.setBackground(QColor(bg))
@@ -12183,7 +15822,9 @@ class AutoManager(QMainWindow):
                         row_data.append({
                             "text": it.text(),
                             "bg": it.background().color().name() if it.background().style() != Qt.NoBrush else None,
-                            "role10": it.data(Qt.UserRole + 10)
+                            "role10": it.data(Qt.UserRole + 10),
+                            "role11": it.data(Qt.UserRole + 11),
+                            "role12": it.data(Qt.UserRole + 12)
                         })
                     else:
                         row_data.append(None)
@@ -12203,16 +15844,66 @@ class AutoManager(QMainWindow):
                         it.setText(data["text"])
                         if data["bg"]: it.setBackground(QColor(data["bg"]))
                         else: it.setBackground(QBrush(Qt.NoBrush))
-                        if data["role10"]: it.setData(Qt.UserRole + 10, data["role10"])
+                        if data.get("role10") is not None: it.setData(Qt.UserRole + 10, data.get("role10"))
+                        if data.get("role11") is not None: it.setData(Qt.UserRole + 11, data.get("role11"))
+                        if data.get("role12") is not None: it.setData(Qt.UserRole + 12, data.get("role12"))
             preview_table.blockSignals(False)
 
         def _set_preview_item_text(item_obj, new_val, bg_color="#fff9c4"):
             if not item_obj:
                 return
-            item_obj.setText(new_val)
-            item_obj.setToolTip(str(new_val))
-            item_obj.setData(Qt.UserRole + 10, None)
+            
+            # [修复] 批量填充中心的智能写入：针对账号/窗口列，支持从复合字符串中拆分元数据
+            col_idx = item_obj.column()
+            _, _, _, act_type, sub = preview_cols[col_idx]
+            
+            raw_str = str(new_val or "")
+            disp_text = raw_str
+            role10_val = None
+            
+            if "|" in raw_str and act_type == "open_url" and sub == "profile":
+                # 如果是 open_url 的账号列且包含 |，说明是 url|profile|mode 格式
+                parts = raw_str.split("|")
+                p_id = parts[1] if len(parts) > 1 else ""
+                if p_id == OPEN_URL_HANDLE_FILE_TOKEN: p_id = ""
+                disp_text = get_profile_display_name(p_id)
+                role10_val = f"|{p_id}"
+            elif "::hwnd=" in raw_str and act_type in ["win_active", "open_url"]:
+                # 窗口类：标题::hwnd=12345
+                disp_text = raw_str.split('::hwnd=')[0] or "已打开窗口"
+                if act_type == "open_url" and sub == "profile":
+                    role10_val = f"|{raw_str}"
+                else:
+                    role10_val = raw_str
+            
+            item_obj.setText(disp_text)
+            item_obj.setToolTip(raw_str)
+            item_obj.setData(Qt.UserRole + 10, role10_val)
             item_obj.setBackground(QColor(bg_color))
+
+        def _resolve_profile_text_to_key(profile_text):
+            """将批量粘贴的账号文本唯一解析为真实规范 Profile Key；绝不按模糊包含关系猜测。"""
+            raw = str(profile_text or "").strip()
+            if not raw:
+                return ""
+            norm_raw = os.path.normcase(os.path.normpath(raw))
+            candidates = set()
+            try:
+                for profile_path, display_name, email, _remark, profile_id in get_chrome_profiles(skip_cookie_check=True):
+                    values = (
+                        str(profile_path or "").strip(),
+                        str(display_name or "").strip(),
+                        str(email or "").strip(),
+                        str(profile_id or "").strip(),
+                    )
+                    if any(raw.casefold() == value.casefold() for value in values if value):
+                        candidates.add(_open_url_profile_store_key(profile_path))
+                    elif norm_raw == _open_url_profile_store_key(profile_path):
+                        candidates.add(_open_url_profile_store_key(profile_path))
+            except Exception as e:
+                log_internal_issue("批量填充解析账号 Profile Key 失败", e)
+                return ""
+            return next(iter(candidates)) if len(candidates) == 1 else ""
 
         def _get_selected_preview_indexes():
             indexes = preview_table.selectedIndexes()
@@ -12328,6 +16019,7 @@ class AutoManager(QMainWindow):
                 _save_undo_state() # 删除前保存状态
                 for it in sel_items:
                     it.setText("")
+                    it.setData(Qt.UserRole + 10, None) # [修复] 同时清空隐藏元数据
                     it.setBackground(QColor(0, 0, 0, 0)) 
             elif event.key() == Qt.Key_C and (event.modifiers() & Qt.ControlModifier):
                 _copy_matrix_from_preview()
@@ -12395,6 +16087,239 @@ class AutoManager(QMainWindow):
         btn_sync_headers_dlg.clicked.connect(_sync_headers_in_dlg)
         btn_reset_presets_dlg.clicked.connect(_reset_presets_in_dlg)
         btn_del_row_dlg.clicked.connect(_delete_rows_in_dlg)
+
+        # --- 全局快照功能实现（主数据表格） ---
+        def _get_batch_snapshots():
+            # 左右统一共用一个快照库。旧 text/batch 库只在首次发现时“移动”到此处，
+            # 绝不在每次打开快照库时重复复制，否则用户删除的条目会被旧库重新复活。
+            snapshots = self.config.setdefault("global_data_snapshots", {})
+            deleted_names = set(self.config.setdefault("deleted_global_snapshot_names", []))
+            changed = False
+            for old_store_key in ("text_snapshots", "batch_snapshots"):
+                old_store = self.config.get(old_store_key, {})
+                if not isinstance(old_store, dict):
+                    continue
+                for legacy_name, legacy_info in list(old_store.items()):
+                    if not isinstance(legacy_info, dict):
+                        continue
+                    # 已删除名称是墓碑记录：旧库残留也不能让它再次出现。
+                    if legacy_name in deleted_names:
+                        old_store.pop(legacy_name, None)
+                        changed = True
+                        continue
+                    matrix = legacy_info.get("matrix", legacy_info.get("data_rows", []))
+                    if not isinstance(matrix, list):
+                        continue
+                    if legacy_name not in snapshots:
+                        migrated = copy.deepcopy(legacy_info)
+                        migrated.setdefault("kind", "text_matrix_v2" if old_store_key == "text_snapshots" else "business_matrix_legacy")
+                        migrated.setdefault("source_task", self.current_task or "")
+                        snapshots[legacy_name] = migrated
+                    # 迁移完成后从旧库移除，之后无论删除或重开均不会重新导入。
+                    old_store.pop(legacy_name, None)
+                    changed = True
+            if changed:
+                save_config(self.config)
+            return snapshots
+
+        def _save_global_snapshot():
+            if not self.current_task:
+                return
+            
+            if not selected_rows or preview_table.rowCount() <= 0:
+                QMessageBox.warning(dlg, "提示", "当前没有待处理数据行可供保存。")
+                return
+
+            # 只保留业务输入列：不保存固定前缀、账号选择和打开方式等流程骨架。
+            # 注意：必须从左侧预览表读取，而不是从 config 读取。用户可能已在此窗口里
+            # 粘贴/拖放/手工修改，但尚未点击应用；旧实现会把这些当前可见内容拍成旧数据或空数据。
+            pure_col_indexes = []
+            headers = []
+            for preview_col_idx, col_def in enumerate(preview_cols):
+                _, _, name, act_type, sub = col_def
+                if sub == "prefix":
+                    continue
+                if act_type == "open_url" and sub != "url":
+                    continue
+                pure_col_indexes.append(preview_col_idx)
+                if sub == "content":
+                    headers.append(f"{name}(内容)")
+                elif sub == "url":
+                    headers.append(f"{name}(网址)")
+                elif act_type == "drag_file" or "拖拽" in name or "文件" in name:
+                    headers.append(f"{name}(文件路径)")
+                else:
+                    headers.append(f"{name}(数据)")
+
+            if not pure_col_indexes:
+                QMessageBox.warning(dlg, "提示", "当前选中的步骤没有可保存的业务输入列。")
+                return
+
+            matrix = []
+            source_rows = []
+            has_any_business_value = False
+            # 逐行按左侧表格的显示顺序保存；即使中间存在空行也保留，避免导入后行位错位。
+            for preview_row_idx in range(preview_table.rowCount()):
+                row_vals = []
+                for preview_col_idx in pure_col_indexes:
+                    item = preview_table.item(preview_row_idx, preview_col_idx)
+                    val = item.text() if item else ""
+                    row_vals.append(str(val))
+                matrix.append(row_vals)
+                if preview_row_idx < len(selected_rows):
+                    source_rows.append(int(selected_rows[preview_row_idx]) + 1)
+                if any(str(v).strip() for v in row_vals):
+                    has_any_business_value = True
+
+            if not has_any_business_value:
+                QMessageBox.warning(dlg, "提示", "左侧待处理行中没有可保存的业务数据。")
+                return
+
+            if not matrix:
+                QMessageBox.warning(dlg, "提示", "选中的行中没有有效内容，无需拍摄快照。")
+                return
+
+            default_title = f"{self.current_task}_快照_{datetime.now().strftime('%m%d_%H%M%S')}"
+            snap_name, ok = QInputDialog.getText(dlg, "拍摄全局快照", "请输入快照名称:", QLineEdit.Normal, default_title)
+            if not ok or not snap_name.strip():
+                return
+            
+            snap_name = snap_name.strip()
+            snapshots = _get_batch_snapshots()
+            import copy
+            if snap_name in snapshots:
+                reply = QMessageBox.question(
+                    dlg, "同名快照", f"快照“{snap_name}”已存在，是否覆盖？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            # 用户重新使用已删除的名称时，该新快照应正常可见；移除旧墓碑即可。
+            deleted_names = self.config.setdefault("deleted_global_snapshot_names", [])
+            if snap_name in deleted_names:
+                deleted_names.remove(snap_name)
+            snapshots[snap_name] = {
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source_task": self.current_task,
+                "kind": "business_matrix_v2",
+                "headers": headers,
+                "source_rows": source_rows,
+                "matrix": copy.deepcopy(matrix)
+            }
+            save_config(self.config)
+            QMessageBox.information(dlg, "成功", f"已保存左侧当前业务数据快照：'{snap_name}'（共 {len(matrix)} 行，包含空行位置）")
+
+        def _load_global_snapshot_library():
+            if not self.current_task:
+                return
+            snapshots = _get_batch_snapshots()
+            if not snapshots:
+                QMessageBox.information(dlg, "提示", "暂无保存的全局快照，请先点击“拍摄快照”。")
+                return
+
+            snap_dlg = QDialog(dlg)
+            snap_dlg.setWindowTitle("📁 全局表格快照库")
+            snap_dlg.resize(520, 380)
+            s_ly = QVBoxLayout(snap_dlg)
+
+            s_list = QListWidget()
+            for s_name, s_info in sorted(snapshots.items(), key=lambda x: x[1].get("time", ""), reverse=True):
+                t_str = s_info.get("time", "")
+                src = s_info.get("source_task", "未知任务")
+                # 兼容旧版 data_rows 和新版 matrix
+                matrix = s_info.get("matrix", s_info.get("data_rows", []))
+                r_count = len(matrix)
+                kind = s_info.get("kind", "")
+                origin = "文字" if kind == "text_matrix_v2" else "左侧业务"
+                item_text = f"{s_name}  ({origin}｜来源: {src or '当前中心'}｜{t_str}｜{r_count} 行)"
+                s_item = QListWidgetItem(item_text)
+                s_item.setData(Qt.UserRole, s_name)
+                s_list.addItem(s_item)
+            s_ly.addWidget(s_list)
+
+            btn_ly = QHBoxLayout()
+            btn_restore = QPushButton("📥 导入快照到右侧“文字”页签")
+            btn_restore.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold;")
+            btn_restore.setToolTip("将快照数据导入到右侧的文字表格中，供您自行筛选、清理、复制后再填入左侧。")
+            btn_del = QPushButton("🗑️ 删除快照")
+            btn_del.setStyleSheet("background-color: #dc2626; color: white;")
+            btn_close = QPushButton("关闭")
+            btn_ly.addWidget(btn_restore)
+            btn_ly.addWidget(btn_del)
+            btn_ly.addStretch()
+            btn_ly.addWidget(btn_close)
+            s_ly.addLayout(btn_ly)
+
+            def _do_restore():
+                sel = s_list.currentItem()
+                if not sel:
+                    QMessageBox.warning(snap_dlg, "提示", "请先选择一个快照。")
+                    return
+                s_name = sel.data(Qt.UserRole)
+                s_info = snapshots.get(s_name)
+                if not s_info:
+                    return
+                
+                # 兼容处理：如果是旧版 task_data 快照，尝试转为矩阵
+                if "matrix" in s_info:
+                    matrix = s_info["matrix"]
+                    headers = s_info.get("headers", [])
+                else:
+                    # 旧版 task_data 恢复逻辑（直接覆盖左侧）
+                    reply = QMessageBox.question(snap_dlg, "旧版快照", "此快照为旧版格式，是否直接覆盖恢复到左侧待处理行？", QMessageBox.Yes | QMessageBox.No)
+                    if reply == QMessageBox.Yes:
+                        self.config.setdefault('task_data', {})[self.current_task] = copy.deepcopy(s_info.get("data_rows", []))
+                        save_config(self.config)
+                        self._apply_task_data_schema(overwrite=False)
+                        self._refresh_data_table(force_sync=False)
+                        _reload_preview_from_main(f"已恢复旧版快照 '{s_name}'")
+                        snap_dlg.accept()
+                    return
+
+                if not matrix:
+                    QMessageBox.warning(snap_dlg, "提示", "该快照中没有数据。")
+                    return
+
+                # 右侧文字工具由独立的嵌套构建块创建，不能在此闭包直接引用 text_grid。
+                # 通过桥接函数导入，既避免 NameError，也确保使用同一套精确矩阵恢复逻辑。
+                importer = right_text_bridge.get("import_matrix")
+                if not callable(importer):
+                    QMessageBox.warning(snap_dlg, "提示", "右侧文字表格尚未就绪，请关闭后重新打开批量填充中心。")
+                    return
+                if not importer(matrix):
+                    QMessageBox.warning(snap_dlg, "提示", "该快照的数据格式无效，无法导入。")
+                    return
+                imported_rows = len(matrix)
+                imported_cols = max((len(row) if isinstance(row, (list, tuple)) else 1 for row in matrix), default=1)
+                QMessageBox.information(
+                    snap_dlg, "成功",
+                    f"已将快照 '{s_name}' 的数据真实写入右侧“文字”表格（{imported_rows} 行 × {imported_cols} 列）。\n可自行筛选、修改，然后利用“直贴”填入左侧。"
+                )
+                snap_dlg.accept()
+
+            def _do_delete():
+                sel = s_list.currentItem()
+                if not sel:
+                    QMessageBox.warning(snap_dlg, "提示", "请先选择一个快照。")
+                    return
+                s_name = sel.data(Qt.UserRole)
+                if QMessageBox.question(snap_dlg, "确认删除", f"确定要删除快照 '{s_name}' 吗？", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+                    snapshots.pop(s_name, None)
+                    # 记录删除墓碑，防止旧版 text_snapshots/batch_snapshots 在下次打开时重新迁回。
+                    deleted_names = self.config.setdefault("deleted_global_snapshot_names", [])
+                    if s_name not in deleted_names:
+                        deleted_names.append(s_name)
+                    save_config(self.config)
+                    s_list.takeItem(s_list.row(sel))
+
+            btn_restore.clicked.connect(_do_restore)
+            btn_del.clicked.connect(_do_delete)
+            btn_close.clicked.connect(snap_dlg.accept)
+            s_list.itemDoubleClicked.connect(lambda: _do_restore())
+            snap_dlg.exec_()
+
+        btn_snapshot_save_dlg.clicked.connect(_save_global_snapshot)
+        btn_snapshot_load_dlg.clicked.connect(_load_global_snapshot_library)
 
         def _get_selected_preview_targets():
             """按当前选区形状返回有序目标格：
@@ -13094,6 +17019,8 @@ class AutoManager(QMainWindow):
                     for w in pgw.getAllWindows():
                         if w.title and w.visible and "批量填充中心" not in w.title:
                             hwnd = getattr(w, '_hWnd', None)
+                            if hwnd and _is_compact_browser_restore_prompt(hwnd):
+                                continue
                             wins.append((build_window_display_text(w.title, hwnd, "[软件] ", profile_meta), w.title, hwnd))
                 except Exception as e:
                     log_internal_issue("批量填充中心扫描窗口列表失败", e)
@@ -13130,7 +17057,7 @@ class AutoManager(QMainWindow):
                 QListWidget::item:selected { background: #e3f2fd; color: #0d47a1; }
             """)
             
-            prof_ly.addWidget(QLabel("选择 Chrome 账户 (支持备注搜索/排序/标签):"))
+            prof_ly.addWidget(QLabel("选择 Chrome 账户（默认优先从当前已打开窗口反向识别并记住；仅在你手动点击时才做严格磁盘扫描）:"))
             
             # 顶部操作栏：搜索 + 排序
             prof_header = QHBoxLayout()
@@ -13147,23 +17074,38 @@ class AutoManager(QMainWindow):
             chk_hide_bad = QCheckBox("隐藏已失效账号")
             chk_hide_bad.setChecked(True)
             filter_lay.addWidget(chk_hide_bad)
+            chk_hide_dup = QCheckBox("隐藏重名账号")
+            chk_hide_dup.setChecked(True)
+            chk_hide_dup.setToolTip("默认按“显示名 + 邮箱”折叠疑似重复账号，只保留更优先的一条；关闭后可显示全部扫描结果。")
+            filter_lay.addWidget(chk_hide_dup)
             prof_ly.addLayout(filter_lay)
             
             # [新增] 账号数据缓存，避免搜索时重复深度扫描磁盘
             prof_data_cache = []
 
-            def _refresh_prof(force_rescan=False):
+            def _rebuild_prof_cache(strict_scan=False, skip_cookie_check=True):
                 nonlocal prof_data_cache
+                if strict_scan or not prof_data_cache:
+                    # [性能修复] 移除“从窗口识别”以防止重复项。
+                    # 默认采用轻量化磁盘扫描：只读账号名和路径，不读取耗时的 Cookie，解决卡顿和账号消失问题。
+                    if strict_scan:
+                        clear_chrome_profile_cache()
+                        # 严格模式：读磁盘+Cookie
+                        rows = get_chrome_profiles(force_refresh=True, skip_cookie_check=False)
+                    else:
+                        # 轻量模式：只读基本信息，极速响应
+                        rows = get_chrome_profiles(force_refresh=True, skip_cookie_check=True)
+                    prof_data_cache = merge_profile_rows(rows, get_active_chrome_profiles())
+
+            def _refresh_prof(force_rescan=False):
                 prof_list.clear()
                 txt = search_prof.text().lower()
                 hide_bad = chk_hide_bad.isChecked()
+                hide_dup = chk_hide_dup.isChecked()
                 sort_mode = sort_prof.currentText()
-                
-                # 只有点击“刷新”按钮或首次加载时，才执行耗时的磁盘扫描
-                if force_rescan or not prof_data_cache:
-                    if force_rescan:
-                        clear_chrome_profile_cache()
-                    prof_data_cache = get_chrome_profiles(force_refresh=force_rescan)
+
+                # 只有明确点击“严格扫描”按钮时才进行 Cookie 检测，平时均使用轻量扫描
+                _rebuild_prof_cache(strict_scan=force_rescan, skip_cookie_check=not force_rescan)
                 
                 # 获取账号状态元数据
                 prof_meta = self.config.get("profile_meta", {})
@@ -13195,23 +17137,63 @@ class AutoManager(QMainWindow):
                         "pid": pid, "name": pname, "email": pemail, "remark": premark, 
                         "status": status, "tag": tag, "prawid": prawid, "is_active": is_active
                     })
-                
-                # 排序逻辑 (基于过滤后的结果)
-                def _natural_sort_key(s):
-                    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
-                if sort_mode == "按名称 A-Z":
-                    filtered_profs.sort(key=lambda x: x["name"].lower())
-                elif sort_mode == "按数字排序":
-                    filtered_profs.sort(key=lambda x: natural_sort_key(x["name"]))
-                elif sort_mode == "按备注排序":
-                    filtered_profs.sort(key=lambda x: (x["remark"] or "").lower())
+                def _normalize_dup_name(name):
+                    name = re.sub(r'^\[[^\]]+\]\s*', '', str(name or "").strip())
+                    name = re.sub(r'\s+', ' ', name)
+                    return name.lower()
+
+                def _dup_key(item):
+                    email_key = str(item.get("email") or "").strip().lower()
+                    name_key = _normalize_dup_name(item.get("name"))
+                    # 邮箱存在时必须按邮箱唯一；无邮箱时再退化为名称
+                    return ("email", email_key) if email_key else ("name", name_key)
+
+                def _dup_score(item):
+                    # 优先保留：已激活 > 正常状态 > 有标签 > 有备注
+                    return (
+                        1 if item.get("is_active") else 0,
+                        1 if item.get("status") != "bad" else 0,
+                        1 if item.get("tag") else 0,
+                        1 if item.get("remark") else 0,
+                        -len(str(item.get("pid") or ""))
+                    )
+
+                if hide_dup:
+                    deduped_map = {}
+                    deduped_hidden_count = {}
+                    for item in filtered_profs:
+                        key = _dup_key(item)
+                        old_item = deduped_map.get(key)
+                        if old_item is None:
+                            deduped_map[key] = dict(item)
+                            deduped_hidden_count[key] = 0
+                            continue
+                        if _dup_score(item) > _dup_score(old_item):
+                            deduped_map[key] = dict(item)
+                        deduped_hidden_count[key] = deduped_hidden_count.get(key, 0) + 1
+                    filtered_profs = []
+                    for key, item in deduped_map.items():
+                        item["dup_hidden_count"] = deduped_hidden_count.get(key, 0)
+                        filtered_profs.append(item)
+                
+                # 排序逻辑：所有模式（包括“默认排序”和“按数字排序”）统一以名称的自然排序为核心
+                if sort_mode == "按备注排序":
+                    filtered_profs.sort(key=lambda x: profile_sort_key(x, primary="remark"))
                 elif sort_mode == "已标记优先":
-                    filtered_profs.sort(key=lambda x: (0 if x["tag"] else 1, x["name"].lower()))
+                    filtered_profs.sort(key=lambda x: (
+                        0 if x["tag"] else 1,
+                        natural_sort_key(x["tag"]),
+                        *profile_sort_key(x, primary="name")
+                    ))
                 elif sort_mode == "已激活优先":
-                    filtered_profs.sort(key=lambda x: (0 if x["is_active"] else 1, natural_sort_key(x["name"])))
-                else: # 默认排序也建议使用自然排序，防止 1, 11, 2 出现
-                    filtered_profs.sort(key=lambda x: natural_sort_key(x["name"]))
+                    filtered_profs.sort(key=lambda x: (
+                        0 if x["is_active"] else 1,
+                        *profile_sort_key(x, primary="name")
+                    ))
+                else:
+                    # “默认排序”、“按数字排序”、“按名称 A-Z”全部统一采用基于名称的自然排序
+                    filtered_profs.sort(key=lambda x: profile_sort_key(x, primary="name"))
                 
                 # [优化] 渲染列表，智能去重备注显示
                 for i, p in enumerate(filtered_profs):
@@ -13219,6 +17201,8 @@ class AutoManager(QMainWindow):
                     # 如果备注名和显示名完全一样，就不再额外显示备注
                     if p["remark"] and p["remark"].lower() not in disp.lower():
                         disp += f" [{p['remark']}]"
+                    if p.get("dup_hidden_count", 0) > 0:
+                        disp += f" (+隐藏{p['dup_hidden_count']}项重名)"
                     
                     if p["tag"]: disp = f"🏷️{p['tag']} | {disp}"
                     
@@ -13276,15 +17260,19 @@ class AutoManager(QMainWindow):
             search_prof.textChanged.connect(lambda: _refresh_prof(force_rescan=False))
             sort_prof.currentIndexChanged.connect(lambda: _refresh_prof(force_rescan=False))
             chk_hide_bad.stateChanged.connect(lambda: _refresh_prof(force_rescan=False))
+            chk_hide_dup.stateChanged.connect(lambda: _refresh_prof(force_rescan=False))
             
-            # 仅在点击此按钮时执行深度磁盘扫描
-            btn_ref_prof = QPushButton("🔄 深度扫描并刷新账号"); btn_ref_prof.clicked.connect(lambda: _refresh_prof(force_rescan=True))
+            btn_ref_prof = QPushButton("🔄 严格扫描并刷新账号")
+            btn_ref_prof.setToolTip("手动触发一次严格扫描：按账号信息 + Google 登录 Cookie 检测，解决账号列表不准的问题。")
+            btn_ref_prof.clicked.connect(lambda: _refresh_prof(force_rescan=True))
             prof_ly.addWidget(prof_list)
             lbl_prof_selection_count = create_table_selection_label()
             prof_ly.addWidget(lbl_prof_selection_count)
             bind_item_view_selection_label(prof_list, lbl_prof_selection_count, kind_text="个账户")
+            # [修复] 彻底移除“从已开窗口识别”按钮，统一使用轻量化磁盘扫描
             prof_ly.addWidget(btn_ref_prof)
-            _refresh_prof(force_rescan=True) # 首次打开时扫描一次
+            _refresh_prof(force_rescan=False) # 首次打开时优先走轻量磁盘扫描，避免卡顿
+            dlg._smart_fill_prof_list = prof_list
             # 双击账号列表自动填充
             prof_list.itemDoubleClicked.connect(lambda: _do_fill())
             tabs.addTab(prof_tool, "👤 账号")
@@ -13327,6 +17315,7 @@ class AutoManager(QMainWindow):
             smart_fill_bar.addWidget(btn_smart_fill_rule)
             file_ly.addLayout(smart_fill_bar)
             file_ly.addWidget(file_tree)
+            dlg._smart_fill_file_tree = file_tree
             lbl_file_selection_count = create_table_selection_label()
             file_ly.addWidget(lbl_file_selection_count)
             bind_item_view_selection_label(file_tree, lbl_file_selection_count, kind_text="个文件/项")
@@ -14105,7 +18094,7 @@ class AutoManager(QMainWindow):
                         skipped_lines.append(f"{bundle_name}: {text_name} 未填充，原因：{reason_for_pending}")
                 return skipped_lines
 
-            def _bundle_has_more_rows(bundle_runtime, target_items, pending_text_only=False):
+            def _bundle_has_more_rows(bundle_runtime, target_items, smart_rules, pending_text_only=False):
                 text_step_keys = []
                 for it in target_items:
                     real_col, step_idx, _, cell_act_type, cell_sub = preview_cols[it.column()]
@@ -14432,6 +18421,7 @@ class AutoManager(QMainWindow):
                         elif not _bundle_has_more_rows(
                             bundle_runtime,
                             target_items,
+                            smart_rules,
                             pending_text_only=(target_mode == "append_empty")
                         ):
                             break
@@ -14597,13 +18587,21 @@ class AutoManager(QMainWindow):
             btn_prefix_lib = QPushButton("📚 前缀库")
             btn_prefix_lib.setToolTip("将所选前缀填入当前表格单元格。")
             btn_prefix_lib.setFixedHeight(28)
+            btn_snapshot_save = QPushButton("📸 拍摄快照")
+            btn_snapshot_save.setToolTip("将当前文字表格的所有数据拍成快照存入临时库，可在其他任务中随时恢复。")
+            btn_snapshot_save.setFixedHeight(28)
+            btn_snapshot_load = QPushButton("📁 快照库")
+            btn_snapshot_load.setToolTip("打开左右共用的快照库：左侧业务数据和右侧文字表数据都在这里。")
+            btn_snapshot_load.setFixedHeight(28)
             btn_text_paste = QPushButton("📋 粘贴表格")
             btn_text_add_row = QPushButton("➕ 行")
             btn_text_add_col = QPushButton("➕ 列")
             btn_text_clear = QPushButton("🧹 清空")
-            for _btn in [btn_text_paste, btn_text_add_row, btn_text_add_col, btn_text_clear]:
+            for _btn in [btn_snapshot_save, btn_snapshot_load, btn_text_paste, btn_text_add_row, btn_text_add_col, btn_text_clear]:
                 _btn.setFixedHeight(28)
             text_bar.addWidget(btn_prefix_lib)
+            text_bar.addWidget(btn_snapshot_save)
+            text_bar.addWidget(btn_snapshot_load)
             text_bar.addWidget(btn_text_paste)
             text_bar.addWidget(btn_text_add_row)
             text_bar.addWidget(btn_text_add_col)
@@ -14612,6 +18610,8 @@ class AutoManager(QMainWindow):
 
             default_text_cols = max(4, min(8, len(preview_cols) if preview_cols else 4))
             text_grid = SpreadsheetPasteTable(12, default_text_cols, dlg)
+            # 桥接与快照恢复必须只命中用户当前可见的右侧文字表，避免闭包对象错位。
+            text_grid.setObjectName("batch_fill_visible_text_grid")
             for col in range(text_grid.columnCount()):
                 text_grid.setColumnWidth(col, 180)
             text_ly.addWidget(text_grid)
@@ -14632,11 +18632,116 @@ class AutoManager(QMainWindow):
                             target_item = QTableWidgetItem("")
                             text_grid.setItem(cur_row, cur_col, target_item)
                         target_item.setText(prefix)
-                        text_grid.resizeRowToContents(cur_row)
-                        text_grid.setRowHeight(cur_row, min(max(text_grid.rowHeight(cur_row), 42), 140))
+                        # 前缀写入不改变行高，保持表格紧凑与用户手动行高设置。
                         _update_text_preview()
 
             btn_prefix_lib.clicked.connect(_pick_prefix_from_library)
+
+            # --- 统一快照功能：左右共用 _get_batch_snapshots() 返回的同一库 ---
+            def _get_shared_snapshots():
+                return _get_batch_snapshots()
+
+            def _save_current_snapshot():
+                # “文字快照”应保存整张文字表；旧实现若仍选中单元格，会悄悄只保存选区。
+                matrix = text_grid.get_effective_matrix()
+                if not matrix or all(not any(str(c).strip() for c in row) for row in matrix):
+                    QMessageBox.warning(dlg, "提示", "当前表格为空，无需拍摄快照。")
+                    return
+                default_title = f"快照_{datetime.now().strftime('%m%d_%H%M%S')}"
+                snap_name, ok = QInputDialog.getText(dlg, "拍摄快照", "请输入快照名称:", QLineEdit.Normal, default_title)
+                if not ok or not snap_name.strip():
+                    return
+                snap_name = snap_name.strip()
+                snapshots = _get_shared_snapshots()
+                if snap_name in snapshots:
+                    reply = QMessageBox.question(
+                        dlg, "同名快照", f"快照“{snap_name}”已存在，是否覆盖？",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                    )
+                    if reply != QMessageBox.Yes:
+                        return
+                snapshots[snap_name] = {
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "source_task": self.current_task or "",
+                    "kind": "text_matrix_v2",
+                    "matrix": copy.deepcopy(matrix)
+                }
+                save_config(self.config)
+                QMessageBox.information(dlg, "成功", f"已成功保存整张文字表快照：'{snap_name}'")
+
+            def _load_snapshot_library():
+                snapshots = _get_batch_snapshots()
+                if not snapshots:
+                    QMessageBox.information(dlg, "提示", "暂无保存的快照，请先点击“拍摄快照”。")
+                    return
+
+                snap_dlg = QDialog(dlg)
+                snap_dlg.setWindowTitle("📁 表格快照库")
+                snap_dlg.resize(480, 360)
+                s_ly = QVBoxLayout(snap_dlg)
+
+                s_list = QListWidget()
+                for s_name, s_info in sorted(snapshots.items(), key=lambda x: x[1].get("time", ""), reverse=True):
+                    t_str = s_info.get("time", "")
+                    row_count = len(s_info.get("matrix", []))
+                    item_text = f"{s_name}  (保存于: {t_str}, 共 {row_count} 行)"
+                    s_item = QListWidgetItem(item_text)
+                    s_item.setData(Qt.UserRole, s_name)
+                    s_list.addItem(s_item)
+                s_ly.addWidget(s_list)
+
+                btn_ly = QHBoxLayout()
+                btn_restore = QPushButton("📥 恢复此快照到表格")
+                btn_restore.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold;")
+                btn_del = QPushButton("🗑️ 删除快照")
+                btn_del.setStyleSheet("background-color: #dc2626; color: white;")
+                btn_close = QPushButton("关闭")
+                btn_ly.addWidget(btn_restore)
+                btn_ly.addWidget(btn_del)
+                btn_ly.addStretch()
+                btn_ly.addWidget(btn_close)
+                s_ly.addLayout(btn_ly)
+
+                def _do_restore():
+                    sel = s_list.currentItem()
+                    if not sel:
+                        QMessageBox.warning(snap_dlg, "提示", "请先选择一个快照。")
+                        return
+                    s_name = sel.data(Qt.UserRole)
+                    s_info = snapshots.get(s_name)
+                    if not s_info:
+                        return
+                    matrix = s_info.get("matrix", [])
+                    if not matrix:
+                        return
+                    
+                    # 所有恢复入口统一走可见文字表的安全导入函数，避免不同闭包直接引用 text_grid。
+                    if not _import_global_snapshot_to_text_grid(matrix):
+                        QMessageBox.warning(snap_dlg, "提示", "该快照的数据格式无效，无法恢复。")
+                        return
+                    QMessageBox.information(snap_dlg, "成功", f"已成功从快照 '{s_name}' 恢复数据！")
+                    snap_dlg.accept()
+
+                def _do_delete():
+                    sel = s_list.currentItem()
+                    if not sel:
+                        QMessageBox.warning(snap_dlg, "提示", "请先选择一个快照。")
+                        return
+                    s_name = sel.data(Qt.UserRole)
+                    if QMessageBox.question(snap_dlg, "确认删除", f"确定要删除快照 '{s_name}' 吗？", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+                        snapshots.pop(s_name, None)
+                        save_config(self.config)
+                        s_list.takeItem(s_list.row(sel))
+
+                btn_restore.clicked.connect(_do_restore)
+                btn_del.clicked.connect(_do_delete)
+                btn_close.clicked.connect(snap_dlg.accept)
+                s_list.itemDoubleClicked.connect(lambda: _do_restore())
+                snap_dlg.exec_()
+
+            btn_snapshot_save.clicked.connect(_save_current_snapshot)
+            # 左右共用同一个快照库；从任意一侧打开都是同一份清单。
+            btn_snapshot_load.clicked.connect(_load_global_snapshot_library)
 
             # --- 文字实时预览同步 ---
             def _update_text_preview():
@@ -14668,6 +18773,49 @@ class AutoManager(QMainWindow):
                 text_preview.setPlainText("\n".join(preview_lines))
                 source_desc = "当前选区" if text_grid.get_selected_matrix() else "整张表"
                 lbl_file_info.setText(f"表格预览: 使用{source_desc}，共 {row_count} 行 × {col_count} 列")
+
+            def _import_global_snapshot_to_text_grid(matrix):
+                """统一快照库到用户当前可见右侧文字表格的唯一导入入口。"""
+                if not isinstance(matrix, (list, tuple)) or not matrix:
+                    return False
+                expected_has_value = any(
+                    str(cell).strip()
+                    for raw_row in matrix
+                    for cell in (raw_row if isinstance(raw_row, (list, tuple)) else [raw_row])
+                )
+                if not expected_has_value:
+                    return False
+                # 不信任闭包中可能过期的局部引用；从当前批量窗口按唯一对象名找到可见文字表。
+                visible_grid = dlg.findChild(SpreadsheetPasteTable, "batch_fill_visible_text_grid")
+                if visible_grid is None or visible_grid.parentWidget() is None:
+                    return False
+                if not visible_grid.set_matrix(matrix):
+                    return False
+                for c in range(visible_grid.columnCount()):
+                    visible_grid.setColumnWidth(c, 180)
+                try:
+                    tabs.setCurrentWidget(text_tool)
+                    text_tool.show()
+                    visible_grid.show()
+                    visible_grid.setFocus()
+                    visible_grid.viewport().update()
+                    visible_grid.viewport().repaint()
+                    QApplication.processEvents()
+                except Exception:
+                    pass
+                actual_matrix = visible_grid.get_effective_matrix()
+                actual_has_value = any(str(cell).strip() for row in actual_matrix for cell in row)
+                actual_rows = visible_grid.rowCount()
+                actual_cols = visible_grid.columnCount()
+                expected_rows = len(matrix)
+                expected_cols = max((len(row) if isinstance(row, (list, tuple)) else 1 for row in matrix), default=1)
+                if not actual_has_value or actual_rows != expected_rows or actual_cols != expected_cols:
+                    return False
+                _update_text_preview()
+                return True
+
+            # 全局快照恢复通过此桥接进入右侧文字表格，避免依赖不同闭包内的局部变量。
+            right_text_bridge["import_matrix"] = _import_global_snapshot_to_text_grid
 
             text_grid.itemChanged.connect(lambda *_: _update_text_preview())
             text_grid.itemSelectionChanged.connect(_update_text_preview)
@@ -14959,20 +19107,57 @@ class AutoManager(QMainWindow):
                     
                     key = (real_row, real_col)
                     if key not in row_col_data: 
-                        row_col_data[key] = {"prefix":"", "content":"", "url":"", "profile":"", "val":"", "p_id":""}
+                        row_col_data[key] = {"prefix":"", "content":"", "url":"", "profile":"", "val":"", "p_id":"", "original_p_id":"", "original_profile_text":""}
                     
                     if sub == "prefix": row_col_data[key]["prefix"] = val
                     elif sub == "content": row_col_data[key]["content"] = val
                     elif sub == "url": row_col_data[key]["url"] = val
                     elif sub == "profile": 
                         row_col_data[key]["profile"] = val
-                        if extra and extra.startswith("|"): row_col_data[key]["p_id"] = extra[1:]
+                        row_col_data[key]["original_p_id"] = str(it.data(Qt.UserRole + 11) or "")
+                        row_col_data[key]["original_profile_text"] = str(it.data(Qt.UserRole + 12) or "")
+                        if extra and extra.startswith("|"):
+                            row_col_data[key]["p_id"] = extra[1:]
                     else: 
                         row_col_data[key]["val"] = val
                     
                     # 如果是普通填充带了 extra 数据，也要记录
                     if extra and not row_col_data[key]["p_id"]:
                         row_col_data[key]["extra_raw"] = extra
+
+            # 账号列必须先完成真实 Profile Key 的保真解析；禁止写到一半再用旧行账号兜底。
+            unresolved_profiles = []
+            for (real_row, real_col), data in row_col_data.items():
+                act_type_for_key = next((at for rc, _, _, at, _ in preview_cols if rc == real_col), "")
+                if act_type_for_key != "open_url" or str(data.get("profile", "")).strip() == "[SKIP_ROW]":
+                    continue
+                if data.get("p_id"):
+                    continue
+                typed_profile = str(data.get("profile", "") or "").strip()
+                original_p_id = str(data.get("original_p_id", "") or "").strip()
+                original_display = str(data.get("original_profile_text", "") or "").strip()
+                if not typed_profile:
+                    # 用户明确清空账号时允许清空，绝不悄悄恢复旧账号。
+                    data["p_id"] = ""
+                elif typed_profile == original_display:
+                    # 未改账号文字时，继续保留打开预览时记录的真实 Profile Key。
+                    data["p_id"] = original_p_id
+                else:
+                    resolved_key = _resolve_profile_text_to_key(typed_profile)
+                    if resolved_key:
+                        data["p_id"] = resolved_key
+                    else:
+                        unresolved_profiles.append((int(real_row) + 1, typed_profile))
+            if unresolved_profiles:
+                detail = "\n".join(f"第 {row_no} 行：{profile_text}" for row_no, profile_text in unresolved_profiles[:12])
+                if len(unresolved_profiles) > 12:
+                    detail += f"\n…另有 {len(unresolved_profiles) - 12} 行"
+                QMessageBox.warning(
+                    dlg, "账号未能唯一识别",
+                    "以下账号文本无法唯一对应到真实 Chrome Profile，已取消本次应用，主表未被修改：\n" + detail +
+                    "\n\n请从右侧“账号”工具直接填充，或粘贴完整 Profile 路径；系统不会再自动回退为旧账号。"
+                )
+                return
 
             # [关键修复] 应用更改前确保主表格信号不被阻塞，否则界面不会刷新
             self.data_table.blockSignals(False)
@@ -14993,16 +19178,29 @@ class AutoManager(QMainWindow):
                 elif act_type == "clear_input_plus":
                     final_val = f"{data['prefix']}|{data['content']}"
                 elif act_type == "open_url":
-                    p_id = data["p_id"]
-                    if not p_id:
-                        typed_profile = str(data.get("profile", "") or "").strip()
-                        if typed_profile and typed_profile != "[SKIP_ROW]":
-                            p_id = typed_profile
-                    if not p_id:
-                        orig_it = self.data_table.item(real_row, real_col)
-                        if orig_it and "|" in orig_it.text():
-                            p_id = orig_it.text().split("|", 1)[1]
-                    final_val = f"{data['url']}|{p_id}"
+                    # p_id 已在写入前完成保真解析；这里绝不从旧主表回退账号。
+                    p_id = str(data.get("p_id", "") or "")
+                    # 保留原行第三段 mode，防止批量填充后丢失模式
+                    # [修复] 优先从 cellWidget 的 mode 下拉框中读取，确保获取最新值
+                    orig_it = self.data_table.item(real_row, real_col)
+                    orig_mode = "independent"
+                    _orig_widget = self.data_table.cellWidget(real_row, real_col)
+                    if _orig_widget:
+                        _orig_cb_mode = _orig_widget.findChild(QComboBox, "open_url_mode")
+                        if _orig_cb_mode:
+                            orig_mode = _orig_cb_mode.currentData() or "independent"
+                        elif orig_it and orig_it.text():
+                            _orig_parts = orig_it.text().split("|")
+                            if len(_orig_parts) >= 3:
+                                orig_mode = _orig_parts[2].strip() or "independent"
+                    elif orig_it and orig_it.text():
+                        _orig_parts = orig_it.text().split("|")
+                        if len(_orig_parts) >= 3:
+                            orig_mode = _orig_parts[2].strip() or "independent"
+                    # 如果 p_id 是旧版 token，清除
+                    if p_id == OPEN_URL_HANDLE_FILE_TOKEN:
+                        p_id = ""
+                    final_val = f"{data['url']}|{p_id}|{orig_mode}"
                 elif act_type == "win_active":
                     # [修复] 如果 extra_raw 包含完整 hwnd 标识，直接使用；否则用 val
                     _extra = data.get("extra_raw", "")
@@ -15030,14 +19228,18 @@ class AutoManager(QMainWindow):
                     if act_type == "open_url":
                         le = _find_text_input(w)
                         btn = w.findChild(QPushButton)
+                        cb_mode_w = w.findChild(QComboBox, "open_url_mode")
                         if final_val == skip_token:
                             url_part = skip_token
                             p_id_part = ""
+                            mode_part = "independent"
                         else:
-                            url_part = data["url"]
-                            p_id_part = data["p_id"]
-                            if not p_id_part and "|" in final_val:
-                                p_id_part = final_val.split("|", 1)[1]
+                            _fv_parts = final_val.split("|")
+                            url_part = _fv_parts[0] if len(_fv_parts) > 0 else data["url"]
+                            p_id_part = _fv_parts[1] if len(_fv_parts) > 1 else data["p_id"]
+                            mode_part = _fv_parts[2].strip() if len(_fv_parts) > 2 else "independent"
+                            if not p_id_part:
+                                p_id_part = data["p_id"]
                         if le:
                             le.blockSignals(True)
                             le.setText(url_part)
@@ -15045,6 +19247,13 @@ class AutoManager(QMainWindow):
                         if btn:
                             btn.setProperty("profile_id", p_id_part)
                             btn.setText(get_profile_display_name(p_id_part))
+                        # 同步 mode 下拉框
+                        if cb_mode_w:
+                            _mode_idx = cb_mode_w.findData(mode_part)
+                            if _mode_idx >= 0:
+                                cb_mode_w.blockSignals(True)
+                                cb_mode_w.setCurrentIndex(_mode_idx)
+                                cb_mode_w.blockSignals(False)
                     elif act_type == "clear_input_plus":
                         le = _find_text_input(w)
                         lbl = w.findChild(QLabel)
@@ -15410,14 +19619,21 @@ class AutoManager(QMainWindow):
         if not self.current_task: return
         idx = self.action_table.currentRow()
         new_name = self._make_unique_action_name(f"步骤{len(self.config['tasks'][self.current_task])+1}")
-        new_act = {"name": new_name, "action": "左键点击", "x": 0, "y": 0, "value": "", "delay": 1}
+        new_act = {"enabled": True, "name": new_name, "action": "左键点击", "x": 0, "y": 0, "value": "", "delay": 1}
         if idx >= 0: self.config['tasks'][self.current_task].insert(idx + 1, new_act)
         else: self.config['tasks'][self.current_task].append(new_act)
-        save_config(self.config); self._refresh_actions(); self._refresh_defer_target_options(persist_changes=True)
-        new_idx = idx + 1 if idx >= 0 else self.action_table.rowCount() - 1; self.action_table.setCurrentCell(new_idx, 0)
+        # 添加步骤是高频 UI 操作：先立即刷新界面，配置由既有防抖定时器异步落盘，
+        # 避免大配置文件同步写入让按钮点击卡住。
+        self._refresh_actions(); self._refresh_defer_target_options(persist_changes=False)
+        if hasattr(self, "_config_flush_timer"):
+            self._config_flush_timer.start()
+        else:
+            save_config(self.config)
+        new_idx = idx + 1 if idx >= 0 else self.action_table.rowCount() - 1; self.action_table.setCurrentCell(new_idx, 1)
     def _del_action(self):
         if not self.current_task: return
-        rows = sorted(list(set([i.row() for i in self.action_table.selectedItems()])), reverse=True)
+        # [修复] action_table 多列为 cellWidget，selectedItems() 可能为空；改用 selectedRows 更稳定
+        rows = sorted(self._get_selected_action_rows(fallback_row=self.action_table.currentRow()), reverse=True)
         if not rows: return
         removed_names = []
         for r in rows:
@@ -15824,7 +20040,7 @@ class AutoManager(QMainWindow):
             index = self.action_table.model().index(row, 0)
             if index.isValid():
                 selection_model.select(index, flags)
-        self.action_table.setCurrentCell(rows[-1], 0, QItemSelectionModel.NoUpdate)
+        self.action_table.setCurrentCell(rows[-1], 1, QItemSelectionModel.NoUpdate)
 
     def _ensure_action_row_selected(self, row):
         rows = self._get_selected_action_rows()
@@ -16045,7 +20261,6 @@ class AutoManager(QMainWindow):
         run_step_act = menu.addAction(f"🎯 仅执行此步骤：[{step_name}]（用第1行数据）"); run_step_act.triggered.connect(lambda _checked, r=row: self._run_single_step(r))
         menu.addSeparator()
         run_from_act = menu.addAction(f"▶️ 从此步骤开始执行（仅当前任务）"); run_from_act.triggered.connect(lambda _checked, r=row: self._run_from_step(r, only_current=True))
-        run_from_all_act = menu.addAction(f"▶️▶️ 从此步骤开始执行（含后续所有任务）"); run_from_all_act.triggered.connect(lambda _checked, r=row: self._run_from_step(r, only_current=False))
         menu.addSeparator()
         menu.addAction("⬆️ 上移选中步骤" if multi_selected else "⬆️ 向上移动步骤").triggered.connect(lambda _checked, r=row: self._move_row_action_by_idx(r, -1))
         menu.addAction("⬇️ 下移选中步骤" if multi_selected else "⬇️ 向下移动步骤").triggered.connect(lambda _checked, r=row: self._move_row_action_by_idx(r, 1))
@@ -16084,22 +20299,14 @@ class AutoManager(QMainWindow):
         # 核心逻辑：如果在“流程编排”标签页触发，强制进入“测试模式”，只跑单组数据
         is_test_run = (self.tabs.currentIndex() == 0)
 
-        if only_current:
-            # 核心修复：确保不触发任务链队列
-            self._task_queue = [] 
-            if is_test_run:
-                self._log(f"🧪 [流程测试模式] 从步骤 [{step_name}] 开始执行（仅跑当前选中的单组数据）", "blue")
-            else:
-                self._log(f"▶️ 从第 {data_row+1} 组数据 / 步骤 [{step_name}] 开始执行（仅当前任务）", "blue")
+        # “从此步骤开始”也只能作用于当前任务；任务链仅允许在排程页建立。
+        if not only_current:
+            self._log("ℹ️ 已取消非排程任务链，本操作将仅执行当前任务。", "gray")
+        self._task_queue = []
+        if is_test_run:
+            self._log(f"🧪 [流程测试模式] 从步骤 [{step_name}] 开始执行（仅跑当前选中的单组数据）", "blue")
         else:
-            all_tasks = self._get_task_names()
-            cur_idx = all_tasks.index(self.current_task) if self.current_task in all_tasks else -1
-            self._task_queue = all_tasks[cur_idx + 1:] if cur_idx >= 0 else []
-            if self._task_queue:
-                queue_text = " → ".join(self._get_task_display_text(task_id, with_folder=True) for task_id in self._task_queue)
-                self._log(f"▶️ 从第 {data_row+1} 组数据 / 步骤 [{step_name}] 开始执行，完成后将依次执行: {queue_text}", "blue")
-            else:
-                self._log(f"▶️ 从第 {data_row+1} 组数据 / 步骤 [{step_name}] 开始执行...", "blue")
+            self._log(f"▶️ 从第 {data_row+1} 组数据 / 步骤 [{step_name}] 开始执行（仅当前任务）", "blue")
 
         self._row_statuses[self.current_task] = {}
         self._refresh_data_table()
@@ -16146,7 +20353,7 @@ class AutoManager(QMainWindow):
         self.btn_run.setEnabled(False); self.btn_stop.setEnabled(True)
         # 确保 loops=1, 且不触发后续任务
         self._engine = AutoEngine(single_act, dummy_data, 0, 0, 0, loops=1, ignore_data=is_test_run)
-        self._engine.log_sig.connect(self._log); self._engine.done_sig.connect(self._on_done); self._engine.start()
+        self._engine.log_sig.connect(self._queue_engine_log_ui, Qt.QueuedConnection); self._engine.done_sig.connect(self._on_done); self._engine.start()
 
     def _run_single_step_with_row(self, step_idx, data_row):
         """单格测试：只执行数据表第data_row行 × 步骤step_idx，不继续执行后续步骤。"""
@@ -16170,7 +20377,7 @@ class AutoManager(QMainWindow):
         self.btn_run.setEnabled(False); self.btn_stop.setEnabled(True)
         # 确保 loops=1
         self._engine = AutoEngine(single_act, single_data, 0, 0, 0, loops=1)
-        self._engine.log_sig.connect(self._log)
+        self._engine.log_sig.connect(self._queue_engine_log_ui, Qt.QueuedConnection)
         self._engine.done_sig.connect(self._on_done)
         self._engine.start()
 
@@ -16228,7 +20435,7 @@ class AutoManager(QMainWindow):
         )
         self._engine._task_name = self.current_task
         self._engine._task_id = self.current_task
-        self._engine.log_sig.connect(self._log)
+        self._engine.log_sig.connect(self._queue_engine_log_ui, Qt.QueuedConnection)
         self._engine.prog_sig.connect(self.progress.setValue)
         self._engine.prog_sig.connect(lambda p: self._update_osd(p))
         self._engine.pause_sig.connect(self._on_pause)
@@ -16274,6 +20481,10 @@ class AutoManager(QMainWindow):
             self.btn_pause.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
             self.osd.btn_pause.setText("▶ 继续")
             self.osd.btn_pause.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; border-radius: 3px; font-size: 11px; font-weight: bold; padding: 1px 4px; }")
+            self.osd.lbl_info.setText("⏸️ <b>已暂停</b> | 当前步骤将于安全检查点停下")
+            self.osd.lbl_detail.setText("再次点击暂停按钮或热键即可继续；小窗口保持显示")
+            self.osd.show()
+            self.osd.raise_()
             self._log("⏸️ 已暂停，点击「继续」恢复执行", "orange")
 
     def _stop_execution(self):
@@ -16287,6 +20498,14 @@ class AutoManager(QMainWindow):
                     sig.disconnect()
                 except Exception:
                     pass
+            # Worker 可能仍在安全检查点或不可中断调用中收尾；保留小窗口直到收到 done/退出事件。
+            if self.chk_show_osd.isChecked():
+                current_percent = max(0, int(getattr(self._engine, "_last_percent", self.progress.value() or 0) or 0))
+                self.osd.bar.setValue(current_percent)
+                self.osd.lbl_pct.setText(f"{current_percent}%")
+                self.osd.lbl_info.setText("🛑 <b>正在停止</b> | 等待当前动作安全结束")
+                self.osd.lbl_detail.setText("停止请求已发送；收到 Worker 最终状态后将完成收尾")
+                self.osd.show(); self.osd.raise_()
             self._log("🛑 正在停止执行...", "red")
         if hasattr(self, "_subtask_queue"):
             self._subtask_stopped = True
@@ -16296,21 +20515,52 @@ class AutoManager(QMainWindow):
         if hasattr(self, "_repair_queue"):
             self._repair_stopped = True
             self._repair_queue = []
-        self.osd.hide() # 停止执行，隐藏悬浮窗
-        self.osd.lbl_detail.setText("")
-        self.osd.bar.setValue(0)
-        self.osd.lbl_pct.setText("0%")
+        # 不在这里隐藏或清零小窗口；必须等 Worker 回传 stopped/failed/done 后统一收尾。
         self._clear_deferred_queue_panel()
         self._task_queue = []
         self._current_on_finished = None
-        self.progress.setValue(0)
+        # 主进度也保留到最终状态事件，避免动作仍在收尾时视觉上回到 0%。
         self.btn_run.setEnabled(True); self.btn_run.setText("🚀 开始批量执行")
         self.btn_pause.setEnabled(False); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
         self.btn_stop.setEnabled(False); self.btn_resume.setEnabled(False)
         self.btn_dry_run.setEnabled(True)
-    def _run_all(self, on_finished=None):
+    def _close_osd_window(self):
+        """仅在没有活动执行引擎时关闭悬浮窗，避免运行中误关。"""
+        engine = getattr(self, "_engine", None)
+        if engine and engine.isRunning():
+            self.osd.set_execution_active(True)
+            self.osd.lbl_detail.setText("任务正在执行；完成、失败或停止后才可关闭此窗口")
+            return
+        self.osd.hide()
+        self._log("🪟 已手动关闭执行悬浮窗。", "gray")
+
+    def _run_all(self, on_finished=None, scheduled_actions_snapshot=None, scheduled_data_snapshot=None):
+        # 必须先验证任务，再创建回调/切换运行态。空任务在旧逻辑中会只输出“任务开始”
+        # 后不启动引擎，界面看似卡住且没有可见错误。
+        task_id = str(getattr(self, "current_task", "") or "").strip()
+        # 排程使用启动时冻结的任务定义；手动执行继续从当前已保存任务读取。
+        task_actions = scheduled_actions_snapshot if (on_finished and isinstance(scheduled_actions_snapshot, list)) else (self.config.get("tasks", {}).get(task_id) if task_id else None)
+        if not task_id or not isinstance(task_actions, list) or not task_actions:
+            self._execution_readonly_config = False
+            self._current_on_finished = None
+            self._task_queue = []
+            self._log("⚠️ 未选择有效任务或当前任务没有步骤，已拒绝启动执行。请先在任务列表中选择一个包含步骤的任务。", "orange")
+            try:
+                self.btn_run.setEnabled(True)
+                self.btn_run.setText("🚀 开始批量执行")
+                self.btn_stop.setEnabled(False)
+                self.btn_pause.setEnabled(False)
+                self.btn_resume.setEnabled(False)
+            except Exception:
+                pass
+            return
+
+        # 不再弹出独立 CMD；诊断继续写入后台日志，实时状态由主界面与 OSD 显示。
+        live_runtime_diagnostic(f"运行入口已验证 task={task_id}")
+
         # 保存回调
         self._current_on_finished = on_finished
+        self._last_osd_runtime_status_key = None
         # 清理上一次“批量执行”的失败汇总（跨任务）
         self._last_run_row_results = []
         self._last_run_failures = []
@@ -16323,36 +20573,67 @@ class AutoManager(QMainWindow):
         )
         self._log(_start_banner, "purple")
         
-        # Build task queue unless "only current task" is checked
+        # 硬性入口隔离：运行控制台只允许执行当前任务的批量数据。
+        # 多任务顺序执行只能由任务排程页 _run_schedule → _run_next_scheduled_task 触发。
+        self._task_queue = []
         if on_finished:
-            self._task_queue = [] # 排程模式下不使用默认的任务队列逻辑
-        elif self.chk_only_current.isChecked():
-            self._task_queue = []
-            self._log(f"🚀 开始执行当前任务: [{self._get_task_display_text(self.current_task, with_folder=True)}]", "blue")
+            self._log(f"📅 排程执行当前项: [{self._get_task_display_text(self.current_task, with_folder=True)}]", "purple")
         else:
-            all_tasks = self._get_task_names()
-            cur_idx = all_tasks.index(self.current_task) if self.current_task in all_tasks else -1
-            self._task_queue = all_tasks[cur_idx + 1:] if cur_idx >= 0 else []
-            if self._task_queue:
-                queue_text = " → ".join(self._get_task_display_text(task_id, with_folder=True) for task_id in self._task_queue)
-                self._log(f"🚀 开始执行，将依次运行: [{self._get_task_display_text(self.current_task, with_folder=True)}] → {queue_text}", "purple")
-            else:
-                self._log(f"🚀 开始执行当前任务: [{self._get_task_display_text(self.current_task, with_folder=True)}]", "blue")
-        # Clear previous run statuses
+            self._log(f"🚀 运行控制台批量执行：仅当前任务 [{self._get_task_display_text(self.current_task, with_folder=True)}]", "blue")
+        # [排程只读运行态] 自动排程不得抓取当前 UI 控件或把其写回目标任务，
+        # 并且始终执行启动排程时冻结的快照，确保每项的打开网址模式彼此隔离。
+        self._execution_readonly_config = bool(on_finished)
+        if self._execution_readonly_config:
+            self._scheduled_execution_snapshot = {
+                "task_id": task_id,
+                "actions": copy.deepcopy(task_actions),
+                "data": copy.deepcopy(
+                    scheduled_data_snapshot if isinstance(scheduled_data_snapshot, list)
+                    else self.config.get("task_data", {}).get(task_id, [{}])
+                ),
+            }
+        else:
+            self._scheduled_execution_snapshot = None
+        if not self._execution_readonly_config:
+            self._force_sync_action_widgets()
+            if self.data_table.is_editing():
+                self.data_table.clearSelection()
+                self.data_table.setCurrentCell(-1, -1)
+            self._save_data_table(flush=True)
+            self._refresh_data_table()
+        else:
+            self._log("🔒 排程只读执行：使用已保存的流程与批量数据，不从界面反向同步", "gray")
         self._row_statuses[self.current_task] = {}
-        self._refresh_data_table()
-        is_test_run = (self.tabs.currentIndex() == 0)
+        # 排程可能在“流程编排”页可见，但它的语义永远是按各任务的批量数据运行。
+        # 旧代码只看当前页签，导致第二任务被误判为测试模式，账号列被忽略而变成空值。
+        is_scheduled_run = bool(on_finished)
+        is_test_run = (not is_scheduled_run) and (self.tabs.currentIndex() == 0)
+        if is_scheduled_run:
+            self._log("📦 排程批量模式：按已保存的每行账号与业务数据执行", "gray")
         self.resume_point = (0, 0, 0); self._execute(0, 0, 0, is_test=is_test_run)
     def _resume_execution(self):
-        is_test_run = (self.tabs.currentIndex() == 0)
+        # 排程暂停后恢复时也不能因当前页面停留在流程编排而丢弃批量账号数据。
+        is_scheduled_run = bool(getattr(self, "_execution_readonly_config", False))
+        is_test_run = (not is_scheduled_run) and (self.tabs.currentIndex() == 0)
         self._execute(*self.resume_point, is_test=is_test_run)
     def _force_sync_action_widgets(self):
-        """修复3：运行前强制从 UI 表格抓取最新内容写入 config，防止幽灵输入框问题。"""
-        if not self.current_task: return
+        """从当前可见流程编辑器抓取最新内容写入其对应配置。"""
+        if not self.current_task:
+            return
+        visible_task = str(getattr(self, "_visible_action_editor_task", "") or "")
+        # 排程为避免卡顿会临时修改 current_task，但不会重绘流程编辑器。此时旧控件绝不能
+        # 写入新的后台任务；否则“独立模式”会被上一任务的“读取模式”永久污染。
+        if visible_task != str(self.current_task):
+            self._log(
+                f"🔒 已跳过流程控件反向同步：可见编辑器=[{visible_task or '无'}]，"
+                f"后台当前任务=[{self.current_task}]，配置保持不变。",
+                "gray"
+            )
+            return
         acts = self.config['tasks'].get(self.current_task, [])
         for i in range(self.action_table.rowCount()):
             if i >= len(acts): break
-            w = self.action_table.cellWidget(i, 3)
+            w = self.action_table.cellWidget(i, 4)
             if w is None: continue
             # 直接是 QLineEdit（非容器）
             if isinstance(w, QLineEdit) and w.isEnabled():
@@ -16366,13 +20647,22 @@ class AutoManager(QMainWindow):
                 if act_type == "🌐 打开网址":
                     le = w.findChild(QLineEdit)
                     btn = w.findChild(QPushButton)
+                    cb_mode_w = w.findChild(QComboBox, "open_url_mode")
                     if le and btn:
                         url_text = le.text()
                         prof_id = btn.property("profile_id") or ""
-                        new_val = f"{url_text}|{prof_id}"
+                        # [致命 BUG 修复] 绝不盲目重置为 independent！优先继承原有 mode
+                        old_val = str(acts[i].get('value', ''))
+                        old_parts = [p.strip() for p in old_val.split('|')]
+                        old_mode = old_parts[2] if len(old_parts) > 2 else "independent"
+                        ui_mode = cb_mode_w.currentData() if cb_mode_w else ""
+                        mode = ui_mode if ui_mode else old_mode
+                        if not mode:
+                            mode = "independent"
+                        new_val = f"{url_text}|{prof_id}|{mode}"
                         if acts[i].get('value', '') != new_val:
                             acts[i]['value'] = new_val
-                            self._log(f"🔒 [运行前同步] 步骤「{acts[i].get('name', f'步骤{i+1}')}」网址/账户已同步", "blue")
+                            self._log(f"🔒 [运行前同步] 步骤「{acts[i].get('name', f'步骤{i+1}')}」网址/账户/模式已同步", "blue")
                 elif act_type == "✨ 清空并输入(增强版)":
                     # 这里的内容区可能是 MultiLineTextEdit（而不是 QLineEdit）
                     edits = w.findChildren(QLineEdit)
@@ -16407,6 +20697,13 @@ class AutoManager(QMainWindow):
                         if acts[i].get('value', '') != new_val:
                             acts[i]['value'] = new_val
                             self._log(f"🔒 [运行前同步] 步骤「{acts[i].get('name', f'步骤{i+1}')}」延后配置已同步", "blue")
+                elif act_type == "🧹 关闭浏览器窗口":
+                    cb = w.findChild(QComboBox)
+                    if cb:
+                        new_val = cb.currentData() or cb.currentText() or "single"
+                        if acts[i].get('value', '') != new_val:
+                            acts[i]['value'] = new_val
+                            self._log(f"🔒 [运行前同步] 步骤「{acts[i].get('name', f'步骤{i+1}')}」关闭浏览器模式已同步", "blue")
                 elif any(x in act_type for x in ["如果找图成功", "如果窗口存在"]):
                     le = w.findChild(QLineEdit)
                     cbs = w.findChildren(QComboBox)
@@ -16428,19 +20725,169 @@ class AutoManager(QMainWindow):
                             self._log(f"🔒 [运行前同步] 步骤「{acts[i].get('name', f'步骤{i+1}')}」内容已同步", "blue")
         save_config(self.config)
 
+    def _get_low_spec_batch_options(self):
+        """读取当前低配分批参数；该设置保存为全局运行偏好，适用于后续任务。"""
+        if not hasattr(self, "chk_low_spec_batch"):
+            return {"enabled": False}
+        return {
+            "enabled": bool(self.chk_low_spec_batch.isChecked()),
+            "batch_size": int(self.batch_size_spin.value()),
+            "wave_size": int(self.batch_wave_spin.value()),
+            "wave_interval": int(self.batch_wave_interval_spin.value()),
+            "settle_seconds": int(self.batch_settle_spin.value()),
+            "close_batch_windows": bool(self.chk_batch_auto_close.isChecked()),
+        }
+
+    def _save_low_spec_batch_settings(self, *_args):
+        """保存运行控制台中的低配分批偏好，不影响已有任务及其数据。"""
+        if not hasattr(self, "chk_low_spec_batch"):
+            return
+        try:
+            self.config.setdefault("layout", {})["low_spec_batch"] = self._get_low_spec_batch_options()
+            save_config(self.config)
+        except Exception as e:
+            log_internal_issue("保存低配分批设置失败", e)
+
+    def _start_isolated_worker(self, **job):
+        """Start this same main.pyw in worker mode; UI remains in the parent process."""
+        os.makedirs(os.path.join(BASE_DIR, "worker_jobs"), exist_ok=True)
+        token = f"worker_{int(time.time() * 1000)}_{os.getpid()}"
+        job_path = os.path.join(BASE_DIR, "worker_jobs", token + ".json")
+        job.update({"task_name": self.current_task, "task_id": self.current_task})
+        with open(job_path, "w", encoding="utf-8") as f:
+            json.dump(job, f, ensure_ascii=False)
+        command = [sys.executable, "-X", "utf8", os.path.abspath(sys.argv[0]), "--simuops-worker", job_path]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        worker_env = os.environ.copy()
+        worker_env["PYTHONUTF8"] = "1"
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="strict", bufsize=1,
+                                   creationflags=flags, env=worker_env)
+        if not hasattr(self, "_worker_event_bridge"):
+            self._worker_event_bridge = WorkerEventBridge(self)
+            self._worker_event_bridge.event_sig.connect(self._on_worker_event, Qt.QueuedConnection)
+        self._worker_job_path = job_path
+        self._engine = WorkerEngineProxy(process, job["actions"], job["data_list"], self._send_worker_command)
+        self._last_osd_runtime_status_key = None
+        self._log(f"🧩 已启动独立自动化 Worker（PID {process.pid}）；主界面保持独立响应。", "purple")
+
+        def reader():
+            try:
+                for raw in iter(process.stdout.readline, ""):
+                    raw = raw.rstrip("\r\n")
+                    if raw.startswith(WORKER_PREFIX):
+                        try:
+                            event = json.loads(raw[len(WORKER_PREFIX):])
+                            self._worker_event_bridge.event_sig.emit(event)
+                        except Exception:
+                            continue
+                    elif raw:
+                        self._worker_event_bridge.event_sig.emit({"kind": "log", "payload": ["[Worker输出] " + raw, "gray"]})
+            finally:
+                if process.poll() is not None:
+                    self._worker_event_bridge.event_sig.emit({"kind": "worker_exit", "payload": process.returncode})
+        threading.Thread(target=reader, name="SimuOpsWorkerReader", daemon=True).start()
+
+    def _send_worker_command(self, command):
+        process = getattr(getattr(self, "_engine", None), "process", None)
+        if not process or process.poll() is not None:
+            return
+        try:
+            process.stdin.write(json.dumps({"command": command}) + "\n")
+            process.stdin.flush()
+            self._log(f"🎛️ 已发送 Worker 控制命令：{command}", "gray")
+            if command == "stop":
+                # 若 worker 卡在不可中断的 Win32/UIA 调用中，控制 JSON 不会被及时读取；
+                # 主界面仍可在宽限期后终止子进程，绝不被该调用拖死。
+                QTimer.singleShot(3500, self._force_stop_worker_if_needed)
+        except Exception as exc:
+            self._log(f"⚠️ Worker 控制通道不可用：{exc}", "orange")
+
+    def _force_stop_worker_if_needed(self):
+        engine = getattr(self, "_engine", None)
+        process = getattr(engine, "process", None)
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+                self._log("🛑 Worker 在 3.5 秒内未响应停止命令，已由主界面终止。", "orange")
+            except Exception as exc:
+                self._log(f"⚠️ 无法终止无响应 Worker: {exc}", "orange")
+
+    def _on_worker_event(self, event):
+        """All child-process events arrive here on the GUI thread."""
+        if not isinstance(event, dict):
+            return
+        kind, payload = event.get("kind"), event.get("payload")
+        engine = getattr(self, "_engine", None)
+        try:
+            if kind == "log":
+                self._queue_engine_log_ui(*(payload or ["", "white"]))
+            elif kind == "progress":
+                if engine: engine._last_percent = int((payload or [0])[0] or 0)
+                self._on_engine_progress_ui(int((payload or [0])[0] or 0))
+            elif kind == "pause":
+                self._on_pause(*(payload or [0, 0, 0]))
+            elif kind == "row_status":
+                self._on_row_status(*(payload or [0, ""]))
+            elif kind == "row_result":
+                self._on_row_result((payload or [{}])[0])
+            elif kind == "hotkey_paused":
+                self._on_hotkey_paused(*(payload or [0, 0, 0]))
+            elif kind == "detail":
+                self.osd.update_detail(str((payload or [""])[0]))
+            elif kind == "deferred":
+                self._on_deferred_queue_update((payload or [[]])[0])
+            elif kind == "runtime":
+                status = (payload or [{}])[0]
+                if engine and isinstance(status, dict):
+                    engine._cur_l = max(0, int(status.get("loop", 1)) - 1)
+                    engine._cur_t = max(0, int(status.get("row", 1)) - 1)
+                    engine._cur_s = max(0, int(status.get("step", 1)) - 1)
+                self._on_engine_runtime_status(status)
+            elif kind == "done":
+                info = payload if isinstance(payload, dict) else ((payload or [{}])[0] if isinstance(payload, list) else {})
+                if engine:
+                    engine._final_status = str(info.get("status", "failed"))
+                    engine._last_error = str(info.get("last_error", ""))
+                    engine._last_percent = int(info.get("last_percent", 0) or 0)
+                    engine._cur_l, engine._cur_t, engine._cur_s = int(info.get("cur_l", 0) or 0), int(info.get("cur_t", 0) or 0), int(info.get("cur_s", 0) or 0)
+                self._on_done()
+            elif kind == "worker_exit" and engine and engine._final_status == "running":
+                # 用户已请求停止时，3.5 秒保护终止属于受控收尾，不应显示为卡住或意外失败。
+                if getattr(self, "_ui_stop_reset_pending", False):
+                    engine._final_status = "stopped"
+                    engine._last_error = ""
+                else:
+                    engine._final_status = "failed"
+                    engine._last_error = "Worker 进程意外退出"
+                self._on_done()
+        except Exception as exc:
+            self._log(f"⚠️ 处理 Worker 事件失败: {type(exc).__name__}: {exc}", "orange")
+
     def _execute(self, l, t, s, is_test=False):
         # 核心修复：强制结束表格当前的编辑状态，确保正在输入的单元格内容被提交
         if self.data_table.is_editing():
             self.data_table.clearSelection()
             self.data_table.setCurrentCell(-1, -1)
             
-        self._force_sync_action_widgets()  # 修复3：运行前强制同步 UI → config
-        self._refresh_defer_target_options(persist_changes=True)  # 运行前修复旧配置里的挂起目标
-        self._save_data_table() # 内部会从 UI 控件重新抓取最新值并保存到 config
+        # 手动运行时才允许把当前 UI 提交回配置；排程严格只读，杜绝跨任务控件污染。
+        readonly_execution = bool(getattr(self, "_execution_readonly_config", False))
+        if not readonly_execution:
+            self._force_sync_action_widgets()
+            self._refresh_defer_target_options(persist_changes=True)
+            self._save_data_table()
+        else:
+            self._refresh_defer_target_options(persist_changes=False)
         
-        # 重新从配置加载数据，确保传递给引擎的是最新快照
-        as_ = self.config['tasks'].get(self.current_task, [])
-        ds = self.config['task_data'].get(self.current_task, [{}])
+        # 创建独立深拷贝运行快照，执行线程绝不与界面/配置共享可变对象。
+        # 排程必须继续使用其启动时冻结的当前项快照，禁止回读可能被界面改动的 config。
+        scheduled_snapshot = getattr(self, "_scheduled_execution_snapshot", None)
+        if readonly_execution and isinstance(scheduled_snapshot, dict) and scheduled_snapshot.get("task_id") == self.current_task:
+            as_ = copy.deepcopy(scheduled_snapshot.get("actions", []))
+            ds = copy.deepcopy(scheduled_snapshot.get("data", [{}]))
+        else:
+            as_ = copy.deepcopy(self.config['tasks'].get(self.current_task, []))
+            ds = copy.deepcopy(self.config['task_data'].get(self.current_task, [{}]))
         
         # 立即显示 OSD 悬浮窗（如果勾选了）
         if self.chk_show_osd.isChecked():
@@ -16450,8 +20897,10 @@ class AutoManager(QMainWindow):
             # 强制提升到最顶层
             self.osd.raise_()
         
-        as_ = self.config['tasks'].get(self.current_task, [])
-        ds = self.config['task_data'].get(self.current_task, [{}])
+        # as_ / ds 已在上方创建为独立运行快照；不要再次从 config 读取引用。
+        if not is_test:
+            selected_count = sum(1 for row in ds if isinstance(row, dict) and bool(row.get("_选中", True)))
+            self._log(f"☑️ Worker 执行快照：已勾选 {selected_count}/{len(ds)} 行。", "gray")
         
         # 核心修复：如果是测试模式（从流程编排触发）
         loops_to_run = self.loop_spin.value()
@@ -16464,50 +20913,145 @@ class AutoManager(QMainWindow):
         if as_:
             self._clear_deferred_queue_panel()
             self._ui_stop_reset_pending = False
+            self.osd.set_execution_active(True)
             self.btn_run.setEnabled(False); self.btn_resume.setEnabled(False); self.btn_stop.setEnabled(True); self.btn_run.setText("正在执行...")
             self.btn_pause.setEnabled(True); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
             on_error_map = {0: "stop", 1: "skip", 2: "fail_row"}
             on_error = on_error_map.get(self.error_combo.currentIndex(), "stop")
-            self._engine = AutoEngine(as_, ds, self.delay_spin.value(), t, s, loops_to_run, l,
-                                          retry_count=self.retry_spin.value(), on_error=on_error, ignore_data=is_test,
-                                          standardize_window=self.chk_std_win.isChecked())
-            self._engine._task_name = self.current_task  # 注入任务名称供进度文件使用
-            self._engine._task_id = self.current_task
-            self._engine.log_sig.connect(self._log)
-            self._engine.prog_sig.connect(self.progress.setValue)
-            self._engine.prog_sig.connect(lambda p: self._update_osd(p)) # 同步更新 OSD
-            self._engine.pause_sig.connect(self._on_pause)
-            self._engine.done_sig.connect(self._on_done)
-            self._engine.row_status_sig.connect(self._on_row_status)
-            self._engine.row_result_sig.connect(self._on_row_result)
-            self._engine.highlight_sig.connect(self._on_highlight)
-            self._engine.hotkey_paused_sig.connect(self._on_hotkey_paused)
-            self._engine.detail_sig.connect(self.osd.update_detail)  # [v3] 修复: 延时倒计时同步到 OSD
-            self._engine.deferred_queue_sig.connect(self._on_deferred_queue_update)
-            self._engine.start()
+            batch_options = self._get_low_spec_batch_options()
+            # 流程编排页属于单组测试，不进入分批预开，避免额外启动账号窗口。
+            if is_test:
+                batch_options["enabled"] = False
+            self._start_isolated_worker(
+                actions=as_, data_list=ds, loop_delay=self.delay_spin.value(), start_t=t, start_s=s,
+                loops=loops_to_run, start_l=l, retry_count=self.retry_spin.value(), on_error=on_error,
+                dry_run=False, ignore_data=is_test, standardize_window=self.chk_std_win.isChecked(),
+                batch_options=batch_options,
+            )
+        else:
+            # 二次防线：即使未来有其他调用绕过 _run_all，也不能让空步骤任务悄悄停在运行态。
+            self._execution_readonly_config = False
+            self._log("⚠️ 当前任务没有可执行步骤，执行已取消。", "orange")
+            try:
+                self.btn_run.setEnabled(True)
+                self.btn_run.setText("🚀 开始批量执行")
+                self.btn_stop.setEnabled(False)
+                self.btn_pause.setEnabled(False)
+                self.btn_resume.setEnabled(False)
+            except Exception:
+                pass
     def _on_pause(self, l, t, s): 
         self.resume_point = (l, t, s); self.btn_run.setEnabled(True); self.btn_resume.setEnabled(True); self.btn_stop.setEnabled(False); self.btn_run.setText("🚀 重新开始"); self._log(f"🛑 暂停: 轮{l+1}, 组{t+1}, 步{s+1}", "orange")
         self.osd.lbl_info.setText(f"⏸ <b>已暂停</b> | 组 {t+1} | 步 {s+1}")
 
+    def _on_engine_runtime_status(self, payload):
+        """GUI 主线程中渲染行/步骤状态；不执行 Win32、文件 I/O 或自动化操作。"""
+        if not isinstance(payload, dict):
+            return
+        row = int(payload.get("row", 0) or 0)
+        total_rows = max(1, int(payload.get("total_rows", 1) or 1))
+        step = int(payload.get("step", 0) or 0)
+        total_steps = max(1, int(payload.get("total_steps", 1) or 1))
+        step_name = str(payload.get("step_name", "") or "执行中")
+        detail = str(payload.get("detail", "") or "")
+        if not self.chk_show_osd.isChecked():
+            return
+        if not self.osd.isVisible():
+            self.osd.show()
+        info = f"<b>{self._get_task_display_text(self.current_task, with_folder=True)}</b> | 行 {row}/{total_rows} | 步 {step}/{total_steps}: <font color='#82b1ff'>{step_name}</font>"
+        self.osd.lbl_info.setText(info)
+        self.osd.lbl_detail.setText(detail)
+        # 仅在行/步骤切换时向小窗口加入一行，避免拖拽阶段日志淹没执行位置。
+        status_key = (payload.get("kind"), row, step, step_name, detail if payload.get("kind") == "drag" else "")
+        if status_key != getattr(self, "_last_osd_runtime_status_key", None):
+            self._last_osd_runtime_status_key = status_key
+            self.osd.add_log(f"行 {row}/{total_rows} | 步 {step}/{total_steps} | {step_name}", "blue")
+        live_runtime_diagnostic(
+            f"[GUI-OSD] 行 {row}/{total_rows} 步 {step}/{total_steps} {step_name} kind={payload.get('kind', '')}"
+        )
+
+    def _on_engine_progress_ui(self, percent):
+        """仅在 GUI 线程刷新进度条与微型控制台，避免工作线程直接触碰 QWidget。"""
+        try:
+            self.progress.setValue(int(percent))
+        except Exception:
+            pass
+        self._update_osd(percent)
+
     def _update_osd(self, percent):
+        # 停止请求已经发出时，保留“正在停止”终态等待提示；不要再用运行中进度覆盖它。
         if getattr(self, "_ui_stop_reset_pending", False):
             return
         if not self.chk_show_osd.isChecked():
             self.osd.hide()
             return
-            
-        if hasattr(self, '_engine') and self._engine.isRunning():
-            e = self._engine
-            cur_act = e.actions[e._cur_s] if e._cur_s < len(e.actions) else {}
+
+        # WorkerEngineProxy 与同进程 AutoEngine 使用完全相同的运行快照字段。
+        # 之前排除了 Proxy，导致实际 Worker 在执行但悬浮窗进度始终停在 0%。
+        engine = getattr(self, '_engine', None)
+        if engine and engine.isRunning():
+            actions = list(getattr(engine, 'actions', []) or [])
+            data_list = list(getattr(engine, 'data_list', []) or [])
+            cur_step = max(0, int(getattr(engine, '_cur_s', 0) or 0))
+            cur_act = actions[cur_step] if cur_step < len(actions) else {}
             self.osd.update_progress(
-                self.current_task, e._cur_l, e._cur_t + 1, len(e.data_list),
-                e._cur_s + 1, len(e.actions), cur_act.get('name', 'Step'), percent
+                self.current_task, max(0, int(getattr(engine, '_cur_l', 0) or 0)),
+                max(1, int(getattr(engine, '_cur_t', 0) or 0) + 1), max(1, len(data_list)),
+                cur_step + 1, max(1, len(actions)), cur_act.get('name', 'Step'), int(percent)
             )
+            # 进度信号到达时确保微型控制台仍保持显示；日志会由 _log 持续追加。
+            if not self.osd.isVisible():
+                self.osd.show()
+                self.osd.raise_()
+
+    def _queue_engine_log_ui(self, message, color="white"):
+        """接收工作线程日志，但不立即重绘 QTextEdit，避免 GUI 事件队列被日志刷新塞满。"""
+        if not hasattr(self, "_engine_ui_log_buffer"):
+            self._engine_ui_log_buffer = []
+        self._engine_ui_log_buffer.append((str(message), str(color)))
+        if not hasattr(self, "_engine_ui_log_timer"):
+            self._engine_ui_log_timer = QTimer(self)
+            self._engine_ui_log_timer.setSingleShot(True)
+            self._engine_ui_log_timer.timeout.connect(self._flush_engine_log_ui)
+        if not self._engine_ui_log_timer.isActive():
+            self._engine_ui_log_timer.start(80)
+
+    def _flush_engine_log_ui(self):
+        """分批处理最多 8 条日志，为鼠标、重绘和按钮事件持续让出 GUI 线程。"""
+        pending = getattr(self, "_engine_ui_log_buffer", [])
+        if not pending:
+            return
+        batch = pending[:8]
+        del pending[:8]
+        try:
+            self.log_area.setUpdatesEnabled(False)
+            if hasattr(self, "osd"):
+                self.osd.log_area.setUpdatesEnabled(False)
+            for message, color in batch:
+                self._append_log_entry(message, color)
+        finally:
+            try:
+                self.log_area.setUpdatesEnabled(True)
+                self.log_area.viewport().update()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "osd"):
+                    self.osd.log_area.setUpdatesEnabled(True)
+                    self.osd.log_area.viewport().update()
+            except Exception:
+                pass
+        if pending:
+            self._engine_ui_log_timer.start(25)
 
     def _log(self, m, c="white"):
+        """GUI 主线程的即时日志入口，供按钮操作与普通界面操作使用。"""
+        self._append_log_entry(m, c)
+
+    def _append_log_entry(self, m, c="white"):
+        """实际写入界面、微型控制台和文本日志；只能由 GUI 主线程调用。"""
         time_str = datetime.now().strftime('%H:%M:%S')
         log_entry = f"[{time_str}] {m}"
-        # 界面日志区：根据颜色应用 HTML 样式
         color_map = {
             "red": "#ff5252", "green": "#69f0ae", "blue": "#82b1ff",
             "orange": "#ffab40", "purple": "#ea80fc", "gray": "#aaaaaa",
@@ -16515,19 +21059,20 @@ class AutoManager(QMainWindow):
         }
         html_color = color_map.get(c, "#d4d4d4")
         self.log_area.append(f'<span style="color:{html_color}">{log_entry}</span>')
-        
-        # 同步日志到 OSD 微型控制台
-        if hasattr(self, 'osd') and self.osd.isVisible():
+
+        if hasattr(self, 'osd'):
             self.osd.add_log(m, c)
-            
-        # 日志文件：写入纯文本
+
         log_dir = os.path.join(BASE_DIR, "logs")
-        if not os.path.exists(log_dir): os.makedirs(log_dir)
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
         log_file = os.path.join(log_dir, f"log_{datetime.now().strftime('%Y%m%d')}.txt")
         try:
-            with open(log_file, "a", encoding="utf-8") as f: f.write(log_entry + "\n")
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(log_entry + "\n")
         except Exception as e:
             log_internal_issue(f"写入运行日志失败: {log_file}", e)
+
     def _show_config_load_warning(self):
         msg = f"检测到配置文件读取失败，程序已回退为空配置以避免直接崩溃。\n\n错误信息：{self._config_load_error}"
         if self._config_load_backup_path:
@@ -16625,15 +21170,21 @@ class AutoManager(QMainWindow):
         self.btn_timer.setText(f"⏰ {countdown}")
 
     def _on_done(self):
+        # Worker 已回传终态；此时可关闭悬浮窗。若排程还有下一项，下一项启动时会再次锁定。
+        self.osd.set_execution_active(False)
+        # 无论成功、失败还是停止，都结束本轮“排程只读运行态”，避免影响下一次手动执行。
+        self._execution_readonly_config = False
         self.btn_run.setEnabled(True); self.btn_resume.setEnabled(False)
         self.btn_stop.setEnabled(False); self.btn_dry_run.setEnabled(True)
         self.btn_run.setText("🚀 开始批量执行")
         self.btn_pause.setEnabled(False); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
-        self.osd.hide() # 任务完成，隐藏悬浮窗
+        # 收到终态后应关闭悬浮窗口；若排程立即启动下一项，下一项的进度事件会自行重新显示。
         final_status = getattr(getattr(self, '_engine', None), '_final_status', 'done')
         last_error = getattr(getattr(self, '_engine', None), '_last_error', '')
         if final_status == "done":
             self.progress.setValue(100)
+            # 本项已经结束：立即关闭终态小窗口。若排程续跑，下一项开始时会由进度事件重新显示。
+            self.osd.hide()
         elif final_status in ("failed", "stopped"):
             if final_status == "stopped" and getattr(self, "_ui_stop_reset_pending", False):
                 self.progress.setValue(0)
@@ -16643,6 +21194,10 @@ class AutoManager(QMainWindow):
             self.progress.setValue(0)
 
         if final_status == "stopped":
+            stopped_percent = max(0, int(getattr(getattr(self, '_engine', None), '_last_percent', self.progress.value() or 0) or 0))
+            self.progress.setValue(stopped_percent)
+            # 停止状态已确认，关闭小窗口；主界面保留最终进度，供用户查看停止位置。
+            self.osd.hide()
             self._ui_stop_reset_pending = False
             self._task_queue = []
             self._current_on_finished = None
@@ -16650,28 +21205,49 @@ class AutoManager(QMainWindow):
             return
 
         if final_status == "failed":
-            fail_msg = "❌ 当前任务执行失败，已停止后续任务。"
+            fail_msg = "❌ 当前任务执行失败，已跳过当前任务。"
             if last_error:
                 fail_msg += f"\n错误详情：{last_error}"
             self._log(fail_msg, "red")
-            # 若开启“失败也继续”，则不弹窗打断流程，继续跑后续任务；失败项会在最后统一汇总
-            if getattr(self, '_task_queue', []) and hasattr(self, "chk_continue_on_fail") and self.chk_continue_on_fail.isChecked():
-                next_task = self._task_queue.pop(0)
-                if next_task in self.config.get('tasks', {}):
-                    self._log(
-                        f"⚠️ 任务 [{self._get_task_display_text(self.current_task, with_folder=True)}] 失败，但已开启“失败也继续”，将切到下一个任务: [{self._get_task_display_text(next_task, with_folder=True)}]",
-                        "orange"
-                    )
-                    self._activate_task_by_id(next_task)
-                    self._row_statuses[next_task] = {}
-                    self._refresh_data_table()
-                    self.resume_point = (0, 0, 0)
-                    self._execute(0, 0, 0)
-                    return
-            # 默认行为：停止后续任务
+
+            # 运行控制台不存在跨任务队列；失败只结束当前任务。
             self._task_queue = []
+
+            # 只有排程回调会在失败后继续排程中的下一项。
+            if hasattr(self, '_current_on_finished') and self._current_on_finished:
+                callback = self._current_on_finished
+                self._current_on_finished = None
+                self._log("⚠️ 当前任务失败，已记录并继续执行后续排程。", "orange")
+                self.btn_run.setEnabled(False); self.btn_stop.setEnabled(True)
+                self.btn_run.setText("正在切换后续排程...")
+                if self.chk_show_osd.isChecked():
+                    self.osd.lbl_info.setText("⏭️ 当前任务失败，正在切换后续排程...")
+                    self.osd.show(); self._keep_osd_front_and_clear()
+                # 只有低配分批“预开”失败才会影响纯按账号读取的后续排程项。
+                # 普通步骤失败仍沿用原有策略：当前项失败、其余项继续执行。
+                preopen_failed = bool(
+                    "分批预开" in str(last_error or "")
+                    or "预开窗口" in str(last_error or "")
+                )
+                if preopen_failed:
+                    try:
+                        self._schedule_failed_preopen_tasks.add(str(self.current_task or ""))
+                    except Exception:
+                        pass
+                outcome = {
+                    "status": "failed",
+                    "preopen_failed": preopen_failed,
+                    "task_id": str(self.current_task or ""),
+                    "error": str(last_error or ""),
+                }
+                QTimer.singleShot(0, lambda cb=callback, result=outcome: cb(result))
+                return
+
+            # 任务链已无后续项时也只记日志，不弹出任何阻塞式失败窗口。
             self._current_on_finished = None
-            QMessageBox.warning(self, "执行失败", fail_msg)
+            self._task_queue = []
+            self.osd.hide()
+            self._log("⚠️ 当前任务失败，后续任务队列为空；已非阻塞结束本轮执行。", "orange")
             return
 
         # 在日志文件写入任务完成分隔线
@@ -16687,34 +21263,25 @@ class AutoManager(QMainWindow):
         if hasattr(self, '_current_on_finished') and self._current_on_finished:
             callback = self._current_on_finished
             self._current_on_finished = None
-            callback()
+            callback({"status": "done", "task_id": str(self.current_task or "")})
             return
 
-        # If there are more tasks in the sequential queue, run the next one
-        if getattr(self, '_task_queue', []):
-            next_task = self._task_queue.pop(0)
-            if next_task in self.config['tasks']:
-                self._log(
-                    f"✅ 任务 [{self._get_task_display_text(self.current_task, with_folder=True)}] 完成，自动切换到下一个任务: [{self._get_task_display_text(next_task, with_folder=True)}]",
-                    "purple"
-                )
-                self._activate_task_by_id(next_task)
-                self._row_statuses[next_task] = {}
-                self._refresh_data_table()
-                self.resume_point = (0, 0, 0)
-                self._execute(0, 0, 0)
-                return
+        # 控制台批量执行完成后禁止自动切换任务；多任务切换仅由上方排程回调处理。
         self._task_queue = []
         
-        suppress_dialog = bool(getattr(self, "_suppress_failure_dialog_once", False))
+        # 当前任务批量执行结束只写入日志；不弹出失败汇总、失败管理器或其他结果提示。
         self._suppress_failure_dialog_once = False
-
-        # 全部任务结束后：失败项仅记录日志，不再自动弹出失败管理器，避免打断批量执行收尾
         try:
-            if (not suppress_dialog) and getattr(self, "_last_run_failures", []):
-                self._log(f"⚠️ 本次执行有 {len(self._last_run_failures)} 个失败项；如需处理，可手动打开失败管理器。", "orange")
+            failure_count = len(getattr(self, "_last_run_failures", []) or [])
+            if failure_count:
+                self._log(f"⚠️ 当前任务批量执行结束：本次共有 {failure_count} 个失败项，详情已记录在日志与数据状态列。", "orange")
+            else:
+                self._log("✅ 当前任务批量执行结束：本次没有失败项。", "green")
         except Exception:
-            pass
+            self._log("🏁 当前任务批量执行结束。", "green")
+
+        # 全部任务真正结束后才隐藏悬浮进度条。
+        self.osd.hide()
 
         # 自动关机逻辑
         if self.chk_auto_shutdown.isChecked():
@@ -16883,7 +21450,7 @@ class AutoManager(QMainWindow):
             )
             self._engine._task_name = f"[修复] {self._get_task_display_text(self._repair_task_id, with_folder=True)}"
             self._engine._task_id = self._repair_task_id
-            self._engine.log_sig.connect(self._log)
+            self._engine.log_sig.connect(self._queue_engine_log_ui, Qt.QueuedConnection)
             self._engine.prog_sig.connect(self.progress.setValue)
             self._engine.done_sig.connect(self._on_repair_done)
             self._engine.start()
@@ -16960,9 +21527,30 @@ class AutoManager(QMainWindow):
         except Exception as e:
             self.lbl_hotkey.setText(f"⚠️ 热键注册失败: {e}")
 
+    def _queue_hotkey_event(self, command):
+        """由 keyboard 监听线程调用；通过 Qt 信号安全切回 GUI 主线程。"""
+        bridge = getattr(self, "_hotkey_event_bridge", None)
+        if bridge is not None:
+            bridge.event_sig.emit({"kind": "hotkey_command", "command": str(command)})
+
+    def _on_hotkey_event(self, event):
+        if not isinstance(event, dict) or event.get("kind") != "hotkey_command":
+            return
+        command = str(event.get("command") or "")
+        handlers = {
+            "pause": self._do_hotkey_pause_toggle,
+            "stop": self._stop_execution,
+            "capture": self._start_region_capture,
+            "skip_step": self._osd_skip_step,
+            "next_row": self._osd_next_row,
+            "retry_step": self._osd_retry_step,
+        }
+        handler = handlers.get(command)
+        if handler:
+            handler()
+
     def _hotkey_pause_toggle(self):
-        """Called from keyboard listener thread — use QTimer to touch UI safely."""
-        QTimer.singleShot(0, self._do_hotkey_pause_toggle)
+        self._queue_hotkey_event("pause")
 
     def _do_hotkey_pause_toggle(self):
         if not hasattr(self, '_engine') or not self._engine.isRunning(): return
@@ -16980,21 +21568,25 @@ class AutoManager(QMainWindow):
             self.btn_pause.setText("▶️ 继续"); self.btn_pause.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
             self.osd.btn_pause.setText("▶ 继续")
             self.osd.btn_pause.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; border-radius: 3px; font-size: 11px; font-weight: bold; padding: 1px 4px; }")
+            self.osd.lbl_info.setText("⏸️ <b>已暂停</b> | 等待 Worker 到达安全检查点")
+            self.osd.lbl_detail.setText("再次按暂停热键可继续；小窗口保持显示")
+            self.osd.show()
+            self.osd.raise_()
 
     def _hotkey_stop(self):
-        QTimer.singleShot(0, self._stop_execution)
+        self._queue_hotkey_event("stop")
 
     def _hotkey_capture(self):
-        QTimer.singleShot(0, self._start_region_capture)
+        self._queue_hotkey_event("capture")
 
     def _hotkey_skip_step(self):
-        QTimer.singleShot(0, self._osd_skip_step)
+        self._queue_hotkey_event("skip_step")
 
     def _hotkey_next_row(self):
-        QTimer.singleShot(0, self._osd_next_row)
+        self._queue_hotkey_event("next_row")
 
     def _hotkey_retry_step(self):
-        QTimer.singleShot(0, self._osd_retry_step)
+        self._queue_hotkey_event("retry_step")
 
     def _on_hotkey_paused(self, l, t, s):
         self.resume_point = (l, t, s)
@@ -17075,7 +21667,7 @@ class AutoManager(QMainWindow):
                                       retry_count=0, on_error=on_error, dry_run=True)
         self._engine._task_name = self.current_task  # 注入任务名称供进度文件使用
         self._engine._task_id = self.current_task
-        self._engine.log_sig.connect(self._log)
+        self._engine.log_sig.connect(self._queue_engine_log_ui, Qt.QueuedConnection)
         self._engine.prog_sig.connect(self.progress.setValue)
         self._engine.done_sig.connect(self._on_done)
         self._engine.row_status_sig.connect(self._on_row_status)
@@ -17126,6 +21718,14 @@ class AutoManager(QMainWindow):
         })
         self._flush_config_now()
         super().closeEvent(event)
+
+if __name__ == "__main__" and "--simuops-worker" in sys.argv:
+    try:
+        _idx = sys.argv.index("--simuops-worker")
+        _job = sys.argv[_idx + 1]
+    except Exception:
+        _job = ""
+    sys.exit(_simuops_worker_main(_job))
 
 if __name__ == "__main__":
     # [修复] 统一 DPI 策略：必须在 QApplication 实例化之前完成所有 DPI 相关设置
