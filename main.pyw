@@ -1069,7 +1069,7 @@ def _get_all_browser_processes_batch():
         return proc_map
     try:
         raw_out = subprocess.check_output(
-            'wmic process where "name=\'chrome.exe\' or name=\'msedge.exe\'" get ProcessId,CommandLine /format:list',
+            'wmic process where "name=\'chrome.exe\' or name=\'msedge.exe\' or name=\'firefox.exe\' or name=\'opera.exe\' or name=\'opera_gx.exe\' or name=\'brave.exe\' or name=\'bravebrowser.exe\' or name=\'vivaldi.exe\' or name=\'browser.exe\' or name=\'360chrome.exe\' or name=\'qqbrowser.exe\' or name=\'iexplore.exe\'" get ProcessId,CommandLine /format:list',
             shell=True
         ).decode('gbk', errors='ignore')
         
@@ -1112,6 +1112,23 @@ def _get_hwnd_process_info(hwnd):
         if not pid:
             return {"pid": 0, "name": "", "cmd": ""}
         
+        # 直接从窗口所属 PID 读取真实 exe 名称，避免 WMIC 缓存缺失时把浏览器误归为软件。
+        exe_name = ""
+        try:
+            process_handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if process_handle:
+                try:
+                    exe_buf = ctypes.create_unicode_buffer(520)
+                    exe_size = wintypes.DWORD(len(exe_buf))
+                    if ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                        process_handle, 0, exe_buf, ctypes.byref(exe_size)
+                    ):
+                        exe_name = os.path.basename(exe_buf.value).lower()
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(process_handle)
+        except Exception:
+            exe_name = ""
+
         batch_map = _get_all_browser_processes_batch()
         cmd = batch_map.get(pid, "")
         if not cmd:
@@ -1124,7 +1141,12 @@ def _get_hwnd_process_info(hwnd):
             except Exception:
                 cmd = ""
         
-        return {"pid": pid, "name": "chrome.exe", "cmd": cmd}
+        # 不能把所有窗口固定标记为 chrome.exe，否则普通软件也会被误判为浏览器。
+        if not exe_name:
+            exe_match = re.search(r"(?i)([a-z0-9_.-]+\.exe)(?:\s|$)", str(cmd or ""))
+            if exe_match:
+                exe_name = os.path.basename(exe_match.group(1)).lower()
+        return {"pid": pid, "name": exe_name, "cmd": cmd}
     except Exception as e:
         log_internal_issue(f"按 hwnd 获取进程信息失败: hwnd={hwnd}", e)
         return {"pid": 0, "name": "", "cmd": ""}
@@ -1170,6 +1192,33 @@ def _is_browser_process_info(proc_info):
         "runninghub",
     ]
     return any(mark in cmd for mark in browser_marks)
+
+
+def _get_window_browser_label(hwnd):
+    """返回窗口所属浏览器名称；无法确认时返回空字符串，避免把普通软件误归为浏览器。"""
+    if sys.platform != "win32" or not hwnd:
+        return ""
+    try:
+        info = _get_hwnd_process_info(int(hwnd))
+        name = str(info.get("name", "") or "").lower()
+        labels = {
+            "chrome.exe": "Google Chrome", "msedge.exe": "Microsoft Edge",
+            "firefox.exe": "Mozilla Firefox", "opera.exe": "Opera",
+            "opera_gx.exe": "Opera GX", "brave.exe": "Brave",
+            "bravebrowser.exe": "Brave", "vivaldi.exe": "Vivaldi",
+            "360chrome.exe": "360 浏览器", "qqbrowser.exe": "QQ 浏览器",
+            "iexplore.exe": "Internet Explorer", "browser.exe": "浏览器",
+        }
+        if name in labels and _is_browser_process_info(info):
+            return labels[name]
+        cls = str(get_window_class_name(int(hwnd)) or "")
+        if cls == "MozillaWindowClass":
+            return "Mozilla Firefox"
+        if cls == "OperaWindowClass":
+            return "Opera"
+    except Exception:
+        pass
+    return ""
 
 def _force_kill_pid_tree(pid):
     """强制结束指定进程及其子进程。"""
@@ -1478,7 +1527,7 @@ def _get_smart_fill_ext_preset_texts(target_kind="file", act_type="", sub=None):
         presets.extend([SMART_FILL_IMAGE_EXTS_TEXT, SMART_FILL_FILE_EXTS_TEXT])
     elif act_type == "run_app":
         presets.extend([SMART_FILL_FILE_EXTS_TEXT, SMART_FILL_IMAGE_EXTS_TEXT])
-    elif act_type == "clear_input_plus" and sub == "content":
+    elif act_type == "clear_input_plus" and _clear_input_plus_sub_info(sub)[0] == "user_content":
         presets.extend([SMART_FILL_TXT_ONLY_EXTS_TEXT, SMART_FILL_TEXT_EXTS_TEXT])
     elif target_kind == "text":
         presets.extend([SMART_FILL_TEXT_EXTS_TEXT, SMART_FILL_TXT_ONLY_EXTS_TEXT])
@@ -2343,6 +2392,69 @@ def get_chrome_profiles(force_refresh=False, skip_cookie_check=False):
     CHROME_PROFILES_CACHE["scan_dirs"] = scan_dirs_snapshot
     return profiles
 
+
+# --- 独立打开模式：与 Chrome 本地账号启动器“双击资料”一致的进程启动参数 ---
+def _double_click_style_chrome_candidates(user_data_dir=""):
+    """按 Chrome 本地账号启动器的渠道顺序返回 chrome.exe 候选路径。
+
+    该函数只决定新浏览器进程如何创建，不处理窗口句柄、位置或自动化；
+    后续窗口绑定与坐标标准化仍由自动化引擎的既有流程负责。
+    """
+    local_app_data = os.path.expandvars(r"%LOCALAPPDATA%")
+    program_files = os.path.expandvars(r"%ProgramFiles%") or r"C:\\Program Files"
+    program_files_x86 = os.path.expandvars(r"%ProgramFiles(x86)%") or r"C:\\Program Files (x86)"
+    normalized_root = os.path.normcase(os.path.normpath(str(user_data_dir or "")))
+
+    channel_folders = ["Chrome", "Chrome Beta", "Chrome Dev", "Chrome SxS"]
+    matched_channel = ""
+    for channel_folder in channel_folders:
+        channel_root = os.path.normcase(os.path.normpath(
+            os.path.join(local_app_data, "Google", channel_folder, "User Data")
+        ))
+        if normalized_root and normalized_root == channel_root:
+            matched_channel = channel_folder
+            break
+
+    # 与第二个软件相同：标准目录只使用所属 Chrome 渠道的安装候选项；
+    # 自定义 User Data 目录按 Stable Chrome 候选项解析，找不到则由 PATH 的 chrome.exe 兜底，
+    # 不跨渠道尝试其他 chrome.exe，以保持双击启动的行为一致。
+    ordered_channels = [matched_channel or "Chrome"]
+    candidates = []
+    for channel_folder in ordered_channels:
+        candidates.extend([
+            os.path.join(program_files, "Google", channel_folder, "Application", "chrome.exe"),
+            os.path.join(program_files_x86, "Google", channel_folder, "Application", "chrome.exe"),
+            os.path.join(local_app_data, "Google", channel_folder, "Application", "chrome.exe"),
+        ])
+    return candidates
+
+
+def _resolve_double_click_style_chrome_executable(user_data_dir=""):
+    """解析第二个软件双击本地 Profile 时应调用的 Chrome 可执行文件。"""
+    for candidate in _double_click_style_chrome_candidates(user_data_dir):
+        if os.path.isfile(candidate):
+            return candidate
+    # 保持第二个软件的最终兜底行为：交由 Windows PATH 解析 chrome.exe。
+    return "chrome.exe"
+
+
+def _build_double_click_style_profile_launch_command(user_data_dir, profile_directory, url="", chrome_executable=""):
+    """构造与第二个软件 open_profile() 等价的独立 Profile 启动命令。
+
+    保持最小参数集：浏览器、真实 User Data 根目录、真实 Profile 目录、
+    新窗口和可选网址。窗口标准化绝不放在这里，避免改变原引擎的后续流程。
+    """
+    args = [
+        str(chrome_executable or _resolve_double_click_style_chrome_executable(user_data_dir)),
+        f"--user-data-dir={user_data_dir}",
+        f"--profile-directory={profile_directory}",
+        "--new-window",
+    ]
+    if url and "AUTO_KEEP_URL" not in str(url):
+        args.append(str(url))
+    return args
+
+
 def force_activate_window(hwnd):
     """将指定顶层窗口置前，并严格验证它确实成为前台窗口。"""
     if sys.platform != "win32" or not hwnd:
@@ -3031,10 +3143,14 @@ def get_window_profile_descriptor(hwnd):
             WINDOW_PROFILE_INFO_CACHE[hwnd] = {}
             return {}
 
-        cmd_out = subprocess.check_output(
-            f'wmic process where processid={pid} get commandline',
-            shell=True
-        ).decode('gbk', errors='ignore')
+        # 优先复用真实进程信息；WMIC 仅作为兼容性降级，避免账户识别失败。
+        proc_info = _get_hwnd_process_info(hwnd)
+        cmd_out = str(proc_info.get("cmd", "") or "")
+        if not cmd_out:
+            cmd_out = subprocess.check_output(
+                f'wmic process where processid={pid} get commandline',
+                shell=True
+            ).decode('gbk', errors='ignore')
         cmd_lower = cmd_out.lower()
         if "chrome.exe" not in cmd_lower and "chrome_proxy.exe" not in cmd_lower:
             WINDOW_PROFILE_INFO_CACHE[hwnd] = {}
@@ -3755,6 +3871,69 @@ class ChromeProfileSelector(QDialog):
             return item.data(Qt.UserRole) if item else ""
         return None
 
+# --- 清空并输入增强版：前缀 + 可配置数量的用户输入段 ---
+def _clear_input_plus_count(input_count=None, fallback=1):
+    """安全解析增强版用户框数量，兼容旧配置中的空值、字符串和异常值。"""
+    try:
+        count = int(input_count or 0)
+    except (TypeError, ValueError):
+        count = 0
+    try:
+        fallback = int(fallback or 1)
+    except (TypeError, ValueError):
+        fallback = 1
+    return max(1, min(10, count if count > 0 else fallback))
+
+
+def _clear_input_plus_parts(value, input_count=None):
+    """解析增强版值，兼容旧格式“前缀|内容”，并返回前缀和用户输入列表。"""
+    raw = str(value or "")
+    parts = raw.split("|")
+    prefix = parts[0] if parts else ""
+    count = _clear_input_plus_count(input_count, fallback=max(1, len(parts) - 1))
+    users = parts[1:1 + count]
+    users += [""] * (count - len(users))
+    return prefix, users
+
+
+def _clear_input_plus_value(prefix, users):
+    """按稳定的数据格式保存增强版值。"""
+    return "|".join([str(prefix or "")] + [str(item or "") for item in list(users or [])])
+
+
+def _clear_input_plus_final_text(value, input_count=None, data=None, replace_vars=None, user_prefixes=None):
+    raw = replace_vars(value, data) if callable(replace_vars) else str(value or "")
+    total_prefix, users = _clear_input_plus_parts(raw, input_count)
+    prefixes = [str(item or "") for item in list(user_prefixes or [])]
+    prefixes += [""] * (len(users) - len(prefixes))
+    prefixes = prefixes[:len(users)]
+    final_text = total_prefix + "".join((prefix + user) if str(user).strip() else "" for prefix, user in zip(prefixes, users))
+    return total_prefix, users, final_text
+
+
+def _clear_input_plus_sub_info(sub):
+    """解析批量填充预览列的增强版子字段。"""
+    text = str(sub or "")
+    if text == "total_prefix":
+        return "total_prefix", None
+    if text.startswith("user_prefix:"):
+        try:
+            return "user_prefix", int(text.split(":", 1)[1])
+        except (TypeError, ValueError):
+            return "user_prefix", None
+    if text.startswith("user_content:"):
+        try:
+            return "user_content", int(text.split(":", 1)[1])
+        except (TypeError, ValueError):
+            return "user_content", None
+    # 兼容旧的批量填充中心列标记
+    if text == "prefix":
+        return "total_prefix", None
+    if text == "content":
+        return "user_content", 0
+    return None, None
+
+
 # --- Command Mapping ---
 CMD_MAP = {
     "📷 图像识别点击": "image_click",
@@ -3822,6 +4001,14 @@ class KeyRecorder(QLineEdit):
         super().setText(text)
         self.key_recorded.emit(text)
 
+    def event(self, event):
+        # Qt 默认会把 Tab/Shift+Tab 当作焦点切换，不一定下发到 keyPressEvent；
+        # 在录制控件自身拦截后，才能把 Tab 可靠地保存为快捷键主键。
+        if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Tab, Qt.Key_Backtab):
+            self.keyPressEvent(event)
+            return True
+        return super().event(event)
+
     def keyPressEvent(self, event):
         key = event.key()
         modifiers = event.modifiers()
@@ -3850,7 +4037,8 @@ class KeyRecorder(QLineEdit):
                    Qt.Key_F1: "f1", Qt.Key_F2: "f2", Qt.Key_F3: "f3", Qt.Key_F4: "f4", Qt.Key_F5: "f5",
                    Qt.Key_F6: "f6", Qt.Key_F7: "f7", Qt.Key_F8: "f8", Qt.Key_F9: "f9", Qt.Key_F10: "f10",
                    Qt.Key_F11: "f11", Qt.Key_F12: "f12", Qt.Key_Home: "home", Qt.Key_End: "end",
-                   Qt.Key_PageUp: "pageup", Qt.Key_PageDown: "pagedown", Qt.Key_Insert: "insert"}
+                   Qt.Key_PageUp: "pageup", Qt.Key_PageDown: "pagedown", Qt.Key_Insert: "insert",
+                   Qt.Key_Backtab: "tab"}
 
         main_key = key_map.get(key)
         if not main_key:
@@ -5487,9 +5675,13 @@ class DataEditorTable(QTableWidget):
                                     cb_mode_w.setCurrentIndex(_mode_idx)
                                     cb_mode_w.blockSignals(False)
                         elif lbl:
-                            # clear_input_plus: 第一段是前缀，第二段是内容
-                            w.setText(parts[1] if len(parts) > 1 else "")  # clear_input_plus 的内容
+                            # clear_input_plus：第一段是前缀，后续各段分别写入用户1、用户2……
                             lbl.setText(f" {parts[0]}")
+                            plus_edits = widget.findChildren(MultiLineTextEdit) if widget else []
+                            for edit_idx, edit in enumerate(plus_edits):
+                                edit.setText(parts[edit_idx + 1] if len(parts) > edit_idx + 1 else "")
+                            if not plus_edits:
+                                w.setText(parts[1] if len(parts) > 1 else "")
                         else:
                             w.setText(col_text)
                     elif isinstance(w, QComboBox):
@@ -6047,12 +6239,16 @@ def _migrate_config_schema(config):
     config.setdefault("folders", [])
     config.setdefault("layout", {})
     config.setdefault("tasks_layout", {})
+    # 批量数据表的列宽沿用 tasks_layout；行高单独按任务保存，兼容旧版全局行高。
+    config.setdefault("task_data_layouts", {})
     config.setdefault("schedule_bundles", {})
 
     tasks = config.get("tasks", {})
     task_data = config.get("task_data", {})
     task_meta = config.get("task_meta", {})
     tasks_layout = config.get("tasks_layout", {})
+    task_data_layouts = config.get("task_data_layouts", {})
+    task_data_layouts = task_data_layouts if isinstance(task_data_layouts, dict) else {}
     layout = config.get("layout", {})
 
     used_ids = set()
@@ -6060,6 +6256,7 @@ def _migrate_config_schema(config):
     new_task_data = {}
     new_task_meta = {}
     new_tasks_layout = {}
+    new_task_data_layouts = {}
     key_to_id = {}
 
     already_new_schema = bool(tasks) and all(
@@ -6075,6 +6272,8 @@ def _migrate_config_schema(config):
             new_task_data[task_id] = task_data.get(task_id, [])
             if task_id in tasks_layout:
                 new_tasks_layout[task_id] = tasks_layout.get(task_id, [])
+            if isinstance(task_data_layouts.get(task_id), dict):
+                new_task_data_layouts[task_id] = copy.deepcopy(task_data_layouts[task_id])
             key_to_id[task_id] = task_id
     else:
         for legacy_path, actions in tasks.items():
@@ -6085,6 +6284,8 @@ def _migrate_config_schema(config):
             new_task_data[task_id] = task_data.get(legacy_path, [])
             if legacy_path in tasks_layout:
                 new_tasks_layout[task_id] = tasks_layout.get(legacy_path, [])
+            if isinstance(task_data_layouts.get(legacy_path), dict):
+                new_task_data_layouts[task_id] = copy.deepcopy(task_data_layouts[legacy_path])
             key_to_id[legacy_path] = task_id
 
     for task_id in list(new_tasks.keys()):
@@ -6125,6 +6326,7 @@ def _migrate_config_schema(config):
     config["task_data"] = new_task_data
     config["task_meta"] = new_task_meta
     config["tasks_layout"] = new_tasks_layout
+    config["task_data_layouts"] = new_task_data_layouts
     config["folders"] = sorted(normalized_folders, key=lambda p: (p.count("/"), p.lower()))
     config["layout"] = layout
     config["layout"]["task_order"] = layout_order
@@ -6189,9 +6391,34 @@ def load_config():
                 CONFIG_LOAD_BACKUP_PATH = ""
             return _empty_config()
     return _empty_config()
+CONFIG_LAST_GOOD_PATH = CONFIG_PATH + ".last_known_good.json"
+
 def save_config(config):
+    """安全保存完整配置：保留名称/文件夹元数据，并避免半截 JSON 覆盖有效配置。"""
     config = _migrate_config_schema(config)
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f: json.dump(config, f, indent=4, ensure_ascii=False)
+    parent_dir = os.path.dirname(CONFIG_PATH) or "."
+    os.makedirs(parent_dir, exist_ok=True)
+    tmp_path = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        # 写入后再次解析，确保临时文件完整且包含任务元数据。
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            verified = json.load(f)
+        if not isinstance(verified, dict) or not isinstance(verified.get("task_meta"), dict):
+            raise ValueError("配置校验失败：缺少 task_meta")
+        if os.path.exists(CONFIG_PATH):
+            shutil.copy2(CONFIG_PATH, CONFIG_LAST_GOOD_PATH)
+        os.replace(tmp_path, CONFIG_PATH)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
 
 # --- Floating OSD Progress Window ---
 class FloatingProgressWindow(QWidget):
@@ -6215,7 +6442,8 @@ class FloatingProgressWindow(QWidget):
         # Windows 下如果“显示但不激活”，悬浮窗容易出现能看见但按钮不响应点击的问题。
         self.setAttribute(Qt.WA_ShowWithoutActivating, not sys.platform.startswith('win'))
 
-        self.resize(520, 210)  # 增大宽度以容纳更多按钮
+        # 紧凑播放器式控制条：保留必要文字和实时步骤信息，尽量不遮挡主界面。
+        self.resize(520, 76)
 
         # 默认位置：屏幕上方正中央
         self._move_to_top_center()
@@ -6234,13 +6462,16 @@ class FloatingProgressWindow(QWidget):
             QLabel { font-weight: 400; color: #222; color: #e0e0e0; font-family: 'Consolas', '微软雅黑'; font-size: 11px; }
         """)
         container_layout = QVBoxLayout(self.container)
-        container_layout.setContentsMargins(10, 8, 10, 8)
-        container_layout.setSpacing(5)
+        container_layout.setContentsMargins(6, 4, 6, 4)
+        container_layout.setSpacing(2)
 
         # --- 第一行：任务信息 ---
         self.lbl_info = QLabel("等待开始...")
         self.lbl_info.setStyleSheet("font-weight: bold; color: #82b1ff;")
         container_layout.addWidget(self.lbl_info)
+        self.lbl_time = QLabel("耗时 00:00:00  |  最近活动：刚刚")
+        self.lbl_time.setStyleSheet("color: #b0bec5; font-size: 10px; padding: 0;")
+        container_layout.addWidget(self.lbl_time)
 
         # --- 第二行：进度条 ---
         prog_row = QHBoxLayout()
@@ -6364,6 +6595,24 @@ class FloatingProgressWindow(QWidget):
         self.log_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         container_layout.addWidget(self.log_area)
 
+        # 播放器式紧凑模式：只保留一行状态信息和必要控制按钮。
+        for _widget in (self.bar, self.lbl_pct, self.lbl_detail,
+                        self.btn_copy_log, self.btn_pin, self.btn_collapse, self.log_area):
+            _widget.hide()
+        self.lbl_info.setMaximumHeight(20)
+        self.lbl_info.setStyleSheet("font-weight: bold; color: #dbeafe; font-size: 10px; padding: 0;")
+        self.lbl_time.setMaximumHeight(16)
+        for _button, _text, _width in (
+            (self.btn_pause, "⏸ 暂停", 66), (self.btn_skip_step, "⏭ 跳步", 66),
+            (self.btn_next_row, "⏩ 下一行", 78), (self.btn_retry, "🔁 重试", 66),
+            (self.btn_stop, "🛑 停止", 66), (self.btn_close, "✕", 32)
+        ):
+            _button.setText(_text)
+            _button.setFixedWidth(_width)
+            _button.setToolTip(_button.toolTip() + "（紧凑模式）")
+        self.setMinimumSize(0, 0)
+        self.setMaximumHeight(58)
+
         layout.addWidget(self.container)
 
         self._interactive_widgets = (
@@ -6383,10 +6632,47 @@ class FloatingProgressWindow(QWidget):
 
         self._dragging = False
         self._drag_pos = QPoint()
+        self._clock_started_at = None
+        self._last_activity_at = None
+        self._step_result_text = ""
+        self._clock_timer = QTimer(self)
+        self._clock_timer.setInterval(1000)
+        self._clock_timer.timeout.connect(self._refresh_time_status)
+
+    def set_pause_visual(self, paused):
+        """更新紧凑控制条的暂停按钮文字。"""
+        self.btn_pause.setText("▶ 继续" if paused else "⏸ 暂停")
+
+    def _refresh_time_status(self):
+        if self._clock_started_at is None:
+            return
+        elapsed = max(0, int(time.monotonic() - self._clock_started_at))
+        hours, rem = divmod(elapsed, 3600)
+        minutes, seconds = divmod(rem, 60)
+        if self._last_activity_at is None:
+            activity_text = "刚刚"
+        else:
+            idle = max(0, int(time.monotonic() - self._last_activity_at))
+            activity_text = "刚刚" if idle < 2 else f"{idle}秒前"
+        status_suffix = f"  |  {self._step_result_text}" if self._step_result_text else ""
+        self.lbl_time.setText(f"耗时 {hours:02d}:{minutes:02d}:{seconds:02d}  |  最近活动：{activity_text}{status_suffix}")
+
+    def _touch_activity(self):
+        self._last_activity_at = time.monotonic()
+        self._refresh_time_status()
 
     def set_execution_active(self, active):
-        """执行中锁定关闭按钮；仅终态允许用户隐藏该悬浮窗。"""
+        """执行中锁定关闭按钮；同时启动或停止悬浮窗计时。"""
         active = bool(active)
+        if active:
+            self._clock_started_at = time.monotonic()
+            self._last_activity_at = self._clock_started_at
+            self._step_result_text = ""
+            self._clock_timer.start()
+            self._refresh_time_status()
+        else:
+            self._clock_timer.stop()
+            self._touch_activity()
         self.btn_close.setEnabled(not active)
         self.btn_close.setToolTip(
             "任务正在执行，不能关闭悬浮窗" if active
@@ -6413,6 +6699,8 @@ class FloatingProgressWindow(QWidget):
             self._force_topmost(-1)
 
     def update_progress(self, task_name, loop, group, total_groups, step, total_steps, step_name, percent):
+        self._step_result_text = ""
+        self._touch_activity()
         info = f"<b>{task_name}</b> | 组 {group}/{total_groups} | 步 {step}/{total_steps}: <font color='#82b1ff'>{step_name}</font>"
         self.lbl_info.setText(info)
         self.bar.setValue(percent)
@@ -6434,18 +6722,17 @@ class FloatingProgressWindow(QWidget):
             pass
 
     def eventFilter(self, obj, event):
-        if obj in getattr(self, "_interactive_widgets", ()) and event.type() in (
-            QEvent.MouseButtonPress, QEvent.MouseButtonDblClick, QEvent.FocusIn
-        ):
-            self._ensure_interaction_ready()
+        # 不在鼠标按下时强制激活窗口，否则 Windows 可能把第一次点击仅当作激活窗口，
+        # 导致按钮表现为必须点击两次；焦点进入时再提升窗口即可。
+        # 不在 FocusIn/MousePress 时主动激活窗口，避免 Windows 把第一次点击当成激活操作。
         return super().eventFilter(obj, event)
 
     def mousePressEvent(self, event):
-        self._ensure_interaction_ready()
+        # 悬浮窗已经置顶，不在鼠标按下时调用 activateWindow，避免首次点击只完成窗口激活。
         child = self.childAt(event.pos())
         if isinstance(child, (QPushButton, QTextEdit)):
-            event.ignore()
-            return super().mousePressEvent(event)
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
             self._dragging = True
             self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
@@ -6463,7 +6750,13 @@ class FloatingProgressWindow(QWidget):
         super().mouseReleaseEvent(event)
 
     def update_detail(self, text):
-        """更新具体的动作详情或倒计时描述。"""
+        """更新具体的动作详情或延时倒计时描述。"""
+        detail_text = str(text or "")
+        if detail_text and ("剩余" in detail_text or "倒计时" in detail_text):
+            self._step_result_text = f"⏳ 延时倒计时：{detail_text}"
+        else:
+            self._step_result_text = detail_text
+        self._touch_activity()
         self.lbl_detail.setText(text)
 
     def add_log(self, msg, color="white"):
@@ -8170,44 +8463,50 @@ class AutoEngine(QThread):
                 row_delay = ""
             else:
                 val_raw = data.get(name, None)
-                if val_raw is not None:
-                    if val_raw == "[SKIP_ROW]" or val_raw == "":
-                        self.log_sig.emit(f"⏭️ [步骤 {name}] 数据表内容为空或触发词，正在结束当前行...", "orange")
-                        row_ok = True
-                        row_state = "skipped"
-                        break
-
-                val = str(val_raw) if val_raw is not None else ""
                 delay_key = f"{name}_延时"
                 row_delay = data.get(delay_key, "")
-                if val_raw is None:
-                    val = str(act.get('value', ''))
 
-                # 单按键/组合键只读取流程编排中的预设值，直接执行；
-                # 不再由批量数据中同名列覆盖。例如填写 ctrl+v 就发送 Ctrl+V。
+                # 单按键/组合键只使用流程编排中的固定值。
+                # 批量数据表通常会为该步骤生成一个空列，不能先按空列结束当前行。
                 if act_type in ["press", "hotkey"]:
                     val = str(act.get('value', '')).strip()
-
-                for k, v in row_vars.items():
-                    val = val.replace(f"{{{{{k}}}}}", v)
-                if not self.ignore_data:
-                    for k, v in data.items():
-                        val = val.replace(f"{{{{{k}}}}}", str(v))
-
-                if not self.ignore_data:
-                    val_parts = [p.strip() for p in str(val).split('|')] if '|' in str(val) else [str(val).strip()]
-                    if "[SKIP_ROW]" in val_parts:
-                        self.log_sig.emit(f"⏭️ [步骤 {name}] 变量解析为跳过触发词，正在结束当前行...", "orange")
-                        row_ok = True
-                        row_state = "skipped"
+                    if not val:
+                        self.log_sig.emit(
+                            f"❌ [步骤 {name}] 单按键/组合键未配置按键内容，无法执行",
+                            "red"
+                        )
+                        row_ok = False
+                        row_state = "failed"
                         break
-
-                    if act_type in ["input", "clear_input", "clear_input_plus", "upload", "drag_file", "open_url", "cmd"]:
-                        if not val.strip():
-                            self.log_sig.emit(f"⏭️ [步骤 {name}] 输入内容解析为空，正在结束当前行...", "orange")
+                else:
+                    if val_raw is not None:
+                        if val_raw == "[SKIP_ROW]" or val_raw == "":
+                            self.log_sig.emit(f"⏭️ [步骤 {name}] 数据表内容为空或触发词，正在结束当前行...", "orange")
                             row_ok = True
                             row_state = "skipped"
                             break
+                    val = str(val_raw) if val_raw is not None else ""
+                    if val_raw is None:
+                        val = str(act.get('value', ''))
+
+                    for k, v in row_vars.items():
+                        val = val.replace(f"{{{{{k}}}}}", v)
+                    if not self.ignore_data:
+                        for k, v in data.items():
+                            val = val.replace(f"{{{{{k}}}}}", str(v))
+                    if not self.ignore_data:
+                        val_parts = [p.strip() for p in str(val).split('|')] if '|' in str(val) else [str(val).strip()]
+                        if "[SKIP_ROW]" in val_parts:
+                            self.log_sig.emit(f"⏭️ [步骤 {name}] 变量解析为跳过触发词，正在结束当前行...", "orange")
+                            row_ok = True
+                            row_state = "skipped"
+                            break
+                        if act_type in ["input", "clear_input", "clear_input_plus", "upload", "drag_file", "open_url", "cmd"]:
+                            if not val.strip():
+                                self.log_sig.emit(f"⏭️ [步骤 {name}] 输入内容解析为空，正在结束当前行...", "orange")
+                                row_ok = True
+                                row_state = "skipped"
+                                break
 
             self.highlight_sig.emit(t_idx, s_idx)
 
@@ -8216,7 +8515,10 @@ class AutoEngine(QThread):
                 self.log_sig.emit(f"{msg}  值=「{val}」  坐标=({act.get('x',0)},{act.get('y',0)})", "purple")
                 self.detail_sig.emit(msg)
             else:
+                repeat_count = max(1, int(act.get("repeat", 1) or 1))
                 msg = f"👉 执行: {name} ({act.get('action')})"
+                if repeat_count > 1:
+                    msg += f" × {repeat_count}"
                 self.log_sig.emit(msg, "black")
                 self.detail_sig.emit(msg)
 
@@ -8232,7 +8534,16 @@ class AutoEngine(QThread):
                 try:
                     # 分批模式已在本行首步骤（打开网址）完成时切到正确 hwnd。
                     # 同一行的后续步骤不再重复激活窗口，避免每一步都引入前台切换等待。
-                    result = self._execute_step(act, val, act_type, data)
+                    repeat_count = max(1, int(act.get("repeat", 1) or 1))
+                    result = None
+                    for repeat_index in range(repeat_count):
+                        if self._stop:
+                            raise ExecutionInterrupted()
+                        result = self._execute_step(act, val, act_type, data)
+                        if repeat_count > 1:
+                            self.log_sig.emit(f"🔁 [{name}] 第 {repeat_index + 1}/{repeat_count} 次执行完成", "gray")
+                        if result and result[0] in ("jump_if", "defer"):
+                            break
                     self._set_row_runtime_ctx(
                         l_idx, t_idx, s_idx,
                         name, act_type, act.get("action", ""), val
@@ -8283,11 +8594,14 @@ class AutoEngine(QThread):
                                 "关闭对应账号窗口模式未选择账号",
                                 "未能关闭账号",
                                 "账号窗口 #",
+                                "不是真实 Chrome Profile 路径",
+                                "真实 Chrome Profile 路径",
+                                "账号标识 [",
                             ))
                         )
                         if is_profile_window_error:
                             self.log_sig.emit(
-                                f"⏭️ [账号窗口不可用] 第 {t_idx + 1} 行已标记失败，跳过本行剩余步骤并继续下一行。",
+                                f"⏭️ [账号/Profile 无效] 第 {t_idx + 1} 行已标记失败，跳过当前账号，继续执行下一账号。",
                                 "orange"
                             )
                             row_ok = False
@@ -8646,21 +8960,25 @@ class AutoEngine(QThread):
             pyautogui.hotkey('ctrl', 'a'); pyautogui.press('backspace'); self._interruptible_sleep(0.2)
             pyperclip.copy(final_val); self._interruptible_sleep(0.2)
             pyautogui.hotkey('ctrl', 'v')
+            if act.get('press_enter_after', False):
+                self._interruptible_sleep(0.2)
+                pyautogui.press('enter')
         elif act_type == "clear_input_plus":
-            # 增强版：支持 val 格式为 "前缀|内容"
-            raw_val = self._replace_vars(val, data)
-            prefix = ""
-            content = raw_val
-            if "|" in raw_val:
-                prefix, content = raw_val.split("|", 1)
-            
-            final_val = f"{prefix}{content}"
-            self.log_sig.emit(f"✨ 增强输入(前缀:{prefix}): {content[:20]}...", "gray")
+            # 增强版：前缀 + 用户1 + 用户2 + ……；旧配置“前缀|内容”仍可直接运行。
+            prefix, user_values, final_val = _clear_input_plus_final_text(
+                val, act.get('input_count'), data=data, replace_vars=self._replace_vars,
+                user_prefixes=act.get('input_prefixes', [])
+            )
+            user_summary = " + ".join(user_values)
+            self.log_sig.emit(f"✨ 增强输入(前缀:{prefix}): {user_summary[:40]}{'...' if len(user_summary)>40 else ''}", "gray")
             
             pyautogui.click(act.get('x',0), act.get('y',0)); self._interruptible_sleep(0.2)
             pyautogui.hotkey('ctrl', 'a'); pyautogui.press('backspace'); self._interruptible_sleep(0.2)
             pyperclip.copy(final_val); self._interruptible_sleep(0.2)
             pyautogui.hotkey('ctrl', 'v')
+            if act.get('press_enter_after', False):
+                self._interruptible_sleep(0.2)
+                pyautogui.press('enter')
         elif act_type == "upload":
             if not val: self.log_sig.emit("⚠️ 上传文件路径为空，跳过该步骤", "orange"); return None
             abs_path = os.path.normpath(os.path.abspath(val))
@@ -8822,6 +9140,16 @@ class AutoEngine(QThread):
                 self.log_sig.emit(f"❌ CMD 执行失败: {str(e)}", "red")
         elif act_type == "win_active":
             raw_val = self._replace_vars(val, data)
+            # 兼容“原步骤是坐标动作、后来改成激活窗口”的旧数据：同名数据列
+            # 可能仍残留 x,y 坐标。窗口步骤应回退到流程默认窗口，而不是查找该坐标字符串。
+            if re.fullmatch(r"-?\d+\s*,\s*-?\d+", str(raw_val or "").strip()):
+                default_window = str(act.get("value", "") or "").strip()
+                if default_window and not re.fullmatch(r"-?\d+\s*,\s*-?\d+", default_window):
+                    self.log_sig.emit(
+                        f"⚠️ 激活窗口数据列检测到旧坐标 [{raw_val}]，已使用流程默认窗口 [{default_window}]",
+                        "orange"
+                    )
+                    raw_val = self._replace_vars(default_window, data)
             _profile_path_for_win = None
             display_name = raw_val  # 默认显示名
 
@@ -9360,13 +9688,9 @@ class AutoEngine(QThread):
                         f"账号 Profile 未验证：{profile_preferences}\n"
                         "为保护现有登录状态，系统拒绝以未知目录启动 Chrome；请重新选择已登录账号的实际 Profile 文件夹。"
                     )
-                # 2. 寻找浏览器路径
-                chrome_path = None
-                for p in [r"C:\Program Files\Google\Chrome\Application\chrome.exe", 
-                          r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                          os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")]:
-                    if os.path.exists(p): chrome_path = p; break
-                
+                # 2. 解析 Chrome 可执行文件：与第二个软件双击本地 Profile 的渠道候选顺序一致。
+                # 返回值始终存在（最终回退 chrome.exe），因此后续原有的窗口校正与绑定流程保持不变。
+                chrome_path = _resolve_double_click_style_chrome_executable(u_dir)
                 if chrome_path:
                     # [调整] 为了支持多账号并行多开，我们不再强制清理进程
                     # 而是通过确保 --user-data-dir 和 --profile-directory 的组合唯一性来实现多开
@@ -9426,24 +9750,18 @@ class AutoEngine(QThread):
                     # 不经 shell 中转，避免拿到 cmd.exe PID 而只能再按 Profile 名称猜窗口。
                     if not is_batch_first_open:
                         _mark_chrome_profile_clean_exit(u_dir, p_dir)
-                    # 普通 Windows Chrome 启动：仅保留账号、窗口和首次启动相关参数。
-                    # 不传入 --no-sandbox / --disable-setuid-sandbox 等 Linux/调试标记，
-                    # 避免 Chrome 显示“不受支持的命令行标记”黑色提示条。
-                    cmd_args = [
-                        chrome_path,
-                        f"--user-data-dir={u_dir}",
-                        f"--profile-directory={p_dir}",
-                        "--new-window",
-                        "--start-maximized",
-                        "--no-first-run",
-                        "--no-default-browser-check",
-                    ]
-                    if "AUTO_KEEP_URL" not in url:
-                        cmd_args.append(url)
-
+                    # 采用第二个软件双击 Profile 时的最小启动参数：
+                    # chrome.exe + 真实 User Data + 真实 Profile + 新窗口 + 可选网址。
+                    # 注意：窗口位置重置、最大化、句柄绑定和坐标标准化仍在此命令之后按原流程执行。
+                    cmd_args = _build_double_click_style_profile_launch_command(
+                        u_dir, p_dir, url, chrome_executable=chrome_path
+                    )
                     full_cmd = subprocess.list2cmdline(cmd_args)
-                    self.log_sig.emit(f"🚀 执行启动命令: {full_cmd}", "gray")
-                    launch_process = subprocess.Popen(cmd_args, shell=False)
+                    self.log_sig.emit(f"🚀 [独立模式/双击同款] 执行启动命令: {full_cmd}", "gray")
+                    launch_process = subprocess.Popen(
+                        cmd_args,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
                     launch_pid = int(launch_process.pid or 0)
                     self.log_sig.emit(f"🔗 已取得本次浏览器启动 PID: {launch_pid}", "gray")
                     if record_new_handle and self._batch_preopen_phase:
@@ -10785,7 +11103,7 @@ class AutoManager(QMainWindow):
         act_ly.addLayout(act_ctrl)
         
         # [新增] 步骤启用开关：在“流程编排”表格最左侧增加复选框列，用于临时禁用某些步骤
-        self.action_table = DragSortActionTable(0, 6); self.action_table.setObjectName("ActionTable"); self.action_table.setHorizontalHeaderLabels(["启用", "步骤说明", "指令类型", "坐标/窗口", "默认参数/变量", "延时"])
+        self.action_table = DragSortActionTable(0, 7); self.action_table.setObjectName("ActionTable"); self.action_table.setHorizontalHeaderLabels(["启用", "步骤说明", "指令类型", "坐标/窗口", "默认参数/变量", "延时", "执行次数"])
         self.action_table.setHorizontalHeader(ManualWidthHeader(Qt.Horizontal, self.action_table))
         self.action_table.setAlternatingRowColors(True)
         self.action_table.setShowGrid(False)
@@ -10806,6 +11124,7 @@ class AutoManager(QMainWindow):
         self.action_table.setColumnWidth(0, 54)
         self.action_table.setColumnWidth(2, 132)
         self.action_table.setColumnWidth(5, 92)
+        self.action_table.setColumnWidth(6, 92)
         self.action_table.horizontalHeader().sectionResized.connect(self._on_action_column_resized)
         self.action_table.verticalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.action_table.verticalHeader().customContextMenuRequested.connect(self._show_action_header_menu)
@@ -11023,16 +11342,38 @@ class AutoManager(QMainWindow):
         sched_ly.addWidget(self.lbl_sched_selection_count)
         bind_table_selection_label(self.sched_table, self.lbl_sched_selection_count)
 
-        console_panel = QWidget(); console_layout = QVBoxLayout(console_panel); console_layout.setContentsMargins(10, 5, 10, 10)
+        console_panel = QWidget()
+        console_panel.setMinimumHeight(42)
+        console_outer_layout = QVBoxLayout(console_panel)
+        console_outer_layout.setContentsMargins(0, 0, 0, 0)
+        console_outer_layout.setSpacing(0)
+        console_header = QWidget()
+        console_header_layout = QHBoxLayout(console_header)
+        console_header_layout.setContentsMargins(10, 5, 10, 2)
+        console_header_layout.setSpacing(6)
+        console_title = QLabel("🎮 3. 运行控制台", objectName="TitleLabel")
+        console_header_layout.addWidget(console_title)
+        console_header_layout.addStretch()
+        self.btn_toggle_console = QPushButton("🔽 折叠")
+        self.btn_toggle_console.setFixedHeight(28)
+        self.btn_toggle_console.setToolTip("折叠/展开运行控制台，减少对操作区域的遮挡")
+        self.btn_toggle_console.clicked.connect(self._toggle_console_collapsed)
+        console_header_layout.addWidget(self.btn_toggle_console)
+        console_outer_layout.addWidget(console_header)
+        self._console_body = QWidget()
+        console_layout = QVBoxLayout(self._console_body)
+        console_layout.setContentsMargins(10, 0, 10, 10)
+        console_outer_layout.addWidget(self._console_body, 1)
         self.right_splitter.addWidget(console_panel)
         self.right_splitter.setStretchFactor(0, 3) # 默认编辑区占大头
         self.right_splitter.setStretchFactor(1, 1)
+        self._console_collapsed = bool(layout_cfg.get("console_collapsed", False))
+        self._console_expanded_sizes = None
         
         # 恢复上下分栏高度
         if layout_cfg.get("v_splitter_sizes"):
             self.right_splitter.setSizes(layout_cfg["v_splitter_sizes"])
 
-        console_layout.addWidget(QLabel("🎮 3. 运行控制台", objectName="TitleLabel"))
         h_ctrl = QHBoxLayout()
         label_interval = QLabel("轮次间隔:")
         label_interval.setToolTip("执行完表格的一行数据后，等待多久再开始下一行")
@@ -11149,6 +11490,8 @@ class AutoManager(QMainWindow):
         self._deferred_panel_timer.setInterval(1000)
         self._deferred_panel_timer.timeout.connect(self._refresh_deferred_queue_panel)
         self.progress = QProgressBar(); console_layout.addWidget(self.progress); self.log_area = QTextEdit(); self.log_area.setReadOnly(True); self.log_area.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: 'Consolas', '微软雅黑'; font-size: 12px;"); self.log_area.setMinimumHeight(90); console_layout.addWidget(self.log_area, 1)
+        if self._console_collapsed:
+            QTimer.singleShot(0, self._apply_console_collapsed_state)
         # content_ly.addWidget(console_panel) # 已经加入到 right_splitter 中了
         self._refresh_actions()
         self._refresh_data_table()
@@ -11208,16 +11551,46 @@ class AutoManager(QMainWindow):
         if s < 3600: return f"{s//60}分{s%60}秒"
         return f"{s//3600}时{(s%3600)//60}分{s%60}秒"
 
+    def _apply_console_collapsed_state(self):
+        if not hasattr(self, "right_splitter") or not hasattr(self, "_console_body"):
+            return
+        if self._console_collapsed:
+            if self._console_expanded_sizes is None:
+                self._console_expanded_sizes = self.right_splitter.sizes()
+            self._console_body.hide()
+            self.btn_toggle_console.setText("🔼 展开")
+            self.btn_toggle_console.setToolTip("展开运行控制台")
+            self.right_splitter.setSizes([max(1, self.right_splitter.size().height() - 42), 42])
+        else:
+            self._console_body.show()
+            self.btn_toggle_console.setText("🔽 折叠")
+            self.btn_toggle_console.setToolTip("折叠/展开运行控制台，减少对操作区域的遮挡")
+            sizes = self._console_expanded_sizes
+            if not sizes or len(sizes) != 2 or not any(int(v) > 42 for v in sizes):
+                total = max(200, self.right_splitter.size().height())
+                sizes = [int(total * 0.75), int(total * 0.25)]
+            self.right_splitter.setSizes(sizes)
+
+    def _toggle_console_collapsed(self):
+        self._console_collapsed = not self._console_collapsed
+        if not self._console_collapsed:
+            # 展开前保存折叠前的有效比例，防止反复点击后布局跳变。
+            self._console_expanded_sizes = self._console_expanded_sizes or self.right_splitter.sizes()
+        self._apply_console_collapsed_state()
+        self.config.setdefault("layout", {})["console_collapsed"] = self._console_collapsed
+        self._schedule_config_flush(300)
+
     def _on_task_changed(self, name):
         if not name or self._is_initializing: return
         # 检查是否真的发生了任务切换，避免重复点击导致的卡顿
         if hasattr(self, 'current_task') and self.current_task == name:
             return
 
-        # [优化] 使用定时器延迟保存宽度，避免点击时同步 IO 导致卡顿
+        # 任务切换前立即将当前可见表格的列宽写入“原任务”的内存配置。
+        # 旧实现通过延迟回调保存，会在用户快速切换时把原任务的尺寸误写给新任务。
         if hasattr(self, 'current_task') and self.current_task:
-            QTimer.singleShot(500, self._save_column_widths)
-            
+            self._save_column_widths(task_id=self.current_task)
+
         self.current_task = name
         
         # [优化] 任务切换时不再立即写入磁盘，改为内存记忆，程序关闭时统一保存
@@ -11237,19 +11610,24 @@ class AutoManager(QMainWindow):
         # 不再做任何自动列宽适应，只恢复用户自己调过的宽度
         QTimer.singleShot(100, self._restore_action_column_widths)
         QTimer.singleShot(180, self._restore_column_widths)
-        QTimer.singleShot(240, lambda: self._set_data_row_height(self.config.get("layout", {}).get("data_row_height", 28), save=False))
+        QTimer.singleShot(240, lambda task_id=name: self._restore_data_row_height(task_id))
 
-    def _save_column_widths(self):
-        """保存当前任务的列宽到配置中。"""
-        # [修复] 增加对 data_table 的防御性检查
-        if not self.current_task or not hasattr(self, 'data_table'): return
+    def _save_column_widths(self, task_id=None):
+        """保存指定任务（默认当前任务）的批量数据表列宽到配置中。"""
+        task_id = str(task_id or self.current_task or "")
+        # 列宽只能从当前可见表格读取；防止后台任务或过期回调发生串写。
+        if not task_id or not hasattr(self, 'data_table'):
+            return
+        visible_task = str(getattr(self, "_visible_data_editor_task", "") or "")
+        if visible_task and visible_task != task_id:
+            return
         widths = []
         for i in range(self.data_table.columnCount()):
             widths.append(self.data_table.columnWidth(i))
         
         if "tasks_layout" not in self.config:
             self.config["tasks_layout"] = {}
-        self.config["tasks_layout"][self.current_task] = widths
+        self.config["tasks_layout"][task_id] = widths
         self._schedule_config_flush(400)
 
     def _restore_column_widths(self):
@@ -11302,12 +11680,14 @@ class AutoManager(QMainWindow):
     def _restore_action_column_widths(self):
         if not hasattr(self, "action_table"):
             return
-        widths = self.config.get("layout", {}).get("action_col_widths", [54, 190, 132, 150, 340, 92])
+        widths = self.config.get("layout", {}).get("action_col_widths", [54, 190, 132, 150, 340, 92, 92])
         hdr = self.action_table.horizontalHeader()
-        # 兼容旧版本（5 列）布局：自动插入“启用”列宽度
+        # 兼容旧版本布局：先补“启用”列，再补新增的“执行次数”列。
         try:
-            if isinstance(widths, list) and len(widths) == 5 and hdr.count() == 6:
+            if isinstance(widths, list) and len(widths) == 5 and hdr.count() >= 6:
                 widths = [54, *widths]
+            if isinstance(widths, list) and len(widths) == 6 and hdr.count() >= 7:
+                widths = [*widths, 92]
         except Exception:
             pass
         self._syncing_action_column_width = True
@@ -11320,7 +11700,7 @@ class AutoManager(QMainWindow):
                     width = min(max(120, width), 170)
                 elif i == 4:
                     width = min(max(240, width), 640)
-                elif i == 5:
+                elif i in (5, 6):
                     width = min(max(88, width), 108)
                 else:
                     width = min(max(96, width), 520)
@@ -11579,7 +11959,11 @@ class AutoManager(QMainWindow):
                     task_id = role
                     if not task_id or task_id not in self.config.get("tasks", {}):
                         continue
-                    raw_name = child.data(0, Qt.UserRole + 2) or self._get_task_name_only(task_id)
+                    raw_name = str(child.data(0, Qt.UserRole + 2) or "").strip()
+                    current_name = self._get_task_name_only(task_id)
+                    # 树节点的辅助数据可能来自旧版或异常刷新；绝不能把内部 task_* ID 写成显示名称。
+                    if not raw_name or raw_name == task_id or raw_name.startswith("task_"):
+                        raw_name = current_name
                     old_folder = self._get_task_folder(task_id)
                     if old_folder != parent_path:
                         moved_count += 1
@@ -11884,6 +12268,7 @@ class AutoManager(QMainWindow):
                 "actions": actions,
                 "task_data": copy.deepcopy(self.config.get("task_data", {}).get(task_id, [])),
                 "tasks_layout": copy.deepcopy(self.config.get("tasks_layout", {}).get(task_id, [])),
+                "task_data_layout": copy.deepcopy(self.config.get("task_data_layouts", {}).get(task_id, {})),
                 "coordinate_step_names": coord_step_names,
             })
         return {
@@ -12371,6 +12756,8 @@ class AutoManager(QMainWindow):
                 self.config.get('task_meta', {}).pop(task_id, None)
                 if 'tasks_layout' in self.config:
                     self.config['tasks_layout'].pop(task_id, None)
+                if 'task_data_layouts' in self.config:
+                    self.config['task_data_layouts'].pop(task_id, None)
                 if hasattr(self, '_row_statuses'):
                     self._row_statuses.pop(task_id, None)
             self.config['folders'] = [f for f in self.config.get('folders', []) if f not in affected_folders]
@@ -12433,6 +12820,7 @@ class AutoManager(QMainWindow):
                 self.config['task_data'].pop(name, None)
                 self.config.get('task_meta', {}).pop(name, None)
                 if 'tasks_layout' in self.config: self.config['tasks_layout'].pop(name, None)
+                if 'task_data_layouts' in self.config: self.config['task_data_layouts'].pop(name, None)
                 self._row_statuses.pop(name, None)
             
             save_config(self.config)
@@ -12482,6 +12870,8 @@ class AutoManager(QMainWindow):
             # 同时复制任务元数据（如 layout 等）
             if 'tasks_layout' in self.config and old_name in self.config['tasks_layout']:
                 self.config['tasks_layout'][new_task_id] = copy.deepcopy(self.config['tasks_layout'][old_name])
+            if 'task_data_layouts' in self.config and old_name in self.config['task_data_layouts']:
+                self.config['task_data_layouts'][new_task_id] = copy.deepcopy(self.config['task_data_layouts'][old_name])
             if 'task_meta' in self.config and old_name in self.config['task_meta']:
                 meta = copy.deepcopy(self.config['task_meta'][old_name])
                 meta['name'] = unique_name
@@ -12785,6 +13175,8 @@ class AutoManager(QMainWindow):
                 task_data = copy.deepcopy(task_data if isinstance(task_data, list) else [])
                 task_layout = item.get("tasks_layout", [])
                 task_layout = copy.deepcopy(task_layout if isinstance(task_layout, list) else [])
+                task_data_layout = item.get("task_data_layout", {})
+                task_data_layout = copy.deepcopy(task_data_layout if isinstance(task_data_layout, dict) else {})
                 coord_step_names = item.get("coordinate_step_names", [])
                 if not isinstance(coord_step_names, list):
                     coord_step_names = []
@@ -12803,6 +13195,8 @@ class AutoManager(QMainWindow):
                 self.config['tasks'][task_id] = cleaned_actions
                 self.config['task_data'][task_id] = task_data
                 self.config.setdefault('tasks_layout', {})[task_id] = task_layout
+                if task_data_layout:
+                    self.config.setdefault('task_data_layouts', {})[task_id] = task_data_layout
                 self._set_task_location(task_id, folder=folder, name=unique_name)
 
                 raw_meta = item.get("meta", {})
@@ -12943,6 +13337,9 @@ class AutoManager(QMainWindow):
             if isinstance(_a, dict) and "enabled" not in _a:
                 _a["enabled"] = True
                 _need_save = True
+            if isinstance(_a, dict) and "repeat" not in _a:
+                _a["repeat"] = 1
+                _need_save = True
         if _need_save:
             save_config(self.config)
 
@@ -12978,6 +13375,14 @@ class AutoManager(QMainWindow):
             _apply_delay_style(ds, ds.value())
             ds.valueChanged.connect(lambda v, idx=i, s=ds: [self._update_config(idx, 'delay', v), _apply_delay_style(s, v)])
             self.action_table.setCellWidget(i, 5, ds)
+
+            repeat_spin = QSpinBox()
+            repeat_spin.setRange(1, 99999)
+            repeat_spin.setValue(max(1, int(a.get("repeat", 1) or 1)))
+            repeat_spin.setSuffix(" 次")
+            repeat_spin.setToolTip("该步骤连续执行的次数，默认 1 次")
+            repeat_spin.valueChanged.connect(lambda v, idx=i: self._update_config(idx, "repeat", v))
+            self.action_table.setCellWidget(i, 6, repeat_spin)
 
             act_name = a.get('action')
             if act_name == "激活窗口":
@@ -13109,30 +13514,77 @@ class AutoManager(QMainWindow):
                 btn_pre.clicked.connect(lambda chk, idx=i, target=le: self._show_cmd_presets(idx, target))
                 l.addWidget(le); l.addWidget(btn_pre); self.action_table.setCellWidget(i, 4, w)
             elif a.get('action') == "滚轮滚动": le = QLineEdit(str(a.get('value', ''))); le.setPlaceholderText("正数向上，负数向下 (如 -500)"); le.editingFinished.connect(lambda idx=i, edit=le: self._update_config(idx, 'value', edit.text())); self.action_table.setCellWidget(i, 4, le)
-            elif a.get('action') in ["输入文本", "清空输入"]:
+            elif a.get('action') in ["输入文本", "清空输入", "清空并输入"]:
+                w = QWidget(); l = QVBoxLayout(w); l.setContentsMargins(0, 0, 0, 0); l.setSpacing(3)
                 ed = MultiLineTextEdit()
                 ed.setText(str(a.get('value', '')))
                 ed.setPlaceholderText("输入多行内容...")
                 ed.setToolTip(var_tooltip)
                 ed.setMinimumHeight(76)
                 ed.editingFinished.connect(lambda idx=i, edit=ed: self._update_config(idx, 'value', edit.text()))
-                self.action_table.setCellWidget(i, 4, ed)
-                self.action_table.setRowHeight(i, max(self.action_table.rowHeight(i), 82))
-            elif a.get('action') == "✨ 清空并输入(增强版)":
-                w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0); l.setSpacing(2)
-                val_parts = str(a.get('value', '')).split('|')
-                prefix_val = val_parts[0] if val_parts else ""
-                content_val = val_parts[1] if len(val_parts) > 1 else ""
-                le_prefix = QLineEdit(prefix_val); le_prefix.setPlaceholderText("预置前缀..."); le_prefix.setFixedWidth(80)
-                le_content = MultiLineTextEdit(); le_content.setText(content_val); le_content.setPlaceholderText("输入多行内容..."); le_content.setToolTip(var_tooltip); le_content.setMinimumHeight(76)
-                btn_prefix = QPushButton("📚"); btn_prefix.setFixedWidth(30); btn_prefix.setToolTip("打开常用前缀库")
-                def _save_plus(idx=i, lp=le_prefix, lc=le_content):
-                    self._update_config(idx, 'value', f"{lp.text()}|{lc.text()}")
-                le_prefix.editingFinished.connect(_save_plus); le_content.editingFinished.connect(_save_plus)
-                btn_prefix.clicked.connect(lambda chk, idx=i, target=le_prefix, saver=_save_plus: self._show_clear_input_prefix_presets(idx, target, saver))
-                l.addWidget(le_prefix); l.addWidget(btn_prefix); l.addWidget(QLabel("+")); l.addWidget(le_content)
+                l.addWidget(ed)
+                if a.get('action') in ("清空输入", "清空并输入"):
+                    chk_enter = QCheckBox("输入完成后执行回车")
+                    chk_enter.setChecked(bool(a.get('press_enter_after', False)))
+                    chk_enter.setToolTip("默认关闭；开启后，清空并输入完成后会自动按一次 Enter")
+                    chk_enter.stateChanged.connect(lambda state, idx=i: self._update_config(idx, 'press_enter_after', state == Qt.Checked))
+                    l.addWidget(chk_enter)
                 self.action_table.setCellWidget(i, 4, w)
-                self.action_table.setRowHeight(i, max(self.action_table.rowHeight(i), 82))
+                self.action_table.setRowHeight(i, max(self.action_table.rowHeight(i), 108 if a.get('action') in ("清空输入", "清空并输入") else 82))
+            elif a.get('action') == "✨ 清空并输入(增强版)":
+                # 总前缀保存在 value 的第一段；每个用户框的独立前缀保存在 input_prefixes。
+                total_prefix, user_values = _clear_input_plus_parts(a.get('value', ''), a.get('input_count'))
+                input_count = len(user_values)
+                saved_prefixes = list(a.get('input_prefixes', []) or [])
+                saved_prefixes += [""] * (input_count - len(saved_prefixes))
+                saved_prefixes = saved_prefixes[:input_count]
+                w = QWidget(); outer = QVBoxLayout(w); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(2)
+                control_row = QHBoxLayout(); control_row.setContentsMargins(0, 0, 0, 0)
+                control_row.addWidget(QLabel("用户框数量："))
+                count_box = QSpinBox(); count_box.setRange(1, 10); count_box.setValue(input_count); count_box.setFixedWidth(58)
+                count_box.setToolTip("设置用户输入框数量，执行顺序为总前缀 + 前缀1用户1 + 前缀2用户2……")
+                control_row.addWidget(count_box)
+                chk_enter = QCheckBox("输入完成后执行回车")
+                chk_enter.setChecked(bool(a.get('press_enter_after', False)))
+                chk_enter.setToolTip("默认关闭；开启后，增强版清空并输入完成后会自动按一次 Enter")
+                chk_enter.stateChanged.connect(lambda state, idx=i: self._update_config(idx, 'press_enter_after', state == Qt.Checked))
+                control_row.addWidget(chk_enter); control_row.addStretch(); outer.addLayout(control_row)
+                total_row = QHBoxLayout(); total_row.setContentsMargins(0, 0, 0, 0)
+                le_total = QLineEdit(total_prefix); le_total.setObjectName("plus_total_prefix"); le_total.setPlaceholderText("总前缀..."); le_total.setFixedWidth(88)
+                btn_prefix = QPushButton("前缀库"); btn_prefix.setFixedWidth(58); btn_prefix.setMinimumHeight(28); btn_prefix.setToolTip("选择总前缀")
+                total_row.addWidget(le_total); total_row.addWidget(btn_prefix); outer.addLayout(total_row)
+                # 每组独占一行，避免动作表列宽不足时横向叠加。
+                pair_column = QVBoxLayout(); pair_column.setContentsMargins(0, 0, 0, 0); pair_column.setSpacing(4)
+                prefix_edits, user_edits, pair_prefix_buttons = [], [], []
+                for user_idx, user_val in enumerate(user_values):
+                    pair = QWidget(); pair_layout = QHBoxLayout(pair); pair_layout.setContentsMargins(0, 0, 0, 0); pair_layout.setSpacing(4)
+                    group_label = QLabel(f"用户{user_idx + 1}"); group_label.setFixedWidth(48); group_label.setStyleSheet("color: #555; font-weight: bold;")
+                    le_pair_prefix = QLineEdit(saved_prefixes[user_idx]); le_pair_prefix.setObjectName("plus_user_prefix"); le_pair_prefix.setPlaceholderText(f"前缀{user_idx + 1}..."); le_pair_prefix.setMinimumWidth(90)
+                    btn_pair_prefix = QPushButton("前缀库"); btn_pair_prefix.setFixedWidth(58); btn_pair_prefix.setMinimumHeight(28); btn_pair_prefix.setToolTip(f"从前缀库选择前缀{user_idx + 1}")
+                    le_user = MultiLineTextEdit(); le_user.setText(user_val); le_user.setPlaceholderText(f"请输入用户{user_idx + 1}内容…")
+                    le_pair_prefix.setToolTip(f"用户{user_idx + 1}的独立前缀"); le_user.setToolTip(f"用户{user_idx + 1}的内容")
+                    le_user.setMinimumHeight(42); prefix_edits.append(le_pair_prefix); user_edits.append(le_user); pair_prefix_buttons.append(btn_pair_prefix)
+                    pair_layout.addWidget(group_label); pair_layout.addWidget(le_pair_prefix, 1); pair_layout.addWidget(btn_pair_prefix); pair_layout.addWidget(le_user, 3)
+                    pair_column.addWidget(pair)
+                outer.addLayout(pair_column)
+
+                def _save_plus(idx=i, total=le_total, p_edits=prefix_edits, u_edits=user_edits):
+                    self._update_config(idx, 'value', _clear_input_plus_value(total.text(), [ed.text() for ed in u_edits]))
+                    self._update_config(idx, 'input_count', len(u_edits))
+                    self._update_config(idx, 'input_prefixes', [ed.text() for ed in p_edits])
+
+                def _change_plus_count(new_count, idx=i, saver=_save_plus):
+                    saver(); self._update_config(idx, 'input_count', int(new_count)); self._refresh_actions()
+
+                le_total.editingFinished.connect(_save_plus)
+                for edit in prefix_edits + user_edits: edit.editingFinished.connect(_save_plus)
+                for btn, target in zip(pair_prefix_buttons, prefix_edits):
+                    btn.clicked.connect(lambda chk, idx=i, target=target, saver=_save_plus: self._show_clear_input_prefix_presets(idx, target, saver))
+                count_box.valueChanged.connect(_change_plus_count)
+                btn_prefix.clicked.connect(lambda chk, idx=i, target=le_total, saver=_save_plus: self._show_clear_input_prefix_presets(idx, target, saver))
+                self.action_table.setCellWidget(i, 4, w)
+                self.action_table.setRowHeight(i, max(self.action_table.rowHeight(i), 112 + 54 * max(0, input_count - 1)))
+                self.action_table.setColumnWidth(4, max(self.action_table.columnWidth(4), 430))
             elif "图像识别点击" in act_name: le = QLineEdit(str(a.get('value', ''))); le.setPlaceholderText("图片路径..."); le.editingFinished.connect(lambda idx=i, edit=le: self._update_config(idx, 'value', edit.text())); self.action_table.setCellWidget(i, 4, le)
             elif any(x in act_name for x in ["如果找图成功", "如果窗口存在"]):
                 w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0); l.setSpacing(2)
@@ -13164,6 +13616,13 @@ class AutoManager(QMainWindow):
                 
                 l.addWidget(le_target, 2); l.addWidget(btn_pick); l.addWidget(cb_ok, 1); l.addWidget(cb_fail, 1)
                 self.action_table.setCellWidget(i, 4, w)
+            elif a.get('action') == "激活窗口":
+                # 窗口目标由第 3 列的窗口选择按钮维护；第 5 列仅作只读展示。
+                # 不允许运行前同步逻辑从该框读取旧坐标覆盖真实窗口配置。
+                le = QLineEdit(str(a.get('value', '')))
+                le.setReadOnly(True)
+                le.setToolTip("请点击第 3 列的窗口按钮重新选择目标窗口")
+                self.action_table.setCellWidget(i, 4, le)
             else:
                 le = QLineEdit(str(a.get('value', ''))); le.setPlaceholderText("输入内容..."); le.setToolTip(var_tooltip); le.editingFinished.connect(lambda idx=i, edit=le: self._update_config(idx, 'value', edit.text())); self.action_table.setCellWidget(i, 4, le)
         self.action_table.blockSignals(False)
@@ -13795,14 +14254,12 @@ class AutoManager(QMainWindow):
                         final_p = p_ext if p_ext else p_def
                         out[name] = f"{final_u}|{final_p}|{m_def}"
                     elif act_type == "clear_input_plus":
-                        # A: 前缀(Prefix); B: 内容(Content)
-                        d_p = default_val.split('|', 1)
-                        e_p = existing_val.split('|', 1)
-                        pre_def, con_def = (d_p[0] if len(d_p)>0 else ""), (d_p[1] if len(d_p)>1 else "")
-                        con_ext = e_p[1] if len(e_p)>1 else ""
-                        
-                        final_con = con_ext if con_ext else con_def
-                        out[name] = f"{pre_def}|{final_con}"
+                        # 前缀属于流程预设；每个用户输入段属于数据行，逐段保留用户填写内容。
+                        count = _clear_input_plus_count(act.get('input_count'), fallback=1)
+                        pre_def, def_users = _clear_input_plus_parts(default_val, count)
+                        _, ext_users = _clear_input_plus_parts(existing_val, count)
+                        final_users = [ext if str(ext).strip() else default for ext, default in zip(ext_users, def_users)]
+                        out[name] = _clear_input_plus_value(pre_def, final_users)
                     elif any(x in act_type for x in ["if_image", "if_win"]):
                         # A: 跳转目标(Jumps); B: 识别目标(Target)
                         d_p = [p.strip() for p in default_val.split('|')]
@@ -13911,10 +14368,40 @@ class AutoManager(QMainWindow):
         self._schedule_config_flush()
         self._refresh_data_table()
 
+    def _get_task_data_row_height(self, task_id=None):
+        """读取任务专属行高；旧配置或新任务未设置时回退到旧版全局默认值。"""
+        task_id = str(task_id or self.current_task or "")
+        layouts = self.config.get("task_data_layouts", {})
+        task_layout = layouts.get(task_id, {}) if isinstance(layouts, dict) and task_id else {}
+        raw_height = task_layout.get("row_height") if isinstance(task_layout, dict) else None
+        if raw_height is None:
+            raw_height = self.config.get("layout", {}).get("data_row_height", 28)
+        try:
+            return min(max(24, int(raw_height)), 96)
+        except (TypeError, ValueError):
+            return 28
+
+    def _restore_data_row_height(self, task_id=None):
+        """仅在任务仍为当前可见任务时恢复其表格行高，避免延迟回调串写。"""
+        task_id = str(task_id or self.current_task or "")
+        if not task_id or task_id != str(self.current_task or ""):
+            return
+        self._set_data_row_height(self._get_task_data_row_height(task_id), save=False)
+
     def _set_data_row_height(self, value, save=True):
         row_height = min(max(24, int(value)), 96)
-        self.config.setdefault("layout", {})
-        self.config["layout"]["data_row_height"] = row_height
+        task_id = str(self.current_task or "")
+        # 行高在当前任务下独立保存；layout.data_row_height 仅继续充当旧配置的兜底默认值。
+        if save and task_id:
+            layouts = self.config.setdefault("task_data_layouts", {})
+            if not isinstance(layouts, dict):
+                layouts = {}
+                self.config["task_data_layouts"] = layouts
+            task_layout = layouts.setdefault(task_id, {})
+            if not isinstance(task_layout, dict):
+                task_layout = {}
+                layouts[task_id] = task_layout
+            task_layout["row_height"] = row_height
 
         if hasattr(self, "data_row_height_spin") and self.data_row_height_spin.value() != row_height:
             self.data_row_height_spin.blockSignals(True)
@@ -13996,13 +14483,23 @@ class AutoManager(QMainWindow):
             return
         self._set_all_row_check_state(not all_checked)
 
+    def _set_data_row_manual_selection_override(self, row, checked):
+        """记录用户通过复选框明确指定的选中状态，作为自动选择规则的覆盖项。"""
+        if not self.current_task:
+            return
+        data_rows = self.config.get("task_data", {}).get(self.current_task, [])
+        if 0 <= int(row) < len(data_rows) and isinstance(data_rows[int(row)], dict):
+            data_rows[int(row)]["_selection_manual_override"] = bool(checked)
+
     def _set_all_row_check_state(self, checked):
         self.data_table.blockSignals(True)
         for r in range(self.data_table.rowCount()):
             item = self.data_table.item(r, self._data_select_col())
             if item:
                 can_check = self._is_data_row_selectable(r)
-                item.setCheckState(Qt.Checked if checked and can_check else Qt.Unchecked)
+                target_checked = bool(checked and can_check)
+                item.setCheckState(Qt.Checked if target_checked else Qt.Unchecked)
+                self._set_data_row_manual_selection_override(r, target_checked)
         self.data_table.blockSignals(False)
         self._update_data_select_header()
         self._save_data_table()
@@ -14014,8 +14511,11 @@ class AutoManager(QMainWindow):
             if item:
                 if not self._is_data_row_selectable(r):
                     item.setCheckState(Qt.Unchecked)
+                    self._set_data_row_manual_selection_override(r, False)
                 else:
-                    item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+                    target_checked = item.checkState() != Qt.Checked
+                    item.setCheckState(Qt.Checked if target_checked else Qt.Unchecked)
+                    self._set_data_row_manual_selection_override(r, target_checked)
         self.data_table.blockSignals(False)
         self._update_data_select_header()
         self._save_data_table()
@@ -14037,7 +14537,9 @@ class AutoManager(QMainWindow):
             for r in range(start, end + 1):
                 item = self.data_table.item(r, self._data_select_col())
                 if item:
-                    item.setCheckState(state if checked and self._is_data_row_selectable(r) else Qt.Unchecked)
+                    target_checked = bool(checked and self._is_data_row_selectable(r))
+                    item.setCheckState(state if target_checked else Qt.Unchecked)
+                    self._set_data_row_manual_selection_override(r, target_checked)
         finally:
             self.data_table.blockSignals(False)
         self._update_data_select_header()
@@ -14066,6 +14568,7 @@ class AutoManager(QMainWindow):
                     continue
                 should_check = (statuses.get(r) in target_statuses) and self._is_data_row_selectable(r)
                 item.setCheckState(Qt.Checked if should_check else Qt.Unchecked)
+                self._set_data_row_manual_selection_override(r, should_check)
                 if should_check:
                     matched_rows.append(r)
         finally:
@@ -14823,7 +15326,7 @@ class AutoManager(QMainWindow):
                 pass
             btn_run_row.setToolTip("单独执行这一行任务，不依赖“选择”勾选。")
             btn_run_row.setProperty("data_row", r)
-            btn_run_row.setFixedHeight(max(24, self.config.get("layout", {}).get("data_row_height", 28) - 4))
+            btn_run_row.setFixedHeight(max(24, self._get_task_data_row_height() - 4))
             btn_run_row.setFixedWidth(30)
             btn_run_row.clicked.connect(lambda _checked=False, data_row=r: self._run_single_data_row(data_row))
             btn_run_row.setEnabled(r < len(old_data) and bool(acts))
@@ -14853,7 +15356,7 @@ class AutoManager(QMainWindow):
                     d_item.setBackground(QColor("#fff3e0"))
                     self.data_table.setItem(r, col_idx, d_item)
                     col_idx += 1
-            self.data_table.setRowHeight(r, self.config.get("layout", {}).get("data_row_height", 28))
+            self.data_table.setRowHeight(r, self._get_task_data_row_height())
                     
         self.data_table.blockSignals(False)
         self._update_data_select_header()
@@ -14877,7 +15380,7 @@ class AutoManager(QMainWindow):
             self._render_timer.stop()
             self._apply_data_table_column_widths(acts, show_delay)
             self._apply_data_table_column_visibility(acts, show_delay)
-            self._set_data_row_height(self.config.get("layout", {}).get("data_row_height", 28), save=False)
+            self._restore_data_row_height(render_task_id or self.current_task)
             return
             
         r = self._render_row_idx
@@ -14934,18 +15437,31 @@ class AutoManager(QMainWindow):
                 if show_delay:
                     col_idx += 1
             elif act_type == "clear_input_plus":
-                w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0); l.setSpacing(0)
-                parts = str(val).split('|', 1); pre = parts[0] if len(parts)>0 else ""; con = parts[1] if len(parts)>1 else ""
-                lbl = QLabel(f" {pre}"); lbl.setStyleSheet("background: #f5f5f5; color: #666; border-right: 1px solid #ccc; font-size: 11px;")
-                le = MultiLineTextEdit(); le.setText(con); le.setStyleSheet("background: #fffde7; border: none;"); le.setFixedHeight(30)
-                le.setToolTip(str(val))
-                le.editingFinished.connect(lambda r=r, c=col_idx, p=pre, target=le: self._on_cell_widget_changed(r, c, f"{p}|{target.text()}"))
-                if pre: l.addWidget(lbl, 1)
-                l.addWidget(le, 3); self.data_table.setCellWidget(r, col_idx, w)
-                self.data_table.setRowHeight(r, self.config.get("layout", {}).get("data_row_height", 28))
+                # 批量数据表：显示“总前缀 + (前缀1/用户1) + (前缀2/用户2) + …”。
+                # 总前缀和用户内容都属于当前批量数据行；流程编排值只作为新行默认值。
+                total_prefix, user_values = _clear_input_plus_parts(val, a.get('input_count'))
+                pair_prefixes = list(a.get('input_prefixes', []) or [])
+                pair_prefixes += [""] * (len(user_values) - len(pair_prefixes))
+                w = QWidget(); outer = QVBoxLayout(w); outer.setContentsMargins(0,0,0,0); outer.setSpacing(1)
+                head = QLabel(f"总前缀：{total_prefix}"); head.setStyleSheet("background: #f5f5f5; color: #666; font-size: 11px;")
+                outer.addWidget(head)
+                # 每个用户组独占一行，避免同一单元格内横向挤压。
+                pair_column = QVBoxLayout(); pair_column.setContentsMargins(0,0,0,0); pair_column.setSpacing(2)
+                user_edits = []
+                for user_idx, user_val in enumerate(user_values):
+                    pair = QWidget(); pair_layout = QHBoxLayout(pair); pair_layout.setContentsMargins(0,0,0,0); pair_layout.setSpacing(3)
+                    pair_label = QLabel(f"前缀{user_idx + 1}: {pair_prefixes[user_idx]}"); pair_label.setFixedWidth(92); pair_label.setStyleSheet("color: #666; font-size: 10px;")
+                    le = MultiLineTextEdit(); le.setText(user_val); le.setPlaceholderText(f"用户{user_idx + 1}内容…")
+                    le.setStyleSheet("background: #fffde7; border: none;"); le.setFixedHeight(30); le.setToolTip(str(val))
+                    pair_layout.addWidget(pair_label); pair_layout.addWidget(le, 1); user_edits.append(le); pair_column.addWidget(pair)
+                outer.addLayout(pair_column)
+                def _save_plus_cell(row=r, col=col_idx, prefix=total_prefix, edits=user_edits):
+                    self._on_cell_widget_changed(row, col, _clear_input_plus_value(prefix, [edit.text() for edit in edits]))
+                for le in user_edits: le.editingFinished.connect(_save_plus_cell)
+                self.data_table.setCellWidget(r, col_idx, w)
+                self.data_table.setRowHeight(r, max(self.config.get("layout", {}).get("data_row_height", 28), 64 + 36 * max(0, len(user_values) - 1)))
                 col_idx += 1
-                if show_delay:
-                    col_idx += 1
+                if show_delay: col_idx += 1
             elif act_type in ["if_image", "if_win"]:
                 # 使用文本展示，仅在需要时点击触发编辑器（或者保持文本以加速）
                 col_idx += 1
@@ -15016,6 +15532,14 @@ class AutoManager(QMainWindow):
             for k, v in old_row_dict.items():
                 if isinstance(k, str) and k.startswith("_") and k != "_选中":
                     row_dict[k] = v
+            # 每个步骤的“跳过”开关不是下划线私有字段，旧逻辑在任意保存动作
+            # （包括勾选/取消勾选一行）时会把这些规则全部丢掉，导致再次执行时
+            # 看起来“不按规则”。保存表格时必须从旧行原样保留它们。
+            for action in acts:
+                action_name = str(action.get("name", "") or "")
+                skip_key = f"{action_name}_跳过"
+                if skip_key and skip_key in old_row_dict:
+                    row_dict[skip_key] = bool(old_row_dict.get(skip_key))
             col_idx = self._data_first_value_col()  # skip select/execute/status columns
             chk_item = self.data_table.item(r, self._data_select_col())
             row_dict["_选中"] = (chk_item.checkState() == Qt.Checked) if chk_item else True
@@ -15051,15 +15575,18 @@ class AutoManager(QMainWindow):
                     bk = self.data_table.item(r, col_idx)
                     if bk: bk.setText(val)
                 elif act_type == "clear_input_plus" and widget is not None:
-                    # 核心修复：直接从 UI 控件抓取最新值
-                    le = _find_text_input(widget)
-                    lbl = widget.findChild(QLabel)
-                    prefix = lbl.text().strip() if lbl else ""
-                    content = le.text() if le else ""
-                    if str(prefix).strip() == "[SKIP_ROW]" or str(content).strip() == "[SKIP_ROW]":
+                    # 直接从同一单元格内抓取最新用户内容；总前缀必须读取当前动作配置，不能读取“总前缀：...”展示标签。
+                    edits = widget.findChildren(MultiLineTextEdit)
+                    # _apply_to_main 会先更新 backing item；从该行当前值读取前缀，
+                    # 不能使用流程编排默认前缀，否则返回批量数据界面时会被改回旧值。
+                    backing = self.data_table.item(r, col_idx)
+                    current_raw = backing.text() if backing else old_row_dict.get(a.get('name', ''), a.get('value', ''))
+                    prefix, _row_users = _clear_input_plus_parts(current_raw, a.get('input_count'))
+                    contents = [edit.text() for edit in edits]
+                    if str(prefix).strip() == "[SKIP_ROW]" or any(str(content).strip() == "[SKIP_ROW]" for content in contents):
                         val = "[SKIP_ROW]"
                     else:
-                        val = f"{prefix}|{content}"
+                        val = _clear_input_plus_value(prefix, contents)
                     bk = self.data_table.item(r, col_idx)
                     if bk: bk.setText(val)
                 elif isinstance(w, QComboBox):
@@ -15069,6 +15596,20 @@ class AutoManager(QMainWindow):
                 else:
                     item = self.data_table.item(r, col_idx)
                     val = item.text() if item else ""
+
+                # “激活窗口”不是坐标动作。若流程步骤曾经由点击/移动等坐标动作改型，
+                # 旧数据列可能残留“1250,273”这类坐标值；不能把它当窗口标题保存，
+                # 否则下一次执行就会按坐标字符串查找窗口。优先恢复流程中保存的窗口目标。
+                if act_type == "win_active":
+                    val_text = str(val or "").strip()
+                    if re.fullmatch(r"-?\d+\s*,\s*-?\d+", val_text):
+                        default_window = str(a.get("value", "") or "").strip()
+                        if default_window and not re.fullmatch(r"-?\d+\s*,\s*-?\d+", default_window):
+                            self._log(
+                                f"⚠️ 第 {r + 1} 行的激活窗口值仍是旧坐标 [{val_text}]，已恢复为流程设定的窗口 [{default_window}]。",
+                                "orange"
+                            )
+                            val = default_window
                 
                 if not is_coord_only:
                     row_dict[a.get('name', f'步骤{col_idx-1}')] = val
@@ -15108,13 +15649,13 @@ class AutoManager(QMainWindow):
             if act_type == "clear_input_plus":
                 if s == "[SKIP_ROW]":
                     return True
-                parts = s.split("|", 1)
-                prefix = parts[0].strip() if len(parts) > 0 else ""
-                content = parts[1].strip() if len(parts) > 1 else ""
-                def_parts = default_s.split("|", 1)
-                def_prefix = def_parts[0].strip() if len(def_parts) > 0 else ""
-                def_content = def_parts[1].strip() if len(def_parts) > 1 else ""
-                if (prefix or content) and (prefix != def_prefix or content != def_content):
+                count = _clear_input_plus_count(action.get("input_count"), fallback=1)
+                prefix, users = _clear_input_plus_parts(s, count)
+                def_prefix, def_users = _clear_input_plus_parts(default_s, count)
+                if prefix.strip() != def_prefix.strip() or any(
+                    str(user or "").strip() != str(def_users[idx] or "").strip()
+                    for idx, user in enumerate(users)
+                ):
                     return True
             elif act_type == "open_url":
                 if s == "[SKIP_ROW]":
@@ -15149,7 +15690,13 @@ class AutoManager(QMainWindow):
         # 临时占位行仍不可执行，避免被误当成一条任务。
         return 0 <= row_index < len(data_rows)
 
-    def _auto_check_blank_rows(self, rows=None):
+    def _auto_check_blank_rows(self, rows=None, force_from_filled_content=False):
+        """同步批量数据行的默认勾选状态。
+
+        ``force_from_filled_content=True`` 仅供批量填充中心“应用所有更改”后使用：
+        对本次目标行重新按实际业务内容决定勾选状态，流程预设值不算作填充内容。
+        普通刷新、加行等路径仍优先保留用户已手动设置的 ``_选中`` 状态。
+        """
         if not self.current_task:
             return
         actions = self.config.get('tasks', {}).get(self.current_task, [])
@@ -15174,7 +15721,18 @@ class AutoManager(QMainWindow):
         try:
             for row in target_rows:
                 row_dict = data_rows[row] if row < len(data_rows) else {}
-                should_check = self._row_has_meaningful_data(row_dict, actions)
+                # 批量填充“应用”后，需要按这次目标行的真实业务内容重置默认勾选：
+                # 只有与流程默认预设不同的内容才算填充，空行和纯预设行都不勾选。
+                # 其他普通路径则继续尊重用户已经手动设置过的勾选状态。
+                manual_override = row_dict.get("_selection_manual_override")
+                if force_from_filled_content and manual_override is not None:
+                    should_check = bool(manual_override)
+                elif force_from_filled_content:
+                    should_check = self._row_has_meaningful_data(row_dict, actions)
+                elif "_选中" in row_dict:
+                    should_check = bool(row_dict.get("_选中"))
+                else:
+                    should_check = self._row_has_meaningful_data(row_dict, actions)
                 old_checked = bool(row_dict.get("_选中", False))
                 row_dict["_选中"] = should_check
                 if row < self.data_table.rowCount():
@@ -15310,6 +15868,11 @@ class AutoManager(QMainWindow):
     def _batch_assign_profiles(self):
         """批量处理中心：支持多步骤同时填充、分类过滤等。"""
         if not self.current_task: return
+        # 打开批量中心前提交动作编辑器中尚未失焦保存的总前缀和用户框配置。
+        try:
+            self._force_sync_action_widgets()
+        except Exception:
+            pass
         acts = self.config['tasks'].get(self.current_task, [])
         show_delay = self.btn_toggle_delay.isChecked()
         
@@ -15612,11 +16175,18 @@ class AutoManager(QMainWindow):
                     event.acceptProposedAction()
 
         # --- 核心改进：预览表列拆分逻辑 ---
-        preview_cols = [] # [(real_col_idx, step_idx, step_name, act_type, sub_type)] sub_type: "prefix" or "content" or "url" or "profile" or None
+        preview_cols = [] # [(real_col_idx, step_idx, step_name, act_type, sub_type)]
         for col_idx, s_idx, name, act_type in targets:
             if act_type == "clear_input_plus":
-                preview_cols.append((col_idx, s_idx, name, act_type, "prefix"))
-                preview_cols.append((col_idx, s_idx, name, act_type, "content"))
+                action_cfg = acts[s_idx] if 0 <= s_idx < len(acts) else {}
+                try:
+                    plus_count = _clear_input_plus_count(action_cfg.get("input_count"), fallback=1)
+                except (TypeError, ValueError):
+                    plus_count = max(1, len(str(action_cfg.get("value", "")).split("|")) - 1)
+                preview_cols.append((col_idx, s_idx, name, act_type, "total_prefix"))
+                for plus_idx in range(plus_count):
+                    preview_cols.append((col_idx, s_idx, name, act_type, f"user_prefix:{plus_idx}"))
+                    preview_cols.append((col_idx, s_idx, name, act_type, f"user_content:{plus_idx}"))
             elif act_type == "open_url":
                 preview_cols.append((col_idx, s_idx, name, act_type, "url"))
                 preview_cols.append((col_idx, s_idx, name, act_type, "profile"))
@@ -15628,8 +16198,10 @@ class AutoManager(QMainWindow):
         
         headers = []
         for _, _, name, act_type, sub in preview_cols:
-            if sub == "prefix": headers.append(f"{name}\n(前缀)")
-            elif sub == "content": headers.append(f"{name}\n(内容)")
+            plus_kind, plus_idx = _clear_input_plus_sub_info(sub)
+            if plus_kind == "total_prefix": headers.append(f"{name}\n(总前缀)")
+            elif plus_kind == "user_prefix": headers.append(f"{name}\n(前缀{plus_idx + 1})")
+            elif plus_kind == "user_content": headers.append(f"{name}\n(用户{plus_idx + 1})")
             elif sub == "url": headers.append(f"{name}\n(网址)")
             elif sub == "profile": headers.append(f"{name}\n(账号)")
             else: headers.append(f"{name}\n({act_type})")
@@ -15643,7 +16215,8 @@ class AutoManager(QMainWindow):
         preview_table.verticalHeader().setMaximumSectionSize(160)
         preview_table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
         for pc_idx, (_, _, _, act_type, sub) in enumerate(preview_cols):
-            if (act_type in ["input", "clear_input"] and sub is None) or (act_type == "clear_input_plus" and sub == "content"):
+            plus_kind, _plus_idx = _clear_input_plus_sub_info(sub)
+            if (act_type in ["input", "clear_input"] and sub is None) or (act_type == "clear_input_plus" and plus_kind == "user_content"):
                 preview_table.setItemDelegateForColumn(pc_idx, MultiLineTextDelegate(preview_table))
 
         base_dialog_title = f"🛠️ 批量填充中心 — {title_suffix}"
@@ -15728,12 +16301,21 @@ class AutoManager(QMainWindow):
                         raw_val = item_backing.text()
                         if act_type == "clear_input_plus":
                             skip_token = "[SKIP_ROW]"
+                            plus_kind, plus_idx = _clear_input_plus_sub_info(sub)
                             if raw_val.strip() == skip_token:
-                                val = "" if sub == "prefix" else skip_token
+                                val = "" if plus_kind != "user_content" else skip_token
                             else:
-                                parts = raw_val.split('|', 1)
-                                if sub == "prefix": val = parts[0] if len(parts) > 0 else ""
-                                else: val = parts[1] if len(parts) > 1 else ""
+                                action_cfg = acts[_step_idx] if 0 <= _step_idx < len(acts) else {}
+                                total_prefix, user_values = _clear_input_plus_parts(raw_val, action_cfg.get('input_count'))
+                                if plus_kind == "total_prefix":
+                                    # 批量填充中心编辑的是当前数据行的前缀，不能每次
+                                    # 从流程编排动作默认值重新覆盖。
+                                    val = total_prefix
+                                elif plus_kind == "user_prefix":
+                                    prefixes = list(acts[_step_idx].get('input_prefixes', []) or []) if 0 <= _step_idx < len(acts) else []
+                                    val = prefixes[plus_idx] if plus_idx is not None and plus_idx < len(prefixes) else ""
+                                elif plus_kind == "user_content":
+                                    val = user_values[plus_idx] if plus_idx is not None and plus_idx < len(user_values) else ""
                         elif act_type == "open_url":
                             skip_token = "[SKIP_ROW]"
                             if raw_val.strip() == skip_token:
@@ -16137,13 +16719,19 @@ class AutoManager(QMainWindow):
             headers = []
             for preview_col_idx, col_def in enumerate(preview_cols):
                 _, _, name, act_type, sub = col_def
-                if sub == "prefix":
+                plus_kind, plus_idx = _clear_input_plus_sub_info(sub)
+                if plus_kind in ("total_prefix", "user_prefix"):
                     continue
                 if act_type == "open_url" and sub != "url":
                     continue
                 pure_col_indexes.append(preview_col_idx)
-                if sub == "content":
-                    headers.append(f"{name}(内容)")
+                plus_kind, plus_idx = _clear_input_plus_sub_info(sub)
+                if plus_kind == "user_content":
+                    headers.append(f"{name}(用户{plus_idx + 1})")
+                elif plus_kind == "user_prefix":
+                    headers.append(f"{name}(前缀{plus_idx + 1})")
+                elif plus_kind == "total_prefix":
+                    headers.append(f"{name}(总前缀)")
                 elif sub == "url":
                     headers.append(f"{name}(网址)")
                 elif act_type == "drag_file" or "拖拽" in name or "文件" in name:
@@ -16916,10 +17504,11 @@ class AutoManager(QMainWindow):
             valid_targets = []
             for it in target_items:
                 _, _, step_name, act_type, sub = preview_cols[it.column()]
-                if act_type == "clear_input_plus" and sub == "prefix":
+                plus_kind, _plus_idx = _clear_input_plus_sub_info(sub)
+                if act_type == "clear_input_plus" and plus_kind in ("total_prefix", "user_prefix"):
                     valid_targets.append(it)
             if not valid_targets:
-                QMessageBox.warning(dlg, "提示", "当前选区里没有“前缀”单元格，请先选择某个“(前缀)”格子。")
+                QMessageBox.warning(dlg, "提示", "当前选区里没有增强版前缀单元格，请先选择总前缀或某个用户前缀格子。")
                 return
 
             _save_undo_state()
@@ -17008,8 +17597,49 @@ class AutoManager(QMainWindow):
             win_ly.addWidget(QLabel("选择当前打开的窗口/标签页:"))
             search_win = QLineEdit(); search_win.setPlaceholderText("搜索窗口标题...")
             win_ly.addWidget(search_win)
+            win_filter_row = QHBoxLayout()
+            chk_one_window = QCheckBox("每个浏览器实例只显示一个窗口")
+            chk_one_window.setToolTip("勾选后，同一浏览器实例的多个标签页只保留一个代表项；取消后显示全部标签页。")
+            win_filter_row.addWidget(chk_one_window)
+            win_filter_row.addWidget(QLabel("排序:"))
+            sort_win = QComboBox()
+            sort_win.addItems(["默认排序", "按标签页标题/网址关键词归类", "按账户/浏览器实例归类"])
+            sort_win.setToolTip("按标题或网址关键词排序可将标题中包含 Flow、YouTube 等关键词的页面集中显示。")
+            # 批量填充中心打开时默认使用关键词归类；用户仍可手动切回其他排序方式。
+            sort_win.setCurrentIndex(1)
+            win_filter_row.addWidget(sort_win, 1)
+            win_ly.addLayout(win_filter_row)
             lbl_win_selection_count = create_table_selection_label()
             
+            def _get_browser_tab_titles(hwnd, fallback_title):
+                """只读取当前浏览器窗口中处于选中状态的标签页。"""
+                active_titles = []
+                if sys.platform == "win32" and hwnd:
+                    try:
+                        from pywinauto import Desktop
+                        win = Desktop(backend="uia").window(handle=int(hwnd))
+                        for tab in win.descendants(control_type="TabItem"):
+                            try:
+                                is_active = False
+                                # Chromium/Firefox 的 UIA TabItem 通常支持 is_selected。
+                                if hasattr(tab, "is_selected"):
+                                    is_active = bool(tab.is_selected())
+                                if not is_active and hasattr(tab, "get_toggle_state"):
+                                    is_active = int(tab.get_toggle_state()) == 1
+                                if not is_active:
+                                    continue
+                                name = str(tab.window_text() or "").strip()
+                                if name and name not in active_titles:
+                                    active_titles.append(name)
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                # UIA 未提供选中状态时，顶层浏览器标题就是当前激活标签页标题；
+                # 绝不退回枚举全部 TabItem，避免把同一窗口的其他标签页列出来。
+                fallback = str(fallback_title or "").strip()
+                return active_titles[:1] or ([fallback] if fallback else [])
+
             def _get_wins():
                 import pygetwindow as pgw
                 wins = []
@@ -17021,24 +17651,124 @@ class AutoManager(QMainWindow):
                             hwnd = getattr(w, '_hWnd', None)
                             if hwnd and _is_compact_browser_restore_prompt(hwnd):
                                 continue
-                            wins.append((build_window_display_text(w.title, hwnd, "[软件] ", profile_meta), w.title, hwnd))
+                            browser_label = _get_window_browser_label(hwnd)
+                            # 部分浏览器窗口的进程查询可能被系统权限拦截；标题后缀是可靠的辅助证据。
+                            if not browser_label:
+                                title_lower = str(w.title or "").strip().lower()
+                                title_browser_marks = (
+                                    " - google chrome", " - microsoft edge", " - mozilla firefox",
+                                    " - opera", " - brave", " - vivaldi", " - 360浏览器", " - qq浏览器",
+                                )
+                                if any(title_lower.endswith(mark) for mark in title_browser_marks):
+                                    if "google chrome" in title_lower:
+                                        browser_label = "Google Chrome"
+                                    elif "microsoft edge" in title_lower:
+                                        browser_label = "Microsoft Edge"
+                                    elif "mozilla firefox" in title_lower:
+                                        browser_label = "Mozilla Firefox"
+                                    elif "opera" in title_lower:
+                                        browser_label = "Opera"
+                                    elif "brave" in title_lower:
+                                        browser_label = "Brave"
+                                    elif "vivaldi" in title_lower:
+                                        browser_label = "Vivaldi"
+                                    elif "360浏览器" in title_lower:
+                                        browser_label = "360 浏览器"
+                                    else:
+                                        browser_label = "QQ 浏览器"
+                            # Chrome 同一账户可能对应多个窗口；用账户 profile 路径作为归并键，
+                            # 不把同一账户的多个标签/窗口误当成不同浏览器类型。
+                            account_info = get_window_profile_descriptor(hwnd) if browser_label else {}
+                            account_marker = get_window_account_marker(hwnd, profile_meta) if browser_label else ""
+                            account_path = str(account_info.get("path", "") or "").strip()
+                            if browser_label and account_path:
+                                # 优先使用用户自定义标记；没有标记时使用 profile 目录名，
+                                # 确保同一账户的多个窗口仍然归到同一组。
+                                account_name = account_marker or os.path.basename(account_path)
+                                browser_label = f"账户 {account_name}"
+                            elif account_marker:
+                                browser_label = f"账户 {account_marker}"
+                            if browser_label:
+                                # 同一 HWND 代表同一个浏览器实例；该实例内的 TabItem 才是 1/3、2/3 的分母。
+                                instance_label = f"{browser_label} · 实例#{str(int(hwnd or 0))[-4:]}"
+                                tab_titles = _get_browser_tab_titles(hwnd, w.title)
+                                tab_total = len(tab_titles)
+                                for tab_index, tab_title in enumerate(tab_titles, 1):
+                                    _base = build_window_display_text(tab_title, hwnd, "", profile_meta)
+                                    display = f"[{instance_label} · 标签页 {tab_index}/{tab_total}] {_base}"
+                                    wins.append((display, tab_title, hwnd, True, instance_label))
+                            else:
+                                display = build_window_display_text(w.title, hwnd, "[软件] ", profile_meta)
+                                wins.append((display, w.title, hwnd, False, ""))
                 except Exception as e:
                     log_internal_issue("批量填充中心扫描窗口列表失败", e)
-                wins.sort(key=lambda x: x[0])
+                # 标签页序号已经在枚举时按同一 HWND 计算；这里只按实例和标签标题排序，不能再次按全局窗口重编号。
+                wins.sort(key=lambda x: (not x[3], x[4], x[1].lower(), int(x[2] or 0)))
                 return wins
 
             def _refresh_win():
                 all_w = _get_wins()
+                if chk_one_window.isChecked():
+                    # 每个浏览器实例只保留第一个标签页作为代表项；普通软件窗口全部保留。
+                    seen_instances = set()
+                    filtered_wins = []
+                    for _item in all_w:
+                        if _item[3]:
+                            if _item[4] in seen_instances:
+                                continue
+                            seen_instances.add(_item[4])
+                        filtered_wins.append(_item)
+                    all_w = filtered_wins
                 win_list.clear()
                 txt = search_win.text().lower()
-                for d, r, hwnd in all_w:
-                    if not txt or txt in d.lower():
+                browser_items = [item for item in all_w if item[3] and (not txt or txt in item[0].lower())]
+                software_items = [item for item in all_w if not item[3] and (not txt or txt in item[0].lower())]
+                if sort_win.currentIndex() == 1:
+                    # 按标签页标题中的关键词归类，而不是单纯按整句标题排序。
+                    # 当前扫描接口能稳定取得标签页标题和窗口句柄，网址未必能从系统窗口
+                    # UIA 取得，因此以标题中的站点/业务关键词作为可用的 URL 关键词代理。
+                    def _keyword_group(item):
+                        title = str(item[1] or "").strip().casefold()
+                        title = re.sub(r"\s*[-|—|｜]\s*(google chrome|microsoft edge|mozilla firefox|opera|brave|vivaldi).*$", "", title, flags=re.I)
+                        tokens = re.findall(r"[a-z0-9][a-z0-9._-]*|[\u4e00-\u9fff]{2,}", title)
+                        stop_words = {
+                            "home", "主页", "首页", "new", "tab", "新标签页",
+                            "google", "chrome", "microsoft", "edge", "mozilla", "firefox",
+                        }
+                        meaningful = [token for token in tokens if token not in stop_words]
+                        return meaningful[0] if meaningful else (tokens[0] if tokens else title)
+
+                    browser_items.sort(key=lambda item: (
+                        _keyword_group(item),
+                        str(item[1] or "").casefold(),
+                        item[4].casefold(),
+                        int(item[2] or 0),
+                    ))
+                    software_items.sort(key=lambda item: str(item[1] or "").casefold())
+                elif sort_win.currentIndex() == 2:
+                    browser_items.sort(key=lambda item: (item[4].lower(), str(item[1] or "").lower()))
+                    software_items.sort(key=lambda item: str(item[1] or "").lower())
+
+                def _add_group(title, items):
+                    if not items:
+                        return
+                    header = QListWidgetItem(title)
+                    header.setFlags(Qt.ItemIsEnabled)
+                    header.setForeground(QColor("#1565c0" if "浏览器" in title else "#616161"))
+                    header.setBackground(QColor("#e3f2fd" if "浏览器" in title else "#f5f5f5"))
+                    win_list.addItem(header)
+                    for d, r, hwnd, _is_browser, _browser_label in items:
                         it = QListWidgetItem(d)
                         it.setData(Qt.UserRole, r)          # 纯标题
                         it.setData(Qt.UserRole + 1, hwnd)   # hwnd 唯一标识
                         win_list.addItem(it)
+
+                _add_group("🌐 浏览器窗口（Chrome / Edge / Firefox / Opera 等）", browser_items)
+                _add_group("🖥️ 其他软件窗口", software_items)
             
             search_win.textChanged.connect(_refresh_win)
+            chk_one_window.stateChanged.connect(lambda _state: _refresh_win())
+            sort_win.currentIndexChanged.connect(lambda _index: _refresh_win())
             btn_ref_win = QPushButton("🔄 刷新窗口"); btn_ref_win.clicked.connect(_refresh_win)
             win_ly.addWidget(win_list)
             win_ly.addWidget(lbl_win_selection_count)
@@ -17423,7 +18153,7 @@ class AutoManager(QMainWindow):
                     is_target = (
                         (act_type in ["upload", "drag_file", "run_app"] and sub is None) or
                         (act_type in ["input", "clear_input"] and sub is None) or
-                        (act_type == "clear_input_plus" and sub == "content")
+                        (act_type == "clear_input_plus" and _clear_input_plus_sub_info(sub)[0] == "user_content")
                     )
                     if not is_target:
                         continue
@@ -17451,9 +18181,10 @@ class AutoManager(QMainWindow):
                     }
                 text_default_exts = (
                     SMART_FILL_TXT_ONLY_EXTS_TEXT
-                    if act_type == "clear_input_plus" and sub == "content"
+                    if act_type == "clear_input_plus" and _clear_input_plus_sub_info(sub)[0] == "user_content"
                     else smart_rules.get("text_exts_text", SMART_FILL_TEXT_EXTS_TEXT)
                 )
+                plus_user_content = act_type == "clear_input_plus" and _clear_input_plus_sub_info(sub)[0] == "user_content"
                 return {
                     "step_name": step_name,
                     "enabled": True,
@@ -17461,7 +18192,7 @@ class AutoManager(QMainWindow):
                     "exts_text": str(text_default_exts),
                     "consume_mode": "sequential",
                     "text_fill_mode": str(smart_rules.get("text_fill_mode", "content")),
-                    "shortage_action": str(smart_rules.get("text_shortage_action", "skip_row")),
+                    "shortage_action": "blank" if plus_user_content else str(smart_rules.get("text_shortage_action", "skip_row")),
                 }
 
             def _get_effective_step_rule(step_key, step_name, act_type, sub, smart_rules, legacy_step_key=None):
@@ -17475,6 +18206,10 @@ class AutoManager(QMainWindow):
                         for k in ["enabled", "exts_text", "consume_mode", "text_fill_mode", "shortage_action"]:
                             if k in raw:
                                 base[k] = raw[k]
+                if act_type == "clear_input_plus" and _clear_input_plus_sub_info(sub)[0] == "user_content":
+                    # 多用户框的文案必须共享游标并顺序消耗；旧版 repeat_first 规则不能让所有框重复第一篇。
+                    base["consume_mode"] = "sequential"
+                    base["shortage_action"] = "blank"
                 base["parsed_exts"] = _parse_exts_text(base.get("exts_text"), base.get("exts_text"))
                 return base
 
@@ -17856,7 +18591,7 @@ class AutoManager(QMainWindow):
                 return (
                     (cell_act_type in ["upload", "drag_file", "run_app"] and cell_sub is None) or
                     (cell_act_type in ["input", "clear_input"] and cell_sub is None) or
-                    (cell_act_type == "clear_input_plus" and cell_sub == "content")
+                    (cell_act_type == "clear_input_plus" and _clear_input_plus_sub_info(cell_sub)[0] == "user_content")
                 )
 
             def _is_enabled_smart_fill_cell(item, smart_rules=None):
@@ -17886,20 +18621,15 @@ class AutoManager(QMainWindow):
                         if it and _is_enabled_smart_fill_cell(it, smart_rules=smart_rules):
                             targets.append(it)
                 else:
-                    candidate_rows = []
+                    # “填充到空行”不依赖当前选区；自动扫描所有行中的空目标单元格。
+                    # 流程字段（总前缀、前缀1/2等）不会被纳入目标，因此不会阻塞空行判断。
                     for rr in range(preview_table.rowCount()):
-                        row_items = []
-                        row_has_value = False
                         for cc in range(preview_table.columnCount()):
                             it = preview_table.item(rr, cc)
                             if not it or not _is_enabled_smart_fill_cell(it, smart_rules=smart_rules):
                                 continue
-                            row_items.append(it)
-                            if str(it.text()).strip():
-                                row_has_value = True
-                        if row_items and not row_has_value:
-                            candidate_rows.extend(row_items)
-                    targets = candidate_rows
+                            if not str(it.text()).strip():
+                                targets.append(it)
 
                 row_map = {}
                 for it in targets:
@@ -17989,6 +18719,15 @@ class AutoManager(QMainWindow):
                     runtime["step_items"][step_key] = _build_bundle_step_items(bundle, rule, pending_texts=pending_texts)
                     runtime["step_cursors"][step_key] = [0]
                 return runtime
+
+            def _get_bundle_text_cursor(bundle_runtime, step_idx, cell_act_type, step_key):
+                """增强版同一动作的多个用户框共用文案游标，避免每个框都从第一篇文案开始。"""
+                if cell_act_type == "clear_input_plus":
+                    kind, _idx = _clear_input_plus_sub_info(step_key.rsplit("|", 1)[-1])
+                    if kind == "user_content":
+                        shared_key = f"__clear_input_plus_text__{int(step_idx)}"
+                        return bundle_runtime["step_cursors"].setdefault(shared_key, [0])
+                return bundle_runtime["step_cursors"].setdefault(step_key, [0])
 
             def _describe_bundle_exhaust_reason(bundle, bundle_runtime, used_text_files=None):
                 if not bundle_runtime:
@@ -18100,7 +18839,7 @@ class AutoManager(QMainWindow):
                     real_col, step_idx, _, cell_act_type, cell_sub = preview_cols[it.column()]
                     if (
                         (cell_act_type in ["input", "clear_input"] and cell_sub is None) or
-                        (cell_act_type == "clear_input_plus" and cell_sub == "content")
+                        (cell_act_type == "clear_input_plus" and _clear_input_plus_sub_info(cell_sub)[0] == "user_content")
                     ):
                         step_key = _make_smart_fill_step_key(step_idx, cell_act_type, cell_sub)
                         if step_key not in text_step_keys:
@@ -18111,7 +18850,7 @@ class AutoManager(QMainWindow):
                         if not bool(step_rule.get("enabled", True)):
                             continue
                         items = bundle_runtime["step_items"].get(step_key, [])
-                        cursor_holder = bundle_runtime["step_cursors"].setdefault(step_key, [0])
+                        cursor_holder = _get_bundle_text_cursor(bundle_runtime, step_idx, cell_act_type, step_key)
                         if cursor_holder[0] < len(items):
                             break
                     else:
@@ -18133,7 +18872,7 @@ class AutoManager(QMainWindow):
                         continue
                     has_enabled_step = True
                     items = bundle_runtime["step_items"].get(step_key, [])
-                    cursor_holder = bundle_runtime["step_cursors"].setdefault(step_key, [0])
+                    cursor_holder = _get_bundle_text_cursor(bundle_runtime, step_idx, cell_act_type, step_key)
                     if str(rule.get("consume_mode", "sequential")) == "sequential":
                         has_sequential = True
                         if cursor_holder[0] < len(items):
@@ -18188,7 +18927,7 @@ class AutoManager(QMainWindow):
                             continue
                         if (
                             (cell_act_type in ["input", "clear_input"] and cell_sub is None) or
-                            (cell_act_type == "clear_input_plus" and cell_sub == "content")
+                            (cell_act_type == "clear_input_plus" and _clear_input_plus_sub_info(cell_sub)[0] == "user_content")
                         ):
                             text_targets.append((it, step_key, step_name, cell_act_type, cell_sub))
                         elif cell_act_type in ["upload", "drag_file", "run_app"] and cell_sub is None:
@@ -18207,7 +18946,7 @@ class AutoManager(QMainWindow):
                         consume_mode = str(step_rule.get("consume_mode", "sequential"))
                         repeat_single = (consume_mode == "repeat_first")
                         step_items = bundle_runtime["step_items"].get(step_key, [])
-                        step_cursor = bundle_runtime["step_cursors"].setdefault(step_key, [0])
+                        step_cursor = _get_bundle_text_cursor(bundle_runtime, step_idx, cell_act_type, step_key)
                         text_preview = _peek_smart_value(step_items, step_cursor, repeat_single=repeat_single)
                         if text_preview is None:
                             return changed, skip_count, used_text_files, used_file_sources, used_real_source
@@ -18226,7 +18965,7 @@ class AutoManager(QMainWindow):
                         consume_mode = str(step_rule.get("consume_mode", "sequential"))
                         repeat_single = (consume_mode == "repeat_first")
                         step_items = bundle_runtime["step_items"].get(step_key, [])
-                        step_cursor = bundle_runtime["step_cursors"].setdefault(step_key, [0])
+                        step_cursor = _get_bundle_text_cursor(bundle_runtime, step_idx, cell_act_type, step_key)
                         source_preview = _peek_smart_value(step_items, step_cursor, repeat_single=repeat_single)
                         if source_preview is None:
                             return changed, skip_count, used_text_files, used_file_sources, used_real_source
@@ -18244,7 +18983,7 @@ class AutoManager(QMainWindow):
                         consume_mode = str(step_rule.get("consume_mode", "sequential"))
                         repeat_single = (consume_mode == "repeat_first")
                         step_items = bundle_runtime["step_items"].get(step_key, [])
-                        step_cursor = bundle_runtime["step_cursors"].setdefault(step_key, [0])
+                        step_cursor = _get_bundle_text_cursor(bundle_runtime, step_idx, cell_act_type, step_key)
                         text_data = _take_smart_value(step_items, step_cursor, repeat_single=repeat_single)
                         if text_data is None:
                             return changed, skip_count, used_text_files, used_file_sources, used_real_source
@@ -18263,7 +19002,7 @@ class AutoManager(QMainWindow):
                         consume_mode = str(step_rule.get("consume_mode", "sequential"))
                         repeat_single = (consume_mode == "repeat_first")
                         step_items = bundle_runtime["step_items"].get(step_key, [])
-                        step_cursor = bundle_runtime["step_cursors"].setdefault(step_key, [0])
+                        step_cursor = _get_bundle_text_cursor(bundle_runtime, step_idx, cell_act_type, step_key)
                         source_path = _take_smart_value(step_items, step_cursor, repeat_single=repeat_single)
                         if source_path is None:
                             return 0, 0, [], [], False
@@ -18288,7 +19027,7 @@ class AutoManager(QMainWindow):
                     consume_mode = str(step_rule.get("consume_mode", "sequential"))
                     repeat_single = (consume_mode == "repeat_first")
                     step_items = bundle_runtime["step_items"].get(step_key, [])
-                    step_cursor = bundle_runtime["step_cursors"].setdefault(step_key, [0])
+                    step_cursor = _get_bundle_text_cursor(bundle_runtime, step_idx, cell_act_type, step_key)
                     fill_val = None
 
                     if cell_act_type in ["upload", "drag_file", "run_app"] and cell_sub is None:
@@ -18315,7 +19054,7 @@ class AutoManager(QMainWindow):
                             used_real_source = True
                         else:
                             fill_val = skip_token if step_rule.get("shortage_action", "skip_row") == "skip_row" else ""
-                    elif cell_act_type == "clear_input_plus" and cell_sub == "content":
+                    elif cell_act_type == "clear_input_plus" and _clear_input_plus_sub_info(cell_sub)[0] == "user_content":
                         text_data = reserved_text_sources.pop(step_key, None)
                         if text_data is None:
                             text_data = _take_smart_value(step_items, step_cursor, repeat_single=repeat_single)
@@ -19109,8 +19848,13 @@ class AutoManager(QMainWindow):
                     if key not in row_col_data: 
                         row_col_data[key] = {"prefix":"", "content":"", "url":"", "profile":"", "val":"", "p_id":"", "original_p_id":"", "original_profile_text":""}
                     
-                    if sub == "prefix": row_col_data[key]["prefix"] = val
-                    elif sub == "content": row_col_data[key]["content"] = val
+                    plus_kind, plus_idx = _clear_input_plus_sub_info(sub)
+                    if plus_kind == "total_prefix":
+                        row_col_data[key]["prefix"] = val
+                    elif plus_kind == "user_content":
+                        row_col_data[key].setdefault("users", {})[int(plus_idx)] = val
+                    elif plus_kind == "user_prefix":
+                        row_col_data[key].setdefault("user_prefixes", {})[int(plus_idx)] = val
                     elif sub == "url": row_col_data[key]["url"] = val
                     elif sub == "profile": 
                         row_col_data[key]["profile"] = val
@@ -19176,7 +19920,15 @@ class AutoManager(QMainWindow):
                 if has_skip_token:
                     final_val = skip_token
                 elif act_type == "clear_input_plus":
-                    final_val = f"{data['prefix']}|{data['content']}"
+                    # 按动作配置的框数量重建：总前缀|用户1|用户2|……；每个用户前缀属于动作配置。
+                    step_idx_for_key = next((si for rc, si, _, at, _ in preview_cols if rc == real_col and at == act_type), None)
+                    action_cfg = acts[step_idx_for_key] if step_idx_for_key is not None and 0 <= step_idx_for_key < len(acts) else {}
+                    try:
+                        plus_count = _clear_input_plus_count(action_cfg.get("input_count"), fallback=1)
+                    except (TypeError, ValueError):
+                        plus_count = max(1, len(data.get("users", {})))
+                    users = [str(data.get("users", {}).get(i, "") or "") for i in range(plus_count)]
+                    final_val = _clear_input_plus_value(data.get("prefix", ""), users)
                 elif act_type == "open_url":
                     # p_id 已在写入前完成保真解析；这里绝不从旧主表回退账号。
                     p_id = str(data.get("p_id", "") or "")
@@ -19255,22 +20007,20 @@ class AutoManager(QMainWindow):
                                 cb_mode_w.setCurrentIndex(_mode_idx)
                                 cb_mode_w.blockSignals(False)
                     elif act_type == "clear_input_plus":
-                        le = _find_text_input(w)
+                        # 同步刷新批量数据表中的所有用户输入框；各用户前缀来自动作配置并保持不变。
+                        plus_edits = w.findChildren(MultiLineTextEdit)
                         lbl = w.findChild(QLabel)
                         if final_val == skip_token:
-                            if le:
-                                le.blockSignals(True)
-                                le.setText(skip_token)
-                                le.blockSignals(False)
-                            if lbl:
-                                lbl.setText(" ")
+                            for edit in plus_edits:
+                                edit.blockSignals(True); edit.setText(skip_token); edit.blockSignals(False)
+                            if lbl: lbl.setText(" ")
                         else:
-                            if le:
-                                le.blockSignals(True)
-                                le.setText(data["content"])
-                                le.blockSignals(False)
-                            if lbl:
-                                lbl.setText(f" {data['prefix']}")
+                            users = data.get("users", {})
+                            for user_idx, edit in enumerate(plus_edits):
+                                edit.blockSignals(True)
+                                edit.setText(str(users.get(user_idx, "") or ""))
+                                edit.blockSignals(False)
+                            if lbl: lbl.setText(f"总前缀：{data.get('prefix', '')}")
                     elif act_type == "win_active":
                         # [修复] win_active 的 cellWidget 显示纯标题，不显示 hwnd
                         le = _find_text_input(w)
@@ -19293,13 +20043,14 @@ class AutoManager(QMainWindow):
             dlg.accept()
             # [关键修复] 强制触发一次界面重绘
             self.data_table.viewport().update()
+            # 先将预览区写回的数据持久化，再按“非流程预设的实际填充内容”重置本次目标行的默认勾选。
+            # 因而填充内容的行自动勾选，未填内容或仅保留预设参数的行保持不勾选。
             self._save_data_table()
-            self._auto_check_blank_rows(selected_rows)
+            self._auto_check_blank_rows(selected_rows, force_from_filled_content=True)
             QMessageBox.information(self, "成功", "所有更改已应用。")
             
         btn_apply.clicked.connect(_apply_to_main)
         dlg.exec_()
-        self._auto_check_blank_rows(selected_rows)
 
     def _add_data_row(self):
         """添加数据行，支持批量添加。"""
@@ -19336,8 +20087,12 @@ class AutoManager(QMainWindow):
         if self.data_table.signalsBlocked(): return
         if item:
             try:
-                row_height = int(self.config.get("layout", {}).get("data_row_height", 28))
-                self.data_table.setRowHeight(item.row(), row_height)
+                # 用户直接点击“选择”复选框时，记录为明确的人工覆盖项。
+                if item.column() == self._data_select_col():
+                    self._set_data_row_manual_selection_override(
+                        item.row(), item.checkState() == Qt.Checked
+                    )
+                self.data_table.setRowHeight(item.row(), self._get_task_data_row_height())
             except Exception:
                 pass
         self._update_data_select_header()
@@ -19619,7 +20374,7 @@ class AutoManager(QMainWindow):
         if not self.current_task: return
         idx = self.action_table.currentRow()
         new_name = self._make_unique_action_name(f"步骤{len(self.config['tasks'][self.current_task])+1}")
-        new_act = {"enabled": True, "name": new_name, "action": "左键点击", "x": 0, "y": 0, "value": "", "delay": 1}
+        new_act = {"enabled": True, "name": new_name, "action": "左键点击", "x": 0, "y": 0, "value": "", "delay": 1, "repeat": 1}
         if idx >= 0: self.config['tasks'][self.current_task].insert(idx + 1, new_act)
         else: self.config['tasks'][self.current_task].append(new_act)
         # 添加步骤是高频 UI 操作：先立即刷新界面，配置由既有防抖定时器异步落盘，
@@ -20472,14 +21227,14 @@ class AutoManager(QMainWindow):
             self._engine.resume()
             self.btn_pause.setText("⏸️ 暂停")
             self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
-            self.osd.btn_pause.setText("⏸ 暂停")
+            self.osd.set_pause_visual(False)
             self.osd.btn_pause.setStyleSheet("QPushButton { background-color: #ff9800; color: white; border-radius: 3px; font-size: 11px; font-weight: bold; padding: 1px 4px; }")
             self._log("▶️ 已恢复执行", "green")
         else:
             self._engine.pause()
             self.btn_pause.setText("▶️ 继续")
             self.btn_pause.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-            self.osd.btn_pause.setText("▶ 继续")
+            self.osd.set_pause_visual(True)
             self.osd.btn_pause.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; border-radius: 3px; font-size: 11px; font-weight: bold; padding: 1px 4px; }")
             self.osd.lbl_info.setText("⏸️ <b>已暂停</b> | 当前步骤将于安全检查点停下")
             self.osd.lbl_detail.setText("再次点击暂停按钮或热键即可继续；小窗口保持显示")
@@ -20520,10 +21275,12 @@ class AutoManager(QMainWindow):
         self._task_queue = []
         self._current_on_finished = None
         # 主进度也保留到最终状态事件，避免动作仍在收尾时视觉上回到 0%。
-        self.btn_run.setEnabled(True); self.btn_run.setText("🚀 开始批量执行")
+        # 停止命令是异步的：Worker 可能仍在关闭窗口、结束子进程或释放输入控制。
+        # 在收到 done/worker_exit 前禁止再次启动，否则两个 Worker 会同时争抢浏览器、鼠标和剪贴板。
+        self.btn_run.setEnabled(False); self.btn_run.setText("正在停止...")
         self.btn_pause.setEnabled(False); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
         self.btn_stop.setEnabled(False); self.btn_resume.setEnabled(False)
-        self.btn_dry_run.setEnabled(True)
+        self.btn_dry_run.setEnabled(False)
     def _close_osd_window(self):
         """仅在没有活动执行引擎时关闭悬浮窗，避免运行中误关。"""
         engine = getattr(self, "_engine", None)
@@ -20535,6 +21292,13 @@ class AutoManager(QMainWindow):
         self._log("🪟 已手动关闭执行悬浮窗。", "gray")
 
     def _run_all(self, on_finished=None, scheduled_actions_snapshot=None, scheduled_data_snapshot=None):
+        # 停止请求是异步的；旧 Worker 仍存活时，禁止任何入口再次创建新 Worker。
+        # 该检查放在清空结果、写入“任务开始”日志之前，避免重复启动请求污染本轮状态。
+        active_engine = getattr(self, "_engine", None)
+        if active_engine and active_engine.isRunning():
+            self._log("⚠️ 上一个 Worker 仍在停止/收尾，已拒绝重复启动；请等待停止完成提示。", "orange")
+            return
+
         # 必须先验证任务，再创建回调/切换运行态。空任务在旧逻辑中会只输出“任务开始”
         # 后不启动引擎，界面看似卡住且没有可见错误。
         task_id = str(getattr(self, "current_task", "") or "").strip()
@@ -20664,28 +21428,20 @@ class AutoManager(QMainWindow):
                             acts[i]['value'] = new_val
                             self._log(f"🔒 [运行前同步] 步骤「{acts[i].get('name', f'步骤{i+1}')}」网址/账户/模式已同步", "blue")
                 elif act_type == "✨ 清空并输入(增强版)":
-                    # 这里的内容区可能是 MultiLineTextEdit（而不是 QLineEdit）
-                    edits = w.findChildren(QLineEdit)
-                    prefix_text = edits[0].text() if len(edits) > 0 else ""
-                    content_text = edits[1].text() if len(edits) > 1 else ""
-                    if content_text == "":
-                        try:
-                            mles = w.findChildren(MultiLineTextEdit)
-                            if mles and hasattr(mles[0], "text"):
-                                content_text = mles[0].text()
-                        except Exception:
-                            pass
-                    if content_text == "":
-                        try:
-                            tes = w.findChildren(QTextEdit)
-                            if tes and hasattr(tes[0], "toPlainText"):
-                                content_text = tes[0].toPlainText()
-                        except Exception:
-                            pass
-                    new_val = f"{prefix_text}|{content_text}"
+                    # 增强版容器包含：总前缀 QLineEdit、多个独立前缀 QLineEdit、多个用户 MultiLineTextEdit。
+                    # 不能再把 edits[1] 当成用户1，否则会把前缀1写入用户1内容。
+                    total_edit = w.findChild(QLineEdit, "plus_total_prefix")
+                    prefix_edits = w.findChildren(QLineEdit, "plus_user_prefix")
+                    user_edits = w.findChildren(MultiLineTextEdit)
+                    total_prefix = total_edit.text() if total_edit else ""
+                    user_values = [edit.text() for edit in user_edits]
+                    user_prefixes = [edit.text() for edit in prefix_edits]
+                    new_val = _clear_input_plus_value(total_prefix, user_values)
+                    acts[i]['input_count'] = max(1, len(user_values))
+                    acts[i]['input_prefixes'] = user_prefixes[:len(user_values)]
                     if acts[i].get('value', '') != new_val:
                         acts[i]['value'] = new_val
-                        self._log(f"🔒 [运行前同步] 步骤「{acts[i].get('name', f'步骤{i+1}')}」前缀/内容已同步", "blue")
+                        self._log(f"🔒 [运行前同步] 步骤「{acts[i].get('name', f'步骤{i+1}')}」总前缀/用户框内容已同步", "blue")
                 elif act_type == "⏸️ 延后执行":
                     sp_seconds = w.findChild(QSpinBox, "defer_seconds")
                     cb_resume = w.findChild(QComboBox, "defer_resume_mode")
@@ -20715,9 +21471,14 @@ class AutoManager(QMainWindow):
                         if acts[i].get('value', '') != new_val:
                             acts[i]['value'] = new_val
                             self._log(f"🔒 [运行前同步] 步骤「{acts[i].get('name', f'步骤{i+1}')}」判断逻辑已同步", "blue")
+                elif act_type == "激活窗口":
+                    # 激活窗口只能通过第 3 列的“选择窗口”按钮修改。
+                    # 第 5 列只是历史兼容展示框，不能在执行前把它反向写回配置；
+                    # 否则旧坐标/数据列会覆盖流程中保存的窗口标题和 hwnd。
+                    continue
                 else:
-                    # 通用容器（CMD/运行程序/上传文件等）
-                    le = w.findChild(QLineEdit)
+                    # 通用容器（CMD/运行程序/上传文件等）；同时兼容“清空输入”的多行编辑器。
+                    le = _find_text_input(w)
                     if le and le.isEnabled():
                         new_val = le.text()
                         if acts[i].get('value', '') != new_val:
@@ -20865,6 +21626,13 @@ class AutoManager(QMainWindow):
             self._log(f"⚠️ 处理 Worker 事件失败: {type(exc).__name__}: {exc}", "orange")
 
     def _execute(self, l, t, s, is_test=False):
+        # 停止请求发送后，旧 Worker 在收到命令前仍可能处于运行态。
+        # 必须在底层入口再次拦截，防止按钮、快捷键或其他回调绕过界面禁用而启动第二个 Worker。
+        active_engine = getattr(self, "_engine", None)
+        if active_engine and active_engine.isRunning():
+            self._log("⚠️ 上一个 Worker 仍在停止/收尾，已拒绝重复启动；请等待停止完成提示。", "orange")
+            return
+
         # 核心修复：强制结束表格当前的编辑状态，确保正在输入的单元格内容被提交
         if self.data_table.is_editing():
             self.data_table.clearSelection()
@@ -21178,25 +21946,18 @@ class AutoManager(QMainWindow):
         self.btn_stop.setEnabled(False); self.btn_dry_run.setEnabled(True)
         self.btn_run.setText("🚀 开始批量执行")
         self.btn_pause.setEnabled(False); self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
-        # 收到终态后应关闭悬浮窗口；若排程立即启动下一项，下一项的进度事件会自行重新显示。
+        # 收到终态后应关闭悬浮窗口；主界面进度条不保留上一轮任务的进度。
+        # 无论成功、失败、停止还是排程切换，都从 0 开始显示下一轮任务。
+        self.progress.setValue(0)
         final_status = getattr(getattr(self, '_engine', None), '_final_status', 'done')
         last_error = getattr(getattr(self, '_engine', None), '_last_error', '')
         if final_status == "done":
-            self.progress.setValue(100)
             # 本项已经结束：立即关闭终态小窗口。若排程续跑，下一项开始时会由进度事件重新显示。
             self.osd.hide()
-        elif final_status in ("failed", "stopped"):
-            if final_status == "stopped" and getattr(self, "_ui_stop_reset_pending", False):
-                self.progress.setValue(0)
-            else:
-                self.progress.setValue(max(0, int(getattr(getattr(self, '_engine', None), '_last_percent', self.progress.value() or 0))))
-        else:
-            self.progress.setValue(0)
 
         if final_status == "stopped":
-            stopped_percent = max(0, int(getattr(getattr(self, '_engine', None), '_last_percent', self.progress.value() or 0) or 0))
-            self.progress.setValue(stopped_percent)
-            # 停止状态已确认，关闭小窗口；主界面保留最终进度，供用户查看停止位置。
+            # 停止状态已确认，关闭小窗口；主界面进度已清零。
+            self.progress.setValue(0)
             self.osd.hide()
             self._ui_stop_reset_pending = False
             self._task_queue = []
@@ -21559,14 +22320,14 @@ class AutoManager(QMainWindow):
             self._log("▶️ [热键] 已恢复执行", "green")
             self.btn_stop.setEnabled(True)
             self.btn_pause.setText("⏸️ 暂停"); self.btn_pause.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
-            self.osd.btn_pause.setText("⏸ 暂停")
+            self.osd.set_pause_visual(False)
             self.osd.btn_pause.setStyleSheet("QPushButton { background-color: #ff9800; color: white; border-radius: 3px; font-size: 11px; font-weight: bold; padding: 1px 4px; }")
         else:
             self._engine.pause()
             self._log("⏸️ [热键] 已暂停，再按一次继续", "orange")
             self.btn_resume.setEnabled(True)
             self.btn_pause.setText("▶️ 继续"); self.btn_pause.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-            self.osd.btn_pause.setText("▶ 继续")
+            self.osd.set_pause_visual(True)
             self.osd.btn_pause.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; border-radius: 3px; font-size: 11px; font-weight: bold; padding: 1px 4px; }")
             self.osd.lbl_info.setText("⏸️ <b>已暂停</b> | 等待 Worker 到达安全检查点")
             self.osd.lbl_detail.setText("再次按暂停热键可继续；小窗口保持显示")
@@ -21713,6 +22474,7 @@ class AutoManager(QMainWindow):
             "pos": [self.pos().x(), self.pos().y()],
             "splitter_sizes": self.main_splitter.sizes(),
             "v_splitter_sizes": self.right_splitter.sizes(),
+            "console_collapsed": bool(getattr(self, "_console_collapsed", False)),
             "action_col_widths": [hdr.sectionSize(i) for i in range(hdr.count())],
             "last_task": self.current_task # [新增] 退出时确保记录当前任务
         })
@@ -21787,6 +22549,8 @@ if __name__ == "__main__":
         window.config["layout"].update({
             "size": [window.size().width(), window.size().height()],
             "pos": [window.pos().x(), window.pos().y()],
+            "v_splitter_sizes": window.right_splitter.sizes(),
+            "console_collapsed": bool(getattr(window, "_console_collapsed", False)),
             "action_col_widths": [hdr.sectionSize(i) for i in range(hdr.count())],
             "last_task": window.current_task # [新增] 退出时确保记录当前任务
         })
