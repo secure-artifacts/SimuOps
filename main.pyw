@@ -8581,8 +8581,10 @@ class AutoEngine(QThread):
                             name, act_type, act.get("action", ""), val,
                             error_detail
                         )
-                        # 账号窗口读取/关闭失败只影响当前数据行，绝不能因全局“停止”策略中断整个任务或排程。
-                        # 包括窗口记录未命中、Profile 表示形式不一致、窗口已被手动关闭、或网页弹窗阻止关闭。
+                        # 账号窗口读取/关闭失败、文件拖拽失败只影响当前数据行，
+                        # 绝不能因全局“停止”策略中断整个任务或排程。
+                        # 包括窗口记录未命中、Profile 表示形式不一致、窗口已被手动关闭、
+                        # 网页弹窗阻止关闭，以及资源管理器中找不到目标文件项。
                         is_profile_window_error = (
                             act_type == "open_url" and any(token in error_detail for token in (
                                 "对应的浏览器窗口记录",
@@ -8599,9 +8601,11 @@ class AutoEngine(QThread):
                                 "账号标识 [",
                             ))
                         )
-                        if is_profile_window_error:
+                        is_file_drag_error = act_type == "drag_file"
+                        if is_profile_window_error or is_file_drag_error:
+                            error_kind = "文件拖拽" if is_file_drag_error else "账号/Profile"
                             self.log_sig.emit(
-                                f"⏭️ [账号/Profile 无效] 第 {t_idx + 1} 行已标记失败，跳过当前账号，继续执行下一账号。",
+                                f"⏭️ [{error_kind}失败] 第 {t_idx + 1} 行已标记失败，跳过当前行，继续执行下一行。",
                                 "orange"
                             )
                             row_ok = False
@@ -11209,25 +11213,30 @@ class AutoManager(QMainWindow):
         data_ctrl = QHBoxLayout()
         data_ctrl.setContentsMargins(0, 0, 0, 0)
         data_ctrl.setSpacing(6)
-        btn_sync = QPushButton("🔄 同步表头"); btn_sync.setToolTip("根据流程编排同步批量数据列结构。打开网址列仅同步独立/读取/关闭模式，保留每行的网址、账号及其他已填写内容。")
+        btn_sync = QPushButton("🔄 同步"); btn_sync.setToolTip("根据流程编排同步批量数据列结构。打开网址列仅同步独立/读取/关闭模式，保留每行的网址、账号及其他已填写内容。")
         btn_sync.clicked.connect(self._sync_data_headers); data_ctrl.addWidget(btn_sync)
-        btn_reset = QPushButton("🧹 重置预设"); btn_reset.setStyleSheet("background-color: #ffebee; border: 1px solid #ef9a9a;")
+        btn_reset = QPushButton("🧹 重置"); btn_reset.setStyleSheet("background-color: #ffebee; border: 1px solid #ef9a9a;"); btn_reset.setMinimumWidth(62)
         btn_reset.setToolTip("将当前任务的所有批量数据（可编辑步骤列）强制重置为流程编排里的默认参数/变量。不会影响“选择”勾选。")
         btn_reset.clicked.connect(self._reset_data_to_presets); data_ctrl.addWidget(btn_reset)
-        btn_add_data = QPushButton("➕ 添加数据"); btn_add_data.clicked.connect(self._add_data_row); data_ctrl.addWidget(btn_add_data)
-        btn_del_data = QPushButton("❌ 删除数据"); btn_del_data.clicked.connect(self._del_data_row); data_ctrl.addWidget(btn_del_data)
-        btn_del_done_data = QPushButton("🧹 删除已完成"); btn_del_done_data.setToolTip("只删除当前任务里“已勾选”且状态为“完成”的数据行。"); btn_del_done_data.clicked.connect(self._del_completed_data_rows); data_ctrl.addWidget(btn_del_done_data)
-        btn_batch_fill = QPushButton("🛠️ 批量填充"); btn_batch_fill.setStyleSheet("background-color: #f3e5f5; font-weight: bold;"); btn_batch_fill.setToolTip("批量填充账户、文件路径、输入文本等，支持文件夹扫描"); btn_batch_fill.clicked.connect(self._batch_assign_profiles); data_ctrl.addWidget(btn_batch_fill)
-        btn_prefix_library = QPushButton("📚 前缀库"); btn_prefix_library.setStyleSheet("background-color: #fff8e1; border: 1px solid #ffd54f; font-weight: bold;"); btn_prefix_library.setToolTip("直接在主界面打开常用前缀库，无需先进入批量填充中心。"); btn_prefix_library.clicked.connect(self._open_prefix_library); data_ctrl.addWidget(btn_prefix_library)
+        btn_add_data = QPushButton("➕ 添加"); btn_add_data.setToolTip("添加批量数据行"); btn_add_data.clicked.connect(self._add_data_row); data_ctrl.addWidget(btn_add_data)
+        btn_del_data = QPushButton("❌ 删除"); btn_del_data.setToolTip("删除选中的批量数据行"); btn_del_data.clicked.connect(self._del_data_row); data_ctrl.addWidget(btn_del_data)
+        btn_del_done_data = QPushButton("🧹 清理"); btn_del_done_data.setToolTip("只删除当前任务里“已勾选”且状态为“完成”的数据行。"); btn_del_done_data.clicked.connect(self._del_completed_data_rows); data_ctrl.addWidget(btn_del_done_data)
+        btn_batch_fill = QPushButton("🛠️ 填充"); btn_batch_fill.setStyleSheet("background-color: #f3e5f5; font-weight: bold;"); btn_batch_fill.setToolTip("批量填充账户、文件路径、输入文本等，支持文件夹扫描"); btn_batch_fill.clicked.connect(self._batch_assign_profiles); data_ctrl.addWidget(btn_batch_fill)
+        btn_prefix_library = QPushButton("📚 前缀"); btn_prefix_library.setStyleSheet("background-color: #fff8e1; border: 1px solid #ffd54f; font-weight: bold;"); btn_prefix_library.setToolTip("直接在主界面打开常用前缀库，无需先进入批量填充中心。"); btn_prefix_library.clicked.connect(self._open_prefix_library); data_ctrl.addWidget(btn_prefix_library)
 
         self.btn_select_all = QPushButton("☑️ 全选"); self.btn_select_all.clicked.connect(lambda: self._set_all_row_check_state(True)); data_ctrl.addWidget(self.btn_select_all)
-        self.btn_deselect_all = QPushButton("☐ 取消全选"); self.btn_deselect_all.clicked.connect(lambda: self._set_all_row_check_state(False)); data_ctrl.addWidget(self.btn_deselect_all)
+        self.btn_deselect_all = QPushButton("☐ 取消"); self.btn_deselect_all.setToolTip("取消全选"); self.btn_deselect_all.clicked.connect(lambda: self._set_all_row_check_state(False)); data_ctrl.addWidget(self.btn_deselect_all)
         self.btn_invert_select = QPushButton("🔁 反选"); self.btn_invert_select.clicked.connect(self._invert_row_check_state); data_ctrl.addWidget(self.btn_invert_select)
-        self.btn_select_unsuccessful = QPushButton("⚠️ 选未成功"); self.btn_select_unsuccessful.setToolTip("一键勾选本次执行里未成功的行，例如失败、跳过、挂起或需人工介入的行。"); self.btn_select_unsuccessful.clicked.connect(self._select_unsuccessful_rows); data_ctrl.addWidget(self.btn_select_unsuccessful)
+        self.btn_select_unsuccessful = QPushButton("⚠️ 失败"); self.btn_select_unsuccessful.setToolTip("一键勾选本次执行里未成功的行，例如失败、跳过、挂起或需人工介入的行。"); self.btn_select_unsuccessful.clicked.connect(self._select_unsuccessful_rows); data_ctrl.addWidget(self.btn_select_unsuccessful)
+        self.btn_select_by_first_step = QPushButton("🎯 首步")
+        self.btn_select_by_first_step.setToolTip("只勾选第一步有实际内容的行；第一步为空的行不会参与执行。")
+        self.btn_select_by_first_step.setStyleSheet("background-color: #fff8e1; border: 1px solid #ffcc80; font-weight: bold;")
+        self.btn_select_by_first_step.clicked.connect(self._select_rows_by_first_step)
+        data_ctrl.addWidget(self.btn_select_by_first_step)
 
         # 子任务管理器：对“勾选的行”批量执行某个子任务（不限失败项）
-        self.btn_subtask_mgr = QPushButton("🧩 子任务管理")
-        self.btn_subtask_mgr.setMinimumWidth(122)
+        self.btn_subtask_mgr = QPushButton("🧩 子任务")
+        self.btn_subtask_mgr.setMinimumWidth(78)
         self.btn_subtask_mgr.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.btn_subtask_mgr.setToolTip("打开子任务管理器：对当前任务里“已勾选”的数据行，批量执行你选择的子任务（可选自动激活窗口）。")
         self.btn_subtask_mgr.clicked.connect(self._open_subtask_manager)
@@ -11269,6 +11278,12 @@ class AutoManager(QMainWindow):
         self.chk_multi_open = QCheckBox("👯 多账号并行模式"); self.chk_multi_open.setToolTip("开启后，不同账号的浏览器窗口可以同时并存（需确保账号路径唯一）。"); self.chk_multi_open.setChecked(True)
         data_ctrl.addWidget(self.data_col_width_label)
         data_ctrl.addWidget(self.data_col_width_slider)
+        # 不使用横向滚动条；工具栏采用短标题和足够宽的固定尺寸，保证图标和文字完整可见。
+        for toolbar_index in range(data_ctrl.count()):
+            toolbar_item = data_ctrl.itemAt(toolbar_index)
+            toolbar_button = toolbar_item.widget() if toolbar_item else None
+            if isinstance(toolbar_button, QPushButton):
+                toolbar_button.setFixedSize(90, 36)
         data_ly.addLayout(data_ctrl)
         
         self.data_table = DataEditorTable(0, 0); self.data_table.setColumnCount(3); self.data_table.setHorizontalHeaderLabels(["选择", "执行", "状态"])
@@ -14581,6 +14596,67 @@ class AutoManager(QMainWindow):
         else:
             QMessageBox.information(self, "提示", "当前没有未成功的执行行。")
 
+    def _select_rows_by_first_step(self):
+        """只勾选第一步已填入实际内容的批量数据行。"""
+        if not self.current_task:
+            return
+        self._save_data_table(flush=True)
+        actions = self.config.get('tasks', {}).get(self.current_task, [])
+        data_rows = self.config.get('task_data', {}).get(self.current_task, [])
+        if not actions or not data_rows:
+            QMessageBox.information(self, "提示", "当前没有可筛选的批量数据。")
+            return
+
+        # 坐标、等待等动作没有“填充内容”，跳过它们，找到第一步可填写的动作。
+        non_input_types = {
+            "click", "double_click", "right_click", "move", "hover_click",
+            "scroll", "wait", "screenshot", "close_browser"
+        }
+        first_action = next(
+            (
+                action for action in actions
+                if CMD_MAP.get(action.get('action'), "click") not in non_input_types
+            ),
+            None
+        )
+        if not first_action:
+            QMessageBox.information(self, "提示", "当前流程没有可用于判断“第一步填满”的输入步骤。")
+            return
+
+        step_name = first_action.get('name', '')
+        act_type = CMD_MAP.get(first_action.get('action'), "click")
+        matched_rows = []
+        self.data_table.blockSignals(True)
+        try:
+            for row_index, row_dict in enumerate(data_rows):
+                if not isinstance(row_dict, dict):
+                    filled = False
+                else:
+                    raw_value = str(row_dict.get(step_name, "") or "").strip()
+                    if raw_value == "[SKIP_ROW]":
+                        filled = False
+                    elif act_type == "open_url":
+                        parts = [part.strip() for part in raw_value.split("|")]
+                        filled = any(parts[:2])
+                    elif act_type == "clear_input_plus":
+                        count = _clear_input_plus_count(first_action.get("input_count"), fallback=1)
+                        _prefix, users = _clear_input_plus_parts(raw_value, count)
+                        filled = any(str(value or "").strip() for value in users)
+                    else:
+                        filled = bool(raw_value)
+
+                item = self.data_table.item(row_index, self._data_select_col())
+                if item:
+                    item.setCheckState(Qt.Checked if filled else Qt.Unchecked)
+                self._set_data_row_manual_selection_override(row_index, filled)
+                if filled:
+                    matched_rows.append(row_index)
+        finally:
+            self.data_table.blockSignals(False)
+        self._update_data_select_header()
+        self._save_data_table(flush=True)
+        self._log(f"🎯 已按第一步填满选择：{len(matched_rows)} 行", "blue")
+
     def _get_checked_data_rows(self):
         """获取“批量数据”里勾选的行索引列表。"""
         if not hasattr(self, "data_table"):
@@ -15725,10 +15801,11 @@ class AutoManager(QMainWindow):
                 # 只有与流程默认预设不同的内容才算填充，空行和纯预设行都不勾选。
                 # 其他普通路径则继续尊重用户已经手动设置过的勾选状态。
                 manual_override = row_dict.get("_selection_manual_override")
-                if force_from_filled_content and manual_override is not None:
-                    should_check = bool(manual_override)
-                elif force_from_filled_content:
+                if force_from_filled_content:
+                    # “应用所有更改”代表一次新的内容判断，不能让上一次批量填充
+                    # 留下的手动覆盖项污染本次结果；否则第二次填充会记住第一次选择。
                     should_check = self._row_has_meaningful_data(row_dict, actions)
+                    row_dict.pop("_selection_manual_override", None)
                 elif "_选中" in row_dict:
                     should_check = bool(row_dict.get("_选中"))
                 else:
@@ -16072,7 +16149,13 @@ class AutoManager(QMainWindow):
         btn_reset_presets_dlg.setFixedHeight(30)
         btn_reset_presets_dlg.setStyleSheet("background-color: #ffebee; border: 1px solid #ef9a9a;")
         tools_h.addWidget(btn_reset_presets_dlg)
-        btn_del_row_dlg = QPushButton("🗑️ 删除选中行")
+        btn_select_by_windows_dlg = QPushButton("🪟 窗口数选行")
+        btn_select_by_windows_dlg.setToolTip("按右侧窗口工具当前选中的窗口数量，从左侧预览表选择相同行数。")
+        btn_select_by_windows_dlg.setMinimumWidth(110)
+        btn_select_by_windows_dlg.setFixedHeight(30)
+        btn_select_by_windows_dlg.setStyleSheet("background-color: #e3f2fd; border: 1px solid #90caf9; font-weight: bold;")
+        tools_h.addWidget(btn_select_by_windows_dlg)
+        btn_del_row_dlg = QPushButton("🗑️ 删除选行")
         btn_del_row_dlg.setToolTip("删除左侧预览表中选中的数据行，并同步到主表格。")
         btn_del_row_dlg.setMinimumWidth(96)
         btn_del_row_dlg.setFixedHeight(30)
@@ -16949,6 +17032,64 @@ class AutoManager(QMainWindow):
                     targets.append(item)
             return targets
 
+        def _select_preview_rows(row_indexes, message, column=None):
+            """选择左侧预览表目标；指定 column 时只选择该列单元格。"""
+            valid = sorted({int(r) for r in row_indexes if 0 <= int(r) < preview_table.rowCount()})
+            preview_table.clearSelection()
+            for row_index in valid:
+                # 使用 SelectionModel 的 Select 标志累积选择，避免后一次覆盖前一次。
+                # 按窗口数时只选择用户当前指定的那一列，不扩展为整行。
+                target_column = column if column is not None else 0
+                model_index = preview_table.model().index(row_index, target_column)
+                selection_flags = QItemSelectionModel.Select
+                if column is None:
+                    selection_flags |= QItemSelectionModel.Rows
+                preview_table.selectionModel().select(
+                    model_index,
+                    selection_flags
+                )
+            self.data_table.blockSignals(True)
+            try:
+                valid_set = set(valid)
+                for preview_index, real_row in enumerate(selected_rows):
+                    item = self.data_table.item(real_row, self._data_select_col())
+                    if item:
+                        checked = preview_index in valid_set
+                        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                        self._set_data_row_manual_selection_override(real_row, checked)
+            finally:
+                self.data_table.blockSignals(False)
+            self._update_data_select_header()
+            self._save_data_table()
+            _update_batch_fill_caption(f"{message}（已选 {len(valid)} 行）")
+
+        def _select_rows_by_window_count():
+            current_index = preview_table.currentIndex()
+            selected_indexes = preview_table.selectedIndexes()
+            target_column = current_index.column() if current_index.isValid() else (
+                selected_indexes[0].column() if selected_indexes else 0
+            )
+            window_count = sum(
+                len(widget.selectedItems())
+                for widget in getattr(dlg, "_batch_window_lists", [])
+            )
+            if window_count <= 0:
+                QMessageBox.information(dlg, "提示", "请先在右侧窗口工具中选择窗口。")
+                return
+            # 批量中心打开时，左侧可能只带入了主表当前选中的 1 行。
+            # 选了多个窗口时自动扩展到主表前 N 行，避免只能选择当前那 1 行。
+            target_count = min(window_count, self.data_table.rowCount())
+            if len(selected_rows) < target_count:
+                selected_rows[:] = list(range(target_count))
+                _reload_preview_from_main(f"已按 {window_count} 个窗口扩展待处理行")
+            _select_preview_rows(
+                range(min(window_count, preview_table.rowCount(), target_count)),
+                f"按 {window_count} 个窗口（第 {target_column + 1} 列）",
+                column=target_column
+            )
+
+        btn_select_by_windows_dlg.clicked.connect(_select_rows_by_window_count)
+
         _reload_preview_from_main()
         
         left_ly.addWidget(preview_table)
@@ -17586,6 +17727,7 @@ class AutoManager(QMainWindow):
         tool_splitter.setChildrenCollapsible(True)
         tool_splitter.setOpaqueResize(True)
         right_ly.addWidget(tool_splitter, 1) # 权重为 1，占据所有剩余高度
+        dlg._batch_window_lists = []
 
         def create_tool_box(box_id):
             # 创建一个完整的工具箱副本
@@ -17594,6 +17736,7 @@ class AutoManager(QMainWindow):
             # --- 工具1: 窗口选择 ---
             win_tool = QWidget(); win_ly = QVBoxLayout(win_tool)
             win_list = QListWidget(); win_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            dlg._batch_window_lists.append(win_list)
             win_ly.addWidget(QLabel("选择当前打开的窗口/标签页:"))
             search_win = QLineEdit(); search_win.setPlaceholderText("搜索窗口标题...")
             win_ly.addWidget(search_win)
@@ -17608,6 +17751,12 @@ class AutoManager(QMainWindow):
             # 批量填充中心打开时默认使用关键词归类；用户仍可手动切回其他排序方式。
             sort_win.setCurrentIndex(1)
             win_filter_row.addWidget(sort_win, 1)
+            win_filter_row.addWidget(QLabel("显示:"))
+            display_win = QComboBox()
+            display_win.addItems(["窗口标题", "账户/邮箱", "Profile目录", "窗口句柄"])
+            display_win.setToolTip("选择窗口列表的主要显示依据。账户、Profile 和句柄不再全部挤在同一行；完整信息可悬停查看。")
+            display_win.setMinimumWidth(100)
+            win_filter_row.addWidget(display_win)
             win_ly.addLayout(win_filter_row)
             lbl_win_selection_count = create_table_selection_label()
             
@@ -17639,6 +17788,50 @@ class AutoManager(QMainWindow):
                 # 绝不退回枚举全部 TabItem，避免把同一窗口的其他标签页列出来。
                 fallback = str(fallback_title or "").strip()
                 return active_titles[:1] or ([fallback] if fallback else [])
+
+            def _build_batch_window_identity(title, hwnd, profile_meta):
+                """为批量填充中心生成可区分的窗口文案。"""
+                info = get_window_profile_descriptor(hwnd) or {}
+                profile_path = str(info.get("path", "") or "").strip()
+                profile_folder = os.path.basename(os.path.normpath(profile_path)) if profile_path else ""
+                profile_id = str(info.get("id", "") or "").strip()
+                display_name = str(info.get("name", "") or "").strip()
+                email = str(info.get("email", "") or "").strip()
+                remark = str(info.get("remark", "") or "").strip()
+                tag = get_profile_tag(profile_path, profile_meta) if profile_path else ""
+                identity = []
+                if display_name:
+                    identity.append(f"账户: {display_name}")
+                if email and email.casefold() != display_name.casefold():
+                    identity.append(f"邮箱: {email}")
+                if remark:
+                    identity.append(f"备注: {remark}")
+                if tag:
+                    identity.append(f"标签: {tag}")
+                if profile_folder:
+                    identity.append(f"Profile目录: {profile_folder}")
+                elif profile_id:
+                    identity.append(f"Profile: {profile_id}")
+                if hwnd:
+                    identity.append(f"句柄: {int(hwnd)}")
+                suffix = f" 〔{' | '.join(identity)}〕" if identity else ""
+                return f"{str(title or '').strip()}{suffix}"
+
+            def _get_batch_window_display(title, hwnd, profile_meta):
+                """按用户选择的单一依据显示，避免把身份信息全部拼成长句。"""
+                raw_title = str(title or "").strip()
+                info = get_window_profile_descriptor(hwnd) or {}
+                display_name = str(info.get("name", "") or "").strip()
+                email = str(info.get("email", "") or "").strip()
+                profile_path = str(info.get("path", "") or "").strip()
+                profile_folder = os.path.basename(os.path.normpath(profile_path)) if profile_path else ""
+                if display_win.currentText() == "账户/邮箱":
+                    return display_name or email or "未识别账户"
+                if display_win.currentText() == "Profile目录":
+                    return profile_folder or str(info.get("id", "") or "未识别 Profile")
+                if display_win.currentText() == "窗口句柄":
+                    return f"HWND {int(hwnd or 0)}"
+                return raw_title or "未命名窗口"
 
             def _get_wins():
                 import pygetwindow as pgw
@@ -17694,11 +17887,11 @@ class AutoManager(QMainWindow):
                                 tab_titles = _get_browser_tab_titles(hwnd, w.title)
                                 tab_total = len(tab_titles)
                                 for tab_index, tab_title in enumerate(tab_titles, 1):
-                                    _base = build_window_display_text(tab_title, hwnd, "", profile_meta)
+                                    _base = _get_batch_window_display(tab_title, hwnd, profile_meta)
                                     display = f"[{instance_label} · 标签页 {tab_index}/{tab_total}] {_base}"
                                     wins.append((display, tab_title, hwnd, True, instance_label))
                             else:
-                                display = build_window_display_text(w.title, hwnd, "[软件] ", profile_meta)
+                                display = _get_batch_window_display(f"[软件] {w.title}", hwnd, profile_meta)
                                 wins.append((display, w.title, hwnd, False, ""))
                 except Exception as e:
                     log_internal_issue("批量填充中心扫描窗口列表失败", e)
@@ -17721,8 +17914,20 @@ class AutoManager(QMainWindow):
                     all_w = filtered_wins
                 win_list.clear()
                 txt = search_win.text().lower()
-                browser_items = [item for item in all_w if item[3] and (not txt or txt in item[0].lower())]
-                software_items = [item for item in all_w if not item[3] and (not txt or txt in item[0].lower())]
+                def _searchable_window_text(item):
+                    _display, raw_title, hwnd, _is_browser, _browser_label = item
+                    info = get_window_profile_descriptor(hwnd) or {}
+                    profile_path = str(info.get("path", "") or "")
+                    profile_folder = os.path.basename(os.path.normpath(profile_path)) if profile_path else ""
+                    return " ".join([
+                        str(_display or ""), str(raw_title or ""),
+                        str(info.get("name", "") or ""), str(info.get("email", "") or ""),
+                        str(info.get("id", "") or ""), profile_folder,
+                        str(hwnd or "")
+                    ]).lower()
+
+                browser_items = [item for item in all_w if item[3] and (not txt or txt in _searchable_window_text(item))]
+                software_items = [item for item in all_w if not item[3] and (not txt or txt in _searchable_window_text(item))]
                 if sort_win.currentIndex() == 1:
                     # 按标签页标题中的关键词归类，而不是单纯按整句标题排序。
                     # 当前扫描接口能稳定取得标签页标题和窗口句柄，网址未必能从系统窗口
@@ -17761,6 +17966,15 @@ class AutoManager(QMainWindow):
                         it = QListWidgetItem(d)
                         it.setData(Qt.UserRole, r)          # 纯标题
                         it.setData(Qt.UserRole + 1, hwnd)   # hwnd 唯一标识
+                        profile_info = get_window_profile_descriptor(hwnd) or {}
+                        profile_path = str(profile_info.get("path", "") or "").strip()
+                        if profile_path:
+                            it.setToolTip(
+                                f"窗口标题: {r}\n"
+                                f"Profile完整路径: {profile_path}\n"
+                                f"Profile目录: {os.path.basename(os.path.normpath(profile_path))}\n"
+                                f"窗口句柄: {int(hwnd or 0)}"
+                            )
                         win_list.addItem(it)
 
                 _add_group("🌐 浏览器窗口（Chrome / Edge / Firefox / Opera 等）", browser_items)
@@ -17769,6 +17983,7 @@ class AutoManager(QMainWindow):
             search_win.textChanged.connect(_refresh_win)
             chk_one_window.stateChanged.connect(lambda _state: _refresh_win())
             sort_win.currentIndexChanged.connect(lambda _index: _refresh_win())
+            display_win.currentIndexChanged.connect(lambda _index: _refresh_win())
             btn_ref_win = QPushButton("🔄 刷新窗口"); btn_ref_win.clicked.connect(_refresh_win)
             win_ly.addWidget(win_list)
             win_ly.addWidget(lbl_win_selection_count)
