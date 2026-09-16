@@ -16124,20 +16124,6 @@ class AutoManager(QMainWindow):
             QPushButton:hover { background-color: #1976d2; }
         """)
         tools_h.addWidget(btn_paste_clipboard_dlg)
-        btn_snapshot_save_dlg = QPushButton("📸 拍摄快照")
-        btn_snapshot_save_dlg.setToolTip("将当前任务的所有数据行拍成全局快照存入临时库，可在其他任务中随时一键恢复。")
-        btn_snapshot_save_dlg.setMinimumWidth(96)
-        btn_snapshot_save_dlg.setFixedHeight(30)
-        btn_snapshot_save_dlg.setStyleSheet("background-color: #e8f5e9; border: 1px solid #a5d6a7;")
-        tools_h.addWidget(btn_snapshot_save_dlg)
-
-        btn_snapshot_load_dlg = QPushButton("📁 快照库")
-        btn_snapshot_load_dlg.setToolTip("查看并管理全局表格快照库，一键将任意快照数据恢复到当前任务中。")
-        btn_snapshot_load_dlg.setMinimumWidth(96)
-        btn_snapshot_load_dlg.setFixedHeight(30)
-        btn_snapshot_load_dlg.setStyleSheet("background-color: #e8f5e9; border: 1px solid #a5d6a7;")
-        tools_h.addWidget(btn_snapshot_load_dlg)
-
         btn_sync_headers_dlg = QPushButton("🔄 同步表头")
         btn_sync_headers_dlg.setToolTip("在批量填充中心内直接同步批量数据列结构，并刷新左侧预览。")
         btn_sync_headers_dlg.setMinimumWidth(96)
@@ -16155,6 +16141,16 @@ class AutoManager(QMainWindow):
         btn_select_by_windows_dlg.setFixedHeight(30)
         btn_select_by_windows_dlg.setStyleSheet("background-color: #e3f2fd; border: 1px solid #90caf9; font-weight: bold;")
         tools_h.addWidget(btn_select_by_windows_dlg)
+        btn_select_complete_first_cells_dlg = QPushButton("✅ 选内容完整行首格")
+        btn_select_complete_first_cells_dlg.setToolTip(
+            "只选中第1列：该行第1格为空，且第2格到最后一格全部已有内容。"
+        )
+        btn_select_complete_first_cells_dlg.setMinimumWidth(150)
+        btn_select_complete_first_cells_dlg.setFixedHeight(30)
+        btn_select_complete_first_cells_dlg.setStyleSheet(
+            "background-color: #e8f5e9; border: 1px solid #81c784; font-weight: bold;"
+        )
+        tools_h.addWidget(btn_select_complete_first_cells_dlg)
         btn_del_row_dlg = QPushButton("🗑️ 删除选行")
         btn_del_row_dlg.setToolTip("删除左侧预览表中选中的数据行，并同步到主表格。")
         btn_del_row_dlg.setMinimumWidth(96)
@@ -16365,6 +16361,8 @@ class AutoManager(QMainWindow):
             menu.addAction("📋 直贴表格", lambda: btn_paste_clipboard_dlg.click())
             menu.addAction("🔄 同步表头", lambda: btn_sync_headers_dlg.click())
             menu.addAction("🧹 重置预设", lambda: btn_reset_presets_dlg.click())
+            menu.addAction("✅ 选内容完整行首格", lambda: btn_select_complete_first_cells_dlg.click())
+            menu.addAction("🪟 窗口数选行", lambda: btn_select_by_windows_dlg.click())
             menu.addAction("🗑️ 删除选中行", lambda: btn_del_row_dlg.click())
             menu.addSeparator()
             menu.addAction(f"📏 设置行高（当前 {preview_row_height_spin.value()} px）", _pick_preview_row_height)
@@ -16989,9 +16987,6 @@ class AutoManager(QMainWindow):
             s_list.itemDoubleClicked.connect(lambda: _do_restore())
             snap_dlg.exec_()
 
-        btn_snapshot_save_dlg.clicked.connect(_save_global_snapshot)
-        btn_snapshot_load_dlg.clicked.connect(_load_global_snapshot_library)
-
         def _get_selected_preview_targets():
             """按当前选区形状返回有序目标格：
             单行选择 -> 按列从左到右
@@ -17088,7 +17083,40 @@ class AutoManager(QMainWindow):
                 column=target_column
             )
 
+        def _select_complete_first_cells():
+            """只选择第1列中等待激活窗口的格子：本格为空，其余格全部已有内容。"""
+            if preview_table.columnCount() < 2:
+                QMessageBox.information(dlg, "提示", "当前预览表没有足够的其它列可用于判断内容是否完整。")
+                return
+
+            complete_rows = []
+            for row in range(preview_table.rowCount()):
+                first_item = preview_table.item(row, 0)
+                first_value = first_item.text().strip() if first_item else ""
+                if first_value:
+                    continue
+
+                all_other_cells_filled = True
+                for col in range(1, preview_table.columnCount()):
+                    item = preview_table.item(row, col)
+                    if not item or not item.text().strip():
+                        all_other_cells_filled = False
+                        break
+                if all_other_cells_filled:
+                    complete_rows.append(row)
+
+            if not complete_rows:
+                _select_preview_rows([], "没有找到第1格为空且其它格全部已填的行", column=0)
+                return
+
+            _select_preview_rows(
+                complete_rows,
+                "已选中内容完整行的第1格",
+                column=0
+            )
+
         btn_select_by_windows_dlg.clicked.connect(_select_rows_by_window_count)
+        btn_select_complete_first_cells_dlg.clicked.connect(_select_complete_first_cells)
 
         _reload_preview_from_main()
         
@@ -17817,7 +17845,7 @@ class AutoManager(QMainWindow):
                 suffix = f" 〔{' | '.join(identity)}〕" if identity else ""
                 return f"{str(title or '').strip()}{suffix}"
 
-            def _get_batch_window_display(title, hwnd, profile_meta):
+            def _get_batch_window_display(title, hwnd, profile_meta, display_mode=None):
                 """按用户选择的单一依据显示，避免把身份信息全部拼成长句。"""
                 raw_title = str(title or "").strip()
                 info = get_window_profile_descriptor(hwnd) or {}
@@ -17825,15 +17853,16 @@ class AutoManager(QMainWindow):
                 email = str(info.get("email", "") or "").strip()
                 profile_path = str(info.get("path", "") or "").strip()
                 profile_folder = os.path.basename(os.path.normpath(profile_path)) if profile_path else ""
-                if display_win.currentText() == "账户/邮箱":
+                mode = display_mode if display_mode is not None else display_win.currentText()
+                if mode == "账户/邮箱":
                     return display_name or email or "未识别账户"
-                if display_win.currentText() == "Profile目录":
+                if mode == "Profile目录":
                     return profile_folder or str(info.get("id", "") or "未识别 Profile")
-                if display_win.currentText() == "窗口句柄":
+                if mode == "窗口句柄":
                     return f"HWND {int(hwnd or 0)}"
                 return raw_title or "未命名窗口"
 
-            def _get_wins():
+            def _get_wins(display_mode=None):
                 import pygetwindow as pgw
                 wins = []
                 profile_meta = self.config.get("profile_meta", {}) or {}
@@ -17887,11 +17916,11 @@ class AutoManager(QMainWindow):
                                 tab_titles = _get_browser_tab_titles(hwnd, w.title)
                                 tab_total = len(tab_titles)
                                 for tab_index, tab_title in enumerate(tab_titles, 1):
-                                    _base = _get_batch_window_display(tab_title, hwnd, profile_meta)
+                                    _base = _get_batch_window_display(tab_title, hwnd, profile_meta, display_mode)
                                     display = f"[{instance_label} · 标签页 {tab_index}/{tab_total}] {_base}"
                                     wins.append((display, tab_title, hwnd, True, instance_label))
                             else:
-                                display = _get_batch_window_display(f"[软件] {w.title}", hwnd, profile_meta)
+                                display = _get_batch_window_display(f"[软件] {w.title}", hwnd, profile_meta, display_mode)
                                 wins.append((display, w.title, hwnd, False, ""))
                 except Exception as e:
                     log_internal_issue("批量填充中心扫描窗口列表失败", e)
@@ -17899,8 +17928,11 @@ class AutoManager(QMainWindow):
                 wins.sort(key=lambda x: (not x[3], x[4], x[1].lower(), int(x[2] or 0)))
                 return wins
 
-            def _refresh_win():
-                all_w = _get_wins()
+            window_scan_cache = []
+
+            def _refresh_win(all_w=None):
+                if all_w is None:
+                    all_w = list(window_scan_cache)
                 if chk_one_window.isChecked():
                     # 每个浏览器实例只保留第一个标签页作为代表项；普通软件窗口全部保留。
                     seen_instances = set()
@@ -17980,16 +18012,79 @@ class AutoManager(QMainWindow):
                 _add_group("🌐 浏览器窗口（Chrome / Edge / Firefox / Opera 等）", browser_items)
                 _add_group("🖥️ 其他软件窗口", software_items)
             
-            search_win.textChanged.connect(_refresh_win)
+            class _BatchScanWorker(QObject):
+                finished = pyqtSignal(object)
+                failed = pyqtSignal(str)
+
+                def __init__(self, callback):
+                    super().__init__()
+                    self._callback = callback
+
+                def run(self):
+                    try:
+                        self.finished.emit(self._callback())
+                    except Exception as exc:
+                        self.failed.emit(str(exc))
+
+            class _BatchScanBridge(QObject):
+                def __init__(self, callback):
+                    super().__init__(dlg)
+                    self._callback = callback
+
+                def receive(self, value):
+                    self._callback(value)
+
+            scan_runtime = {"window": None, "profile": None}
+
+            def _start_background_scan(kind, callback, scan_func):
+                # 必须同时持有 QThread、worker 和 bridge 的 Python 引用；
+                # 否则局部变量离开函数后，worker 可能被提前回收，导致扫描无结果。
+                old_runtime = scan_runtime.get(kind)
+                old_thread = old_runtime["thread"] if isinstance(old_runtime, dict) else old_runtime
+                if old_thread and old_thread.isRunning():
+                    return
+                thread = QThread(dlg)
+                worker = _BatchScanWorker(scan_func)
+                bridge = _BatchScanBridge(callback)
+                worker.moveToThread(thread)
+                thread.started.connect(worker.run)
+                worker.finished.connect(bridge.receive)
+                worker.failed.connect(lambda message: log_internal_issue(f"批量填充中心后台扫描失败({kind})", message))
+                worker.finished.connect(thread.quit)
+                worker.failed.connect(lambda _message: thread.quit())
+                thread.finished.connect(worker.deleteLater)
+                thread.finished.connect(thread.deleteLater)
+                thread.finished.connect(lambda: scan_runtime.__setitem__(kind, None))
+                scan_runtime[kind] = {
+                    "thread": thread,
+                    "worker": worker,
+                    "bridge": bridge,
+                }
+                thread.start()
+
+            def _on_window_scan_done(items):
+                window_scan_cache[:] = list(items or [])
+                _refresh_win(window_scan_cache)
+
+            def _start_window_scan():
+                display_mode = display_win.currentText()
+                _start_background_scan(
+                    "window",
+                    _on_window_scan_done,
+                    lambda: _get_wins(display_mode)
+                )
+
+            search_win.textChanged.connect(lambda _text: _refresh_win())
             chk_one_window.stateChanged.connect(lambda _state: _refresh_win())
             sort_win.currentIndexChanged.connect(lambda _index: _refresh_win())
             display_win.currentIndexChanged.connect(lambda _index: _refresh_win())
-            btn_ref_win = QPushButton("🔄 刷新窗口"); btn_ref_win.clicked.connect(_refresh_win)
+            btn_ref_win = QPushButton("🔄 刷新窗口"); btn_ref_win.clicked.connect(_start_window_scan)
             win_ly.addWidget(win_list)
             win_ly.addWidget(lbl_win_selection_count)
             bind_item_view_selection_label(win_list, lbl_win_selection_count, kind_text="个窗口")
             win_ly.addWidget(btn_ref_win)
-            _refresh_win()
+            # 扫描完全放入后台线程；主线程只负责在扫描完成后刷新列表。
+            QTimer.singleShot(0, _start_window_scan)
             # 双击窗口列表自动填充
             win_list.itemDoubleClicked.connect(lambda: _do_fill())
             tabs.addTab(win_tool, "🪟 窗口")
@@ -18049,8 +18144,8 @@ class AutoManager(QMainWindow):
                 hide_dup = chk_hide_dup.isChecked()
                 sort_mode = sort_prof.currentText()
 
-                # 只有明确点击“严格扫描”按钮时才进行 Cookie 检测，平时均使用轻量扫描
-                _rebuild_prof_cache(strict_scan=force_rescan, skip_cookie_check=not force_rescan)
+                # 扫描由 _start_profile_scan 在后台线程完成；这里仅按已有缓存渲染列表。
+                # 避免搜索、排序或过滤操作再次阻塞 Qt 主线程。
                 
                 # 获取账号状态元数据
                 prof_meta = self.config.get("profile_meta", {})
@@ -18207,16 +18302,32 @@ class AutoManager(QMainWindow):
             chk_hide_bad.stateChanged.connect(lambda: _refresh_prof(force_rescan=False))
             chk_hide_dup.stateChanged.connect(lambda: _refresh_prof(force_rescan=False))
             
+            def _on_profile_scan_done(rows):
+                prof_data_cache[:] = list(rows or [])
+                _refresh_prof(force_rescan=False)
+
+            def _start_profile_scan(strict_scan=False):
+                def _scan_profiles():
+                    if strict_scan:
+                        clear_chrome_profile_cache()
+                        rows = get_chrome_profiles(force_refresh=True, skip_cookie_check=False)
+                    else:
+                        rows = get_chrome_profiles(force_refresh=True, skip_cookie_check=True)
+                    return merge_profile_rows(rows, get_active_chrome_profiles())
+
+                _start_background_scan("profile", _on_profile_scan_done, _scan_profiles)
+
             btn_ref_prof = QPushButton("🔄 严格扫描并刷新账号")
             btn_ref_prof.setToolTip("手动触发一次严格扫描：按账号信息 + Google 登录 Cookie 检测，解决账号列表不准的问题。")
-            btn_ref_prof.clicked.connect(lambda: _refresh_prof(force_rescan=True))
+            btn_ref_prof.clicked.connect(lambda: _start_profile_scan(strict_scan=True))
             prof_ly.addWidget(prof_list)
             lbl_prof_selection_count = create_table_selection_label()
             prof_ly.addWidget(lbl_prof_selection_count)
             bind_item_view_selection_label(prof_list, lbl_prof_selection_count, kind_text="个账户")
             # [修复] 彻底移除“从已开窗口识别”按钮，统一使用轻量化磁盘扫描
             prof_ly.addWidget(btn_ref_prof)
-            _refresh_prof(force_rescan=False) # 首次打开时优先走轻量磁盘扫描，避免卡顿
+            # 首次账号扫描放入后台线程；界面先显示，扫描完成后再渲染列表。
+            QTimer.singleShot(0, lambda: _start_profile_scan(strict_scan=False))
             dlg._smart_fill_prof_list = prof_list
             # 双击账号列表自动填充
             prof_list.itemDoubleClicked.connect(lambda: _do_fill())
@@ -19541,21 +19652,13 @@ class AutoManager(QMainWindow):
             btn_prefix_lib = QPushButton("📚 前缀库")
             btn_prefix_lib.setToolTip("将所选前缀填入当前表格单元格。")
             btn_prefix_lib.setFixedHeight(28)
-            btn_snapshot_save = QPushButton("📸 拍摄快照")
-            btn_snapshot_save.setToolTip("将当前文字表格的所有数据拍成快照存入临时库，可在其他任务中随时恢复。")
-            btn_snapshot_save.setFixedHeight(28)
-            btn_snapshot_load = QPushButton("📁 快照库")
-            btn_snapshot_load.setToolTip("打开左右共用的快照库：左侧业务数据和右侧文字表数据都在这里。")
-            btn_snapshot_load.setFixedHeight(28)
             btn_text_paste = QPushButton("📋 粘贴表格")
             btn_text_add_row = QPushButton("➕ 行")
             btn_text_add_col = QPushButton("➕ 列")
             btn_text_clear = QPushButton("🧹 清空")
-            for _btn in [btn_snapshot_save, btn_snapshot_load, btn_text_paste, btn_text_add_row, btn_text_add_col, btn_text_clear]:
+            for _btn in [btn_text_paste, btn_text_add_row, btn_text_add_col, btn_text_clear]:
                 _btn.setFixedHeight(28)
             text_bar.addWidget(btn_prefix_lib)
-            text_bar.addWidget(btn_snapshot_save)
-            text_bar.addWidget(btn_snapshot_load)
             text_bar.addWidget(btn_text_paste)
             text_bar.addWidget(btn_text_add_row)
             text_bar.addWidget(btn_text_add_col)
@@ -19692,10 +19795,6 @@ class AutoManager(QMainWindow):
                 btn_close.clicked.connect(snap_dlg.accept)
                 s_list.itemDoubleClicked.connect(lambda: _do_restore())
                 snap_dlg.exec_()
-
-            btn_snapshot_save.clicked.connect(_save_current_snapshot)
-            # 左右共用同一个快照库；从任意一侧打开都是同一份清单。
-            btn_snapshot_load.clicked.connect(_load_global_snapshot_library)
 
             # --- 文字实时预览同步 ---
             def _update_text_preview():
